@@ -1,0 +1,47 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Executables
+mamba_demo
+mamba_advanced
+mamba_train
+
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+*.tmp
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# Dependencies
+*.a
+
+# Object files
+*.o
+*.obj
+*.out
+
+# Debug
+*.dSYM/
+*.su
+*.gch
+*.pch
+
+# Backups
+*.bak
+*.backup
+*.orig
+
+# OS
+Thumbs.db
