@@ -3,6 +3,9 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* Forward storage for training (per timestep) */
 typedef struct {
@@ -171,39 +174,43 @@ void selective_scan(real_t *output, real_t *state,
     /* Initialize state to zero */
     memset(state, 0, state_size * sizeof(real_t));
 
+    /* Allocate temporaries once to avoid per-timestep malloc/free */
     real_t *temp_state = (real_t *)malloc(state_size * sizeof(real_t));
-    if (!temp_state) return;
-
-    /* allocate per-timestep diag buffers once to avoid repeated malloc/free */
     real_t *A_diag_t = (real_t *)malloc(state_size * sizeof(real_t));
     real_t *B_bar_t = (real_t *)malloc(state_size * sizeof(real_t));
-    if (!A_diag_t || !B_bar_t) { free(A_diag_t); free(B_bar_t); free(temp_state); return; }
+    if (!temp_state || !A_diag_t || !B_bar_t) {
+        free(temp_state); free(A_diag_t); free(B_bar_t);
+        return;
+    }
 
     /* Process each timestep; input is flattened controller vectors (seq_len x state_size) */
     for (size_t t = 0; t < seq_len; t++) {
         const real_t *u_t = &input[t * state_size];
         real_t dt_t = delta[t];
 
-        /* Compute A_diag_t = exp(dt_t * diag(A_bar)) and B_bar_t = dt_t * B_bar (simple discretization) */
+        /* Compute A_diag_t and B_bar_t in parallel across state dimensions */
+#pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) {
             real_t a_val = A_bar->data[i * state_size + i];
-            A_diag_t[i] = expf(dt_t * a_val);
-            /* improved discretization for diagonal A: integral_0^dt exp(tau*a) d tau = (exp(dt*a)-1)/a */
+            real_t a_diag = expf(dt_t * a_val);
+            A_diag_t[i] = a_diag;
             if (fabsl(a_val) < 1e-8) {
                 B_bar_t[i] = dt_t * B_bar[i];
             } else {
-                B_bar_t[i] = (A_diag_t[i] - 1.0f) / a_val * B_bar[i];
+                B_bar_t[i] = (a_diag - 1.0f) / a_val * B_bar[i];
             }
         }
 
         memcpy(temp_state, state, state_size * sizeof(real_t));
 
-        /* Update state elementwise: x_t[i] = A_diag_t[i] * x_{t-1}[i] + B_bar_t[i] * u_t[i] */
+        /* Update state elementwise in parallel: x_t[i] = A_diag_t[i] * x_{t-1}[i] + B_bar_t[i] * u_t[i] */
+#pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) {
             state[i] = A_diag_t[i] * temp_state[i] + B_bar_t[i] * u_t[i];
         }
 
         /* Write state vector into output buffer (flattened) */
+#pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) output[t * state_size + i] = state[i];
     }
 
@@ -451,12 +458,18 @@ void selective_scan_forward_store(ForwardStore *store, real_t *state,
 
     memset(state, 0, state_size * sizeof(real_t));
 
+    /* allocate zero prev buffer to avoid per-step calloc/free */
+    real_t *zero_prev = (real_t *)calloc(state_size, sizeof(real_t));
+
     for (size_t t = 0; t < seq_len; t++) {
         const real_t *u_t = &input[t * state_size];
         real_t dt_t = delta[t];
+        /* copy controller vector */
+#pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) store->u_seq[t * state_size + i] = u_t[i];
 
-        /* A_bar_t diagonal */
+        /* A_bar_t diagonal and B_bar per-dim (parallelizable) */
+#pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) {
             real_t a_val = A_bar->data[i * state_size + i];
             real_t a_diag_t = expf(dt_t * a_val);
@@ -465,17 +478,19 @@ void selective_scan_forward_store(ForwardStore *store, real_t *state,
             else store->B_bar[t * state_size + i] = (a_diag_t - 1.0f) / a_val * B_bar[i];
         }
 
-        /* update state */
-        real_t *x_prev = (t == 0) ? (real_t *)calloc(state_size, sizeof(real_t)) : &store->x[(t-1)*state_size];
+        /* update state (elementwise) */
+        real_t *x_prev = (t == 0) ? zero_prev : &store->x[(t-1)*state_size];
         real_t *x_t = &store->x[t * state_size];
+#pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) {
             real_t a_diag_t = store->A_diag[t * state_size + i];
             real_t bbar = store->B_bar[t * state_size + i];
             x_t[i] = a_diag_t * x_prev[i] + bbar * u_t[i];
             state[i] = x_t[i];
         }
-        if (t == 0) free(x_prev);
     }
+
+    free(zero_prev);
 }
 
 /* Backward through stored forward trace. dY is scalar gradient per timestep. input is original inputs (batch's flattened seq*dim), and u_pooling assumed mean pooling done outside. */
