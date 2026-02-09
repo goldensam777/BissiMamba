@@ -1,6 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c99 -lm
-LDFLAGS = -lm
+# enable OpenMP when available for parallel selective_scan
+CFLAGS = -Wall -Wextra -O2 -std=c99 -lm -fopenmp
+LDFLAGS = -lm -fopenmp
 
 # Source files
 SOURCES = mamba.c main.c
