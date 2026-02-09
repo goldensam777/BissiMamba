@@ -17,8 +17,8 @@ typedef struct {
 /* State space model parameters */
 typedef struct {
     Matrix A;           /* State transition matrix (N x N) */
-    Matrix B;           /* Input matrix (N x 1) */
-    Matrix C;           /* Output matrix (1 x N) */
+    Matrix B;           /* Input vector (N x 1) */
+    Matrix C;           /* Output vector (N x 1) (used as readout weights on state) */
     real_t D;           /* Feedthrough term */
 } SSMParams;
 
@@ -39,8 +39,10 @@ typedef struct {
     MambaConfig config;
     
     /* Projections */
-    Matrix W_in;        /* Input projection (dim x dim) */
-    Matrix W_out;       /* Output projection (dim x dim) */
+    /* `W_in` maps input vectors of size `dim` -> controller vectors of size `state_size` (rows=state_size, cols=dim) */
+    Matrix W_in;        /* Input projection (state_size x dim) */
+    /* `W_out` maps state vectors (state_size) -> output vectors of size `dim` (rows=dim, cols=state_size) */
+    Matrix W_out;       /* Output projection (dim x state_size) */
     
     /* State-dependent matrices */
     Matrix A_log;       /* Log of state matrix diagonal */
@@ -48,6 +50,7 @@ typedef struct {
     Matrix C_mat;       /* Output matrix */
     
     /* Delta time parameters */
+    /* `delta_proj` projects input -> scalar delta (shape: 1 x dim or dim x 1 depending on allocation) */
     Matrix delta_proj;  /* Delta time projection */
     
     /* Temporary buffers */
@@ -58,8 +61,8 @@ typedef struct {
 /* Gradient and optimizer state held per-block for CPU training */
 typedef struct {
     /* Gradients */
-    real_t *g_W_in;    /* dim x dim */
-    real_t *g_W_out;   /* dim x dim */
+    real_t *g_W_in;    /* state_size x dim (row-major: rows=state_size, cols=dim) */
+    real_t *g_W_out;   /* dim x state_size (row-major: rows=dim, cols=state_size) */
     real_t *g_A_log;   /* state_size */
     real_t *g_B_mat;   /* state_size */
     real_t *g_C_mat;   /* state_size */
