@@ -234,11 +234,19 @@ MambaBlock* mamba_block_create(const MambaConfig *config) {
     
     /* Allocate temporary buffers */
     block->hidden = (real_t *)calloc(config->state_size, sizeof(real_t));
-    block->delta = (real_t *)calloc(config->seq_len, sizeof(real_t));
-    
+    block->delta  = (real_t *)calloc(config->seq_len, sizeof(real_t));
+
+    /* Pre-allocate scan1d adapter buffers */
+    size_t LD = config->seq_len * config->state_size;
+    block->scan_B     = (real_t *)malloc(LD * sizeof(real_t));
+    block->scan_C     = (real_t *)malloc(LD * sizeof(real_t));
+    block->scan_delta = (real_t *)malloc(LD * sizeof(real_t));
+    block->scan_h     = (real_t *)calloc(config->state_size, sizeof(real_t));
+
     if (!block->W_in.data || !block->W_out.data || !block->A_log.data ||
         !block->B_mat.data || !block->C_mat.data || !block->delta_proj.data ||
-        !block->hidden || !block->delta) {
+        !block->hidden || !block->delta ||
+        !block->scan_B || !block->scan_C || !block->scan_delta || !block->scan_h) {
         mamba_block_free(block);
         return NULL;
     }
@@ -257,6 +265,10 @@ void mamba_block_free(MambaBlock *block) {
     if (block->delta_proj.data) free(block->delta_proj.data);
     if (block->hidden) free(block->hidden);
     if (block->delta) free(block->delta);
+    if (block->scan_B)     free(block->scan_B);
+    if (block->scan_C)     free(block->scan_C);
+    if (block->scan_delta) free(block->scan_delta);
+    if (block->scan_h)     free(block->scan_h);
     /* free optimizer/grad buffers if present */
     /* Those are managed by mamba_free_optimizer through block pointer if used */
     
@@ -443,7 +455,8 @@ void mamba_optimizer_step(MambaBlock *block, const OptimConfig *conf) {
 }
 
 /* ------------------------------------------------------------------
- * Forward scan that stores per-timestep values for backward
+ * Forward scan that stores per-timestep values for backward.
+ * Math is aligned with scan1d ASM: dA = exp(dt * A), dB = dt * B.
  * ------------------------------------------------------------------ */
 void selective_scan_forward_store(ForwardStore *store, real_t *state, 
                    const real_t *input, const real_t *delta,
@@ -470,14 +483,13 @@ void selective_scan_forward_store(ForwardStore *store, real_t *state,
 #pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) store->u_seq[t * state_size + i] = u_t[i];
 
-        /* A_bar_t diagonal and B_bar per-dim (parallelizable) */
+        /* dA and dB per-dim (parallelizable), matching scan1d */
 #pragma omp parallel for
         for (size_t i = 0; i < state_size; i++) {
             real_t a_val = A_bar->data[i * state_size + i];
             real_t a_diag_t = expf(dt_t * a_val);
             store->A_diag[t * state_size + i] = a_diag_t;
-            if (fabsl(a_val) < 1e-8) store->B_bar[t * state_size + i] = dt_t * B_bar[i];
-            else store->B_bar[t * state_size + i] = (a_diag_t - 1.0f) / a_val * B_bar[i];
+            store->B_bar[t * state_size + i] = dt_t * B_bar[i];
         }
 
         /* update state (elementwise) */
@@ -495,7 +507,9 @@ void selective_scan_forward_store(ForwardStore *store, real_t *state,
     free(zero_prev);
 }
 
-/* Backward through stored forward trace. dY is scalar gradient per timestep. input is original inputs (batch's flattened seq*dim), and u_pooling assumed mean pooling done outside. */
+/* Backward through stored forward trace.
+ * dY is flattened [seq_len, dim] gradient wrt final block outputs.
+ */
 void selective_scan_backward(ForwardStore *store, MambaBlock *block, const real_t *dY,
                              const real_t *input_flat, size_t seq_len, size_t state_size) {
     if (!store || !block) return;
@@ -504,49 +518,86 @@ void selective_scan_backward(ForwardStore *store, MambaBlock *block, const real_
     OptimState *s = _find_opt(block);
     if (!s) return;
 
-    /* initialize adjoints for x_t */
-    real_t *adj_x = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
+    /* adj_y: dL/d(scan_out), where scan_out[t,i] = C_i * h_t_i */
+    real_t *adj_y = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
+    /* adj_h: dL/d(h_t), includes output and future recurrent contributions */
+    real_t *adj_h = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
+    if (!adj_y || !adj_h) {
+        free(adj_y);
+        free(adj_h);
+        return;
+    }
 
-    /* First, map output gradients (dY) back into state space via W_out and accumulate grads for W_out */
+    /* Map output grads through W_out and accumulate W_out grads.
+     * forward: out_t = W_out @ scan_out_t, scan_out_t[i] = C_i * h_t_i
+     */
     for (size_t t = 0; t < seq_len; t++) {
         for (size_t j = 0; j < dim; j++) {
             real_t dy = dY[t * dim + j];
-            /* accumulate grad W_out: row j, cols over state_size */
             for (size_t i = 0; i < state_size; i++) {
-                s->g_W_out[j * state_size + i] += dy * store->x[t * state_size + i];
-                /* propagate to adjoint of state */
-                adj_x[t * state_size + i] += dy * block->W_out.data[j * state_size + i];
+                real_t h_t_i = store->x[t * state_size + i];
+                real_t scan_t_i = block->C_mat.data[i] * h_t_i;
+                s->g_W_out[j * state_size + i] += dy * scan_t_i;
+                adj_y[t * state_size + i] += dy * block->W_out.data[j * state_size + i];
             }
         }
     }
 
-    /* Backprop through time (B and A) */
-    for (int t = (int)seq_len - 1; t >= 0; t--) {
-        real_t dt_t = block->delta[t];
-
+    /* Initial output contribution to hidden adjoint through scan_out = C ⊙ h */
+    for (size_t t = 0; t < seq_len; t++) {
         for (size_t i = 0; i < state_size; i++) {
-            real_t ax = adj_x[t*state_size + i];
-            if (ax == 0.0f) continue;
-
-            /* grad B: B_mat (original B) receives ax * bcoef * u_i where bcoef = discretization coeff */
-            real_t u_i = store->u_seq[t * state_size + i];
-            real_t bbar = store->B_bar[t * state_size + i];
-            real_t Bparam = block->B_mat.data[i];
-            real_t bcoef = (fabsl(Bparam) > 0.0f) ? (bbar / Bparam) : dt_t;
-            s->g_B_mat[i] += ax * bcoef * u_i;
-
-            /* grad A_log: chain through A_bar_t and A_bar */
-            real_t A_bar_i = expf(block->A_log.data[i]);
-            real_t A_bar_t_i = store->A_diag[t * state_size + i];
-            real_t x_prev = (t == 0) ? 0.0f : store->x[(t-1)*state_size + i];
-            s->g_A_log[i] += ax * dt_t * A_bar_t_i * A_bar_i * x_prev;
-
-            /* propagate to previous state */
-            if (t > 0) adj_x[(t-1)*state_size + i] += ax * A_bar_t_i;
+            adj_h[t * state_size + i] += adj_y[t * state_size + i] * block->C_mat.data[i];
+            s->g_C_mat[i] += adj_y[t * state_size + i] * store->x[t * state_size + i];
         }
     }
 
-    /* Backprop into W_in from controller u_seq: each controller dimension j affects only state index j (elementwise) */
+    /* Backprop through recurrent scan:
+     * h_t = dA_t * h_{t-1} + dB_t * u_t
+     * dA_t = exp(dt_t * A_i), dB_t = dt_t * B_i
+     */
+    for (int t = (int)seq_len - 1; t >= 0; t--) {
+        real_t dt_t = block->delta[t];
+        real_t ddt_t = 0.0f;
+
+        for (size_t i = 0; i < state_size; i++) {
+            real_t ah = adj_h[t * state_size + i];
+            if (ah == 0.0f) continue;
+
+            real_t u_i = store->u_seq[t * state_size + i];
+            real_t dA_i = store->A_diag[t * state_size + i];
+            real_t B_i = block->B_mat.data[i];
+            real_t A_i = block->A_log.data[i];
+            real_t x_prev = (t == 0) ? 0.0f : store->x[(t-1)*state_size + i];
+
+            /* dL/dB_i and dL/dA_i */
+            s->g_B_mat[i] += ah * dt_t * u_i;
+            s->g_A_log[i] += ah * dt_t * dA_i * x_prev;
+
+            /* propagate to previous hidden state */
+            if (t > 0) adj_h[(t-1)*state_size + i] += ah * dA_i;
+
+            /* accumulate scalar gradient wrt dt_t */
+            ddt_t += ah * (A_i * dA_i * x_prev + B_i * u_i);
+        }
+
+        /* dt_t = clamp(softplus(raw_t)); raw_t = delta_proj @ x_t */
+        {
+            const real_t *x_input_t = &input_flat[(size_t)t * dim];
+            real_t raw_t = 0.0f;
+            for (size_t k = 0; k < dim; k++) {
+                raw_t += block->delta_proj.data[k] * x_input_t[k];
+            }
+            real_t sp = softplus(raw_t);
+            if (sp > block->config.dt_min && sp < block->config.dt_max) {
+                real_t draw = ddt_t * sigmoid(raw_t);
+                for (size_t k = 0; k < dim; k++) {
+                    s->g_delta_proj[k] += draw * x_input_t[k];
+                }
+            }
+        }
+    }
+
+    /* Backprop into W_in via u_t = silu(W_in @ x_t). */
     for (size_t t = 0; t < seq_len; t++) {
         const real_t *x_input_t = &input_flat[t * dim];
 
@@ -555,9 +606,9 @@ void selective_scan_backward(ForwardStore *store, MambaBlock *block, const real_
         matrix_vec_mult(z, &block->W_in, x_input_t);
 
         for (size_t j = 0; j < state_size; j++) {
-            /* derivative of loss wrt controller u_j */
+            /* dL/du_j = dL/dh_t_j * dB_t_j */
             real_t bbar = store->B_bar[t * state_size + j]; /* dt_t * B[j] */
-            real_t du = adj_x[t * state_size + j] * bbar; /* dL/du_j = ax * bbar */
+            real_t du = adj_h[t * state_size + j] * bbar;
 
             /* silu'(z) */
             real_t sig = sigmoid(z[j]);
@@ -572,7 +623,8 @@ void selective_scan_backward(ForwardStore *store, MambaBlock *block, const real_
         free(z);
     }
 
-    free(adj_x);
+    free(adj_y);
+    free(adj_h);
 }
 
 /* Backward entrypoint: compute gradients for a single batch element (batch_index unused here as we perform batch_size=1 in examples) */
@@ -581,10 +633,9 @@ void mamba_backward(MambaBlock *block, const real_t *dY, const real_t *input, si
     size_t seq_len = block->config.seq_len;
     size_t state_size = block->config.state_size;
 
-    /* Re-run forward to capture stored traces (we could have kept them during forward in realistic implementation) */
-    /* For simplicity call selective_scan_forward_store here using A_bar built from A_log and B from B_mat */
+    /* Re-run forward to capture traces, aligned with scan1d forward math. */
     Matrix *A_bar = matrix_create(state_size, state_size);
-    for (size_t i = 0; i < state_size; i++) A_bar->data[i * state_size + i] = expf(block->A_log.data[i]);
+    for (size_t i = 0; i < state_size; i++) A_bar->data[i * state_size + i] = block->A_log.data[i];
     real_t *B_bar = (real_t *)malloc(state_size * sizeof(real_t));
     for (size_t i = 0; i < state_size; i++) B_bar[i] = block->B_mat.data[i];
 
@@ -627,8 +678,6 @@ void mamba_backward(MambaBlock *block, const real_t *dY, const real_t *input, si
 
     /* call backward on stored trace */
     selective_scan_backward(&store, block, dY, input, seq_len, state_size);
-
-    /* accumulate gradients from W_out if used: in forward we projected scan_out into output[0] slot only; handle W_out as mapping from scan outputs to output vector — for simplicity we compute gradient for W_out as zeros here */
 
     /* free store */
     free(store.x); free(store.A_diag); free(store.B_bar); free(store.u_seq); free(u_seq);
@@ -679,39 +728,31 @@ void mamba_forward(MambaBlock *block, real_t *output, const real_t *input,
         }
         free(tmp_delta);
 
-        /* Selective scan across sequence */
+        /* Selective scan via scan1d ASM kernel — L=seq_len, D=state_size, M=1 */
         real_t *scan_out = (real_t *)malloc(seq_len * state_size * sizeof(real_t));
-        if (!scan_out) {
-            free(u_seq);
-            continue;
+        if (!scan_out) { free(u_seq); continue; }
+
+        long L = (long)seq_len, D = (long)state_size;
+
+        /* Remplir les buffers pré-alloués */
+        for (long t = 0; t < L; t++) {
+            for (long d = 0; d < D; d++) {
+                block->scan_B    [t*D + d] = block->B_mat.data[d];
+                block->scan_C    [t*D + d] = block->C_mat.data[d];
+                block->scan_delta[t*D + d] = block->delta[t];
+            }
         }
-        
-        /* Create A_bar matrix from A_log */
-        Matrix *A_bar = matrix_create(state_size, state_size);
-        real_t *B_bar = (real_t *)malloc(state_size * sizeof(real_t));
-        
-        if (!A_bar || !A_bar->data || !B_bar) {
-            free(u_seq);
-            free(scan_out);
-            if (A_bar) matrix_free(A_bar);
-            free(B_bar);
-            continue;
-        }
-        
-        /* Initialize A_bar from A_log */
-        for (size_t i = 0; i < state_size; i++) {
-            A_bar->data[i * state_size + i] = expf(block->A_log.data[i]);
-        }
-        
-        /* Initialize B_bar from B */
-        for (size_t i = 0; i < state_size; i++) {
-            B_bar[i] = block->B_mat.data[i];
-        }
-        
-        /* Run selective scan */
-        selective_scan(scan_out, block->hidden, u_seq, block->delta,
-                  A_bar, B_bar, &block->C_mat, 0.0f,
-                  seq_len, state_size);
+        memset(block->scan_h, 0, (size_t)D * sizeof(real_t));
+
+        ScanParams sp = {
+            .x = u_seq, .A = block->A_log.data,
+            .B = block->scan_B, .C = block->scan_C,
+            .delta = block->scan_delta, .h = block->scan_h,
+            .y = scan_out,
+            .L = L, .D = D, .M = 1
+        };
+        scan1d(&sp);
+        memcpy(block->hidden, block->scan_h, (size_t)D * sizeof(real_t));
         
         /* Output projection: y_t = W_out @ state_t (scan_out contains state vectors) */
         real_t *ybuf = (real_t *)malloc(dim * sizeof(real_t));
@@ -724,7 +765,251 @@ void mamba_forward(MambaBlock *block, real_t *output, const real_t *input,
         
         free(u_seq);
         free(scan_out);
-        matrix_free(A_bar);
-        free(B_bar);
     }
+}
+
+/* ============================================================================
+ * Forward 2D — Mamba sur grille [d1, d2, dim] via scan2d ASM (wavefront)
+ * ============================================================================ */
+void mamba_forward_2d(MambaBlock *block, real_t *output, const real_t *input,
+                      size_t d1, size_t d2) {
+    if (!block || !output || !input) return;
+
+    size_t dim  = block->config.dim;
+    size_t D    = block->config.state_size;
+    size_t P    = d1 * d2;   /* nombre total de positions */
+    long   M    = 1;
+
+    /* --- 1. Projection d'entrée : u[p, D] = silu(W_in @ x[p, dim]) --- */
+    real_t *u          = (real_t *)calloc(P * D, sizeof(real_t));
+    real_t *delta_pos  = (real_t *)calloc(P,     sizeof(real_t));
+    real_t *tmp_delta  = (real_t *)calloc(block->delta_proj.rows, sizeof(real_t));
+
+    if (!u || !delta_pos || !tmp_delta) {
+        free(u); free(delta_pos); free(tmp_delta);
+        return;
+    }
+
+    for (size_t p = 0; p < P; p++) {
+        const real_t *x_p = &input[p * dim];
+        real_t *u_p       = &u[p * D];
+
+        real_t *z = (real_t *)malloc(D * sizeof(real_t));
+        if (!z) continue;
+        matrix_vec_mult(z, &block->W_in, x_p);
+        for (size_t d = 0; d < D; d++)
+            u_p[d] = z[d] * sigmoid(z[d]);
+        free(z);
+
+        matrix_vec_mult(tmp_delta, &block->delta_proj, x_p);
+        real_t dval = softplus(tmp_delta[0]);
+        if (dval < block->config.dt_min) dval = block->config.dt_min;
+        if (dval > block->config.dt_max) dval = block->config.dt_max;
+        delta_pos[p] = dval;
+    }
+    free(tmp_delta);
+
+    /* --- 2. Préparer les tableaux pour scan2d --- */
+    real_t *B_s  = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *C_s  = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *d1_s = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *d2_s = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *h_s  = (real_t *)calloc(P * D, sizeof(real_t));  /* tous les états */
+    real_t *y_s  = (real_t *)malloc(P * D * sizeof(real_t));
+
+    if (!B_s || !C_s || !d1_s || !d2_s || !h_s || !y_s) {
+        free(B_s); free(C_s); free(d1_s); free(d2_s); free(h_s); free(y_s);
+        free(u); free(delta_pos);
+        return;
+    }
+
+    for (size_t p = 0; p < P; p++) {
+        for (size_t d = 0; d < D; d++) {
+            B_s [p*D + d] = block->B_mat.data[d];
+            C_s [p*D + d] = 1.0f;
+            d1_s[p*D + d] = delta_pos[p];
+            d2_s[p*D + d] = delta_pos[p];
+        }
+    }
+    free(delta_pos);
+
+    /* --- 3. Lancer scan2d --- */
+    Scan2DParams sp = {
+        .x      = u,
+        .A1     = block->A_log.data,
+        .A2     = block->A_log.data,
+        .B      = B_s,
+        .C      = C_s,
+        .delta1 = d1_s,
+        .delta2 = d2_s,
+        .h      = h_s,
+        .y      = y_s,
+        .d1     = (long)d1,
+        .d2     = (long)d2,
+        .D      = (long)D,
+        .M      = M
+    };
+    scan2d(&sp);
+
+    /* --- 4. Projection de sortie : output[p, dim] = W_out @ y[p, D] --- */
+    real_t *ybuf = (real_t *)malloc(dim * sizeof(real_t));
+    if (ybuf) {
+        for (size_t p = 0; p < P; p++) {
+            matrix_vec_mult(ybuf, &block->W_out, &y_s[p * D]);
+            memcpy(&output[p * dim], ybuf, dim * sizeof(real_t));
+        }
+        free(ybuf);
+    }
+
+    free(u); free(B_s); free(C_s); free(d1_s); free(d2_s); free(h_s); free(y_s);
+}
+
+/* ============================================================================
+ * Backward 2D — Rétropropagation à travers mamba_forward_2d
+ *
+ * dY    : [d1, d2, dim] — gradient de la loss sur la sortie
+ * input : [d1, d2, dim] — entrée originale
+ * ============================================================================ */
+void mamba_backward_2d(MambaBlock *block, const real_t *dY, const real_t *input,
+                       size_t d1, size_t d2) {
+    if (!block || !dY || !input) return;
+
+    size_t dim = block->config.dim;
+    size_t D   = block->config.state_size;
+    size_t P   = d1 * d2;
+
+    OptimState *s = _find_opt(block);
+    if (!s) return;
+
+    /* --- Re-run forward pour capturer u, delta_pos, h_all --- */
+    real_t *u          = (real_t *)calloc(P * D, sizeof(real_t));
+    real_t *delta_pos  = (real_t *)calloc(P,     sizeof(real_t));
+    real_t *tmp_delta  = (real_t *)calloc(block->delta_proj.rows, sizeof(real_t));
+    real_t *B_s        = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *C_s        = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *d1_s       = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *d2_s       = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *h_all      = (real_t *)calloc(P * D, sizeof(real_t));
+    real_t *y_scan     = (real_t *)malloc(P * D * sizeof(real_t));
+
+    if (!u || !delta_pos || !tmp_delta || !B_s || !C_s ||
+        !d1_s || !d2_s || !h_all || !y_scan) {
+        free(u); free(delta_pos); free(tmp_delta);
+        free(B_s); free(C_s); free(d1_s); free(d2_s);
+        free(h_all); free(y_scan);
+        return;
+    }
+
+    /* Projection d'entrée */
+    for (size_t p = 0; p < P; p++) {
+        const real_t *x_p = &input[p * dim];
+        real_t *z = (real_t *)malloc(D * sizeof(real_t));
+        if (!z) continue;
+        matrix_vec_mult(z, &block->W_in, x_p);
+        for (size_t d = 0; d < D; d++)
+            u[p * D + d] = z[d] * sigmoid(z[d]);
+        free(z);
+
+        matrix_vec_mult(tmp_delta, &block->delta_proj, x_p);
+        real_t dval = softplus(tmp_delta[0]);
+        if (dval < block->config.dt_min) dval = block->config.dt_min;
+        if (dval > block->config.dt_max) dval = block->config.dt_max;
+        delta_pos[p] = dval;
+    }
+    free(tmp_delta);
+
+    for (size_t p = 0; p < P; p++) {
+        for (size_t d = 0; d < D; d++) {
+            B_s [p*D + d] = block->B_mat.data[d];
+            C_s [p*D + d] = 1.0f;
+            d1_s[p*D + d] = delta_pos[p];
+            d2_s[p*D + d] = delta_pos[p];
+        }
+    }
+
+    Scan2DParams sp = {
+        .x = u, .A1 = block->A_log.data, .A2 = block->A_log.data,
+        .B = B_s, .C = C_s, .delta1 = d1_s, .delta2 = d2_s,
+        .h = h_all, .y = y_scan,
+        .d1 = (long)d1, .d2 = (long)d2, .D = (long)D, .M = 1
+    };
+    scan2d(&sp);
+    free(B_s); free(C_s); free(d1_s); free(d2_s);
+
+    /* --- Backward W_out + initialiser adj_h --- */
+    real_t *adj_h = (real_t *)calloc(P * D, sizeof(real_t));
+    real_t *adj_u = (real_t *)calloc(P * D, sizeof(real_t));
+    if (!adj_h || !adj_u) {
+        free(adj_h); free(adj_u);
+        free(u); free(delta_pos); free(h_all); free(y_scan);
+        return;
+    }
+
+    for (size_t p = 0; p < P; p++) {
+        for (size_t j = 0; j < dim; j++) {
+            real_t dy = dY[p * dim + j];
+            for (size_t d = 0; d < D; d++) {
+                s->g_W_out[j * D + d] += dy * y_scan[p * D + d];
+                adj_h[p * D + d]      += dy * block->W_out.data[j * D + d];
+            }
+        }
+    }
+    free(y_scan);
+
+    /* --- Backward scan2d : wavefront inverse k = (d1+d2-2) → 0 --- */
+    for (long k = (long)(d1 + d2 - 2); k >= 0; k--) {
+        long i_min = k - (long)d2 + 1; if (i_min < 0) i_min = 0;
+        long i_max = k;                 if (i_max > (long)d1 - 1) i_max = (long)d1 - 1;
+
+        for (long i = i_min; i <= i_max; i++) {
+            long j = k - i;
+            size_t p = (size_t)(i * (long)d2 + j);
+
+            real_t dt = delta_pos[p];
+
+            for (size_t d = 0; d < D; d++) {
+                real_t ah  = adj_h[p * D + d];
+                if (ah == 0.0f) continue;
+
+                real_t a_val = block->A_log.data[d];
+                real_t dA    = expf(dt * a_val);
+
+                real_t h_prev1 = (i > 0) ? h_all[((size_t)(i-1) * d2 + (size_t)j) * D + d] : 0.0f;
+                real_t h_prev2 = (j > 0) ? h_all[((size_t)i * d2 + (size_t)(j-1)) * D + d] : 0.0f;
+
+                /* grad A_log — A1 et A2 sont le même buffer */
+                s->g_A_log[d] += ah * dt * dA * (h_prev1 + h_prev2);
+
+                /* propagation aux prédécesseurs */
+                if (i > 0) adj_h[((size_t)(i-1) * d2 + (size_t)j) * D + d] += ah * dA;
+                if (j > 0) adj_h[((size_t)i * d2 + (size_t)(j-1)) * D + d] += ah * dA;
+
+                /* grad B_mat : dB = dt * B[d], d(h)/d(B[d]) = dt * u[p,d] */
+                s->g_B_mat[d] += ah * dt * u[p * D + d];
+
+                /* adj_u : d(h)/d(u[p,d]) = dt * B[d] */
+                adj_u[p * D + d] += ah * dt * block->B_mat.data[d];
+            }
+        }
+    }
+    free(h_all); free(delta_pos);
+
+    /* --- Backward SiLU + W_in --- */
+    for (size_t p = 0; p < P; p++) {
+        const real_t *x_p = &input[p * dim];
+        real_t *z = (real_t *)malloc(D * sizeof(real_t));
+        if (!z) continue;
+        matrix_vec_mult(z, &block->W_in, x_p);
+
+        for (size_t d = 0; d < D; d++) {
+            real_t sig    = sigmoid(z[d]);
+            real_t dsilu  = sig * (1.0f + z[d] * (1.0f - sig));
+            real_t contrib = adj_u[p * D + d] * dsilu;
+            for (size_t kk = 0; kk < dim; kk++)
+                s->g_W_in[d * dim + kk] += contrib * x_p[kk];
+        }
+        free(z);
+    }
+
+    free(u); free(adj_h); free(adj_u);
 }

@@ -54,4 +54,43 @@ void silu_f32(float *x, float *y, long n);
 /* y[i] = logf(1 + expf(x[i])) */
 void softplus_f32(float *x, float *y, long n);
 
+/* ---- Selective Scan 1D -------------------------------------------- */
+
+typedef struct {
+    float *x;       /* [L, D]       — entrée */
+    float *A;       /* [D, M]       — log diagonal de A (valeurs négatives) */
+    float *B;       /* [L, D, M]    — matrice d'entrée sélective */
+    float *C;       /* [L, D, M]    — matrice de sortie sélective */
+    float *delta;   /* [L, D]       — pas de discrétisation (positif) */
+    float *h;       /* [D, M]       — état caché (entrée/sortie) */
+    float *y;       /* [L, D]       — sortie */
+    long   L;
+    long   D;
+    long   M;
+} ScanParams;
+
+/* Scan sélectif 1D — interface principale */
+void scan1d(ScanParams *p);
+
+/* ---- Selective Scan 2D (Wavefront) -------------------------------- */
+
+typedef struct {
+    float *x;       /* [d1, d2, D]     — entrée */
+    float *A1;      /* [D, M]          — transition axe 1 */
+    float *A2;      /* [D, M]          — transition axe 2 */
+    float *B;       /* [d1, d2, D, M]  — matrice d entrée sélective */
+    float *C;       /* [d1, d2, D, M]  — matrice de sortie sélective */
+    float *delta1;  /* [d1, d2, D]     — pas axe 1 */
+    float *delta2;  /* [d1, d2, D]     — pas axe 2 */
+    float *h;       /* [d1, d2, D, M]  — tous les états cachés */
+    float *y;       /* [d1, d2, D]     — sortie */
+    long   d1;
+    long   d2;
+    long   D;
+    long   M;
+} Scan2DParams;
+
+/* Scan sélectif 2D avec ordonnancement wavefront */
+void scan2d(Scan2DParams *p);
+
 #endif /* OPTIMATRIX_BRIDGE_H */

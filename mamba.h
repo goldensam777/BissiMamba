@@ -55,7 +55,13 @@ typedef struct {
     
     /* Temporary buffers */
     real_t *hidden;     /* Hidden state (state_size) */
-    real_t *delta;      /* Delta time values */
+    real_t *delta;      /* Delta time values (seq_len) */
+
+    /* Pre-allocated scan1d adapter buffers — évite malloc par forward */
+    real_t *scan_B;     /* [seq_len, state_size] — B_mat répliqué */
+    real_t *scan_C;     /* [seq_len, state_size] — ones (readout neutre) */
+    real_t *scan_delta; /* [seq_len, state_size] — delta[t] répliqué */
+    real_t *scan_h;     /* [state_size]          — état caché pour scan1d */
 } MambaBlock;
 
 /* Gradient and optimizer state held per-block for CPU training */
@@ -129,6 +135,14 @@ void mamba_block_init(MambaBlock *block);
  * output: (seq_len, dim) flattened in row-major order
  */
 void mamba_forward(MambaBlock *block, real_t *output, const real_t *input, size_t batch_size);
+
+/* Forward pass 2D — entree grille [d1, d2, dim], sortie [d1, d2, dim] */
+void mamba_forward_2d(MambaBlock *block, real_t *output, const real_t *input,
+                      size_t d1, size_t d2);
+
+/* Backward pass 2D — gradient de la loss sur la sortie [d1, d2, dim] */
+void mamba_backward_2d(MambaBlock *block, const real_t *dY, const real_t *input,
+                       size_t d1, size_t d2);
 
 /* Compute delta time values for each timestep
  * delta_out: (seq_len) vector of delta values

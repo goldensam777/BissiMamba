@@ -12,7 +12,7 @@ Mamba is a recent advancement in sequence modeling that combines the efficiency 
 
 ## Project Structure
 
-```
+```tree
 BissiMamba/
 ├── mamba.h           # Header file with public API and data structures
 ├── mamba.c           # Core implementation of Mamba algorithm
@@ -26,26 +26,34 @@ BissiMamba/
 ### Data Structures
 
 #### `Matrix`
+
 Represents a 2D matrix with:
+
 - `data`: Flattened array (row-major order)
 - `rows`, `cols`: Dimensions
 
 #### `SSMParams`
+
 State space model parameters:
+
 - `A`: State transition matrix (N × N)
 - `B`: Input matrix (N × 1)
 - `C`: Output matrix (1 × N)
 - `D`: Feedthrough term
 
 #### `MambaConfig`
+
 Configuration for Mamba block:
+
 - `dim`: Model dimension
 - `state_size`: State space dimension (N)
 - `seq_len`: Sequence length
 - `dt_*`: Delta time parameters
 
 #### `MambaBlock`
+
 Main Mamba block state:
+
 - Projection matrices (W_in, W_out)
 - SSM matrices (A_log, B, C)
 - Temporary buffers and parameters
@@ -55,7 +63,8 @@ Main Mamba block state:
 #### 1. **State Space Model Fundamentals**
 
 A continuous-time SSM is:
-```
+
+```math
 ẋ(t) = A·x(t) + B·u(t)
 y(t) = C·x(t) + D·u(t)
 ```
@@ -63,18 +72,21 @@ y(t) = C·x(t) + D·u(t)
 #### 2. **Discretization**
 
 Convert to discrete time with step size Δt:
-```
+
+```maths
 x[n] = Ā·x[n-1] + B̄·u[n]
 y[n] = C·x[n] + D·u[n]
 ```
 
 Where:
+
 - `Ā = exp(Δt·A)`
 - `B̄ = (Δt·A)^(-1)·(exp(Δt·A) - I)·B`
 
 #### 3. **Selective Scan**
 
 The core Mamba operation:
+
 - For each timestep, adapt the state dynamics based on delta time (Δt)
 - Apply state transition: `x[n] = Ā[n]·x[n-1] + B̄[n]·u[n]`
 - Compute output: `y[n] = C·x[n] + D·u[n]`
@@ -273,6 +285,7 @@ This implementation is provided for educational purposes.
 ## Contributing
 
 Feel free to extend this implementation with:
+
 - Additional features from the original Mamba paper
 - Performance optimizations
 - GPU implementations

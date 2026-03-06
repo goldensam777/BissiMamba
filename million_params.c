@@ -22,8 +22,11 @@ int main(void) {
     printf("  State size:        %zu\n", config.state_size);
     printf("  Sequence length:   %zu\n", config.seq_len);
     
-    /* Compute parameter count */
-    size_t params = 2 * config.dim * config.dim + 3 * config.state_size + config.dim;
+    /* Compute parameter count from actual tensor shapes:
+     * W_in[state_size x dim] + W_out[dim x state_size]
+     * + A/B/C[state_size each] + delta_proj[dim]
+     */
+    size_t params = 2 * config.state_size * config.dim + 3 * config.state_size + config.dim;
     printf("  Total parameters:  %zu (~%.2fM)\n\n", params, (double)params / 1e6);
     
     /* Create block */
@@ -77,9 +80,9 @@ int main(void) {
     
     /* Compute flops (rough estimate: W_in, selective_scan, W_out) */
     double flops = 0.0;
-    flops += config.seq_len * config.dim * config.dim;  /* W_in projection */
+    flops += config.seq_len * config.state_size * config.dim;  /* W_in projection */
     flops += config.seq_len * config.state_size * 2;    /* selective_scan */
-    flops += config.seq_len * config.dim * config.dim;  /* W_out projection */
+    flops += config.seq_len * config.dim * config.state_size;  /* W_out projection */
     
     printf("  Estimated FLOPs:  %.2e\n", flops);
     if (elapsed_ms > 0) {
