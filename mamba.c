@@ -624,6 +624,7 @@ void selective_scan_backward(ForwardStore *store, MambaBlock *block, const real_
         ScanBackwardSharedParams bp = {
             .x = store->u_seq,
             .A = block->A_log.data,
+            .A_diag = store->A_diag,
             .B = block->B_mat.data,
             .C = block->C_mat.data,
             .delta = block->delta,

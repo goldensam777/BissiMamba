@@ -99,6 +99,7 @@ void scan1d_backward(ScanBackwardParams *p);
 typedef struct {
     float *x;       /* [L, D]       — entrée du scan */
     float *A;       /* [D]          — paramètres de transition */
+    float *A_diag;  /* [L, D]       — dA pré-calculé optionnel */
     float *B;       /* [D]          — matrice B partagée par canal */
     float *C;       /* [D]          — matrice C partagée par canal */
     float *delta;   /* [L]          — pas scalaire par timestep */
