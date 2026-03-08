@@ -23,6 +23,14 @@ static size_t g_opt_n = 0;
 /* forward declarations */
 static void _mamba_free_opt_for(MambaBlock *block);
 static OptimState* _find_opt(MambaBlock *block);
+static int matrix_init_owned(Matrix *dst, size_t rows, size_t cols);
+static void project_controller(const MambaBlock *block, const real_t *x_t,
+                               real_t *z_buf, real_t *u_out);
+static real_t project_delta_value(const MambaBlock *block, const real_t *x_t,
+                                  real_t *tmp_delta, size_t position,
+                                  size_t total_positions);
+static void transpose_row_major(const real_t *src, real_t *dst,
+                                size_t rows, size_t cols);
 
 /* ============================================================================
  * Matrix Operations
@@ -42,6 +50,20 @@ Matrix* matrix_create(size_t rows, size_t cols) {
     }
     
     return m;
+}
+
+static int matrix_init_owned(Matrix *dst, size_t rows, size_t cols) {
+    Matrix *m;
+
+    if (!dst) return -1;
+    m = matrix_create(rows, cols);
+    if (!m) {
+        memset(dst, 0, sizeof(*dst));
+        return -1;
+    }
+    *dst = *m;
+    free(m);
+    return 0;
 }
 
 void matrix_free(Matrix *m) {
@@ -94,6 +116,42 @@ void vec_scale(real_t *v, real_t alpha, size_t n) {
     if (!v) return;
     for (size_t i = 0; i < n; i++) {
         v[i] *= alpha;
+    }
+}
+
+static void project_controller(const MambaBlock *block, const real_t *x_t,
+                               real_t *z_buf, real_t *u_out) {
+    if (!block || !x_t || !z_buf || !u_out) return;
+    matrix_vec_mult(z_buf, &block->W_in, x_t);
+    silu_f32(z_buf, u_out, (long)block->config.state_size);
+}
+
+static real_t project_delta_value(const MambaBlock *block, const real_t *x_t,
+                                  real_t *tmp_delta, size_t position,
+                                  size_t total_positions) {
+    real_t dval;
+
+    if (!block || !x_t || !tmp_delta || total_positions == 0) return 0.0f;
+
+    if (block->delta_proj.rows > 0) {
+        matrix_vec_mult(tmp_delta, &block->delta_proj, x_t);
+        dval = softplus(tmp_delta[0]);
+        if (dval < block->config.dt_min) dval = block->config.dt_min;
+        if (dval > block->config.dt_max) dval = block->config.dt_max;
+        return dval;
+    }
+
+    return block->config.dt_scale *
+           ((real_t)position / (real_t)total_positions + 1.0f);
+}
+
+static void transpose_row_major(const real_t *src, real_t *dst,
+                                size_t rows, size_t cols) {
+    if (!src || !dst) return;
+    for (size_t i = 0; i < rows; i++) {
+        for (size_t j = 0; j < cols; j++) {
+            dst[j * rows + i] = src[i * cols + j];
+        }
     }
 }
 
@@ -217,20 +275,22 @@ MambaBlock* mamba_block_create(const MambaConfig *config) {
     
     MambaBlock *block = (MambaBlock *)malloc(sizeof(MambaBlock));
     if (!block) return NULL;
+    memset(block, 0, sizeof(*block));
     
     block->config = *config;
     
     /* Allocate matrices */
-     /* W_in: state_size x dim  (maps input -> controller vector)
-         W_out: dim x state_size (maps state -> output) */
-     block->W_in = *matrix_create(config->state_size, config->dim);
-     block->W_out = *matrix_create(config->dim, config->state_size);
-    
-    block->A_log = *matrix_create(config->state_size, 1);
-    block->B_mat = *matrix_create(config->state_size, 1);
-    block->C_mat = *matrix_create(config->state_size, 1);
-    
-    block->delta_proj = *matrix_create(1, config->dim);
+    /* W_in: state_size x dim  (maps input -> controller vector)
+       W_out: dim x state_size (maps state -> output) */
+    if (matrix_init_owned(&block->W_in, config->state_size, config->dim) != 0 ||
+        matrix_init_owned(&block->W_out, config->dim, config->state_size) != 0 ||
+        matrix_init_owned(&block->A_log, config->state_size, 1) != 0 ||
+        matrix_init_owned(&block->B_mat, config->state_size, 1) != 0 ||
+        matrix_init_owned(&block->C_mat, config->state_size, 1) != 0 ||
+        matrix_init_owned(&block->delta_proj, 1, config->dim) != 0) {
+        mamba_block_free(block);
+        return NULL;
+    }
     
     /* Allocate temporary buffers */
     block->hidden = (real_t *)calloc(config->state_size, sizeof(real_t));
@@ -518,113 +578,121 @@ void selective_scan_backward(ForwardStore *store, MambaBlock *block, const real_
     OptimState *s = _find_opt(block);
     if (!s) return;
 
+    /* scan_out[t,i] = C_i * h_t_i */
+    real_t *scan_out = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
+    real_t *dY_T = (real_t *)calloc(dim * seq_len, sizeof(real_t));
     /* adj_y: dL/d(scan_out), where scan_out[t,i] = C_i * h_t_i */
     real_t *adj_y = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
-    /* adj_h: dL/d(h_t), includes output and future recurrent contributions */
-    real_t *adj_h = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
-    if (!adj_y || !adj_h) {
+    real_t *scan_du = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
+    real_t *scan_dA = (real_t *)calloc(state_size, sizeof(real_t));
+    real_t *scan_dB = (real_t *)calloc(state_size, sizeof(real_t));
+    real_t *scan_dC = (real_t *)calloc(state_size, sizeof(real_t));
+    real_t *scan_ddelta = (real_t *)calloc(seq_len, sizeof(real_t));
+    real_t *contrib_T = (real_t *)calloc(state_size * seq_len, sizeof(real_t));
+    real_t *z = (real_t *)malloc(state_size * sizeof(real_t));
+    if (!scan_out || !dY_T || !adj_y || !scan_du || !scan_dA ||
+        !scan_dB || !scan_dC || !scan_ddelta || !contrib_T || !z) {
+        free(scan_out);
+        free(dY_T);
         free(adj_y);
-        free(adj_h);
+        free(scan_du);
+        free(scan_dA);
+        free(scan_dB);
+        free(scan_dC);
+        free(scan_ddelta);
+        free(contrib_T);
+        free(z);
         return;
     }
 
-    /* Map output grads through W_out and accumulate W_out grads.
-     * forward: out_t = W_out @ scan_out_t, scan_out_t[i] = C_i * h_t_i
-     */
+    /* Build scan_out rows and transpose dY once for GEMM-based gradient accumulation. */
     for (size_t t = 0; t < seq_len; t++) {
-        for (size_t j = 0; j < dim; j++) {
-            real_t dy = dY[t * dim + j];
-            for (size_t i = 0; i < state_size; i++) {
-                real_t h_t_i = store->x[t * state_size + i];
-                real_t scan_t_i = block->C_mat.data[i] * h_t_i;
-                s->g_W_out[j * state_size + i] += dy * scan_t_i;
-                adj_y[t * state_size + i] += dy * block->W_out.data[j * state_size + i];
-            }
-        }
+        hadamard_avx2(store->x + t * state_size, block->C_mat.data,
+                      scan_out + t * state_size, (long)state_size);
+    }
+    transpose_row_major(dY, dY_T, seq_len, dim);
+
+    /* g_W_out += dY^T @ scan_out */
+    gemm_avx2(dY_T, scan_out, s->g_W_out,
+              (long)dim, (long)seq_len, (long)state_size);
+
+    /* adj_y = dY @ W_out */
+    gemm_avx2((real_t *)dY, block->W_out.data, adj_y,
+              (long)seq_len, (long)dim, (long)state_size);
+
+    {
+        ScanBackwardSharedParams bp = {
+            .x = store->u_seq,
+            .A = block->A_log.data,
+            .B = block->B_mat.data,
+            .C = block->C_mat.data,
+            .delta = block->delta,
+            .h0 = NULL,
+            .h = store->x,
+            .dy = adj_y,
+            .dx = scan_du,
+            .dA = scan_dA,
+            .dB = scan_dB,
+            .dC = scan_dC,
+            .ddelta = scan_ddelta,
+            .L = (long)seq_len,
+            .D = (long)state_size
+        };
+        scan1d_backward_m1_shared_bc(&bp);
     }
 
-    /* Initial output contribution to hidden adjoint through scan_out = C ⊙ h */
-    for (size_t t = 0; t < seq_len; t++) {
-        for (size_t i = 0; i < state_size; i++) {
-            adj_h[t * state_size + i] += adj_y[t * state_size + i] * block->C_mat.data[i];
-            s->g_C_mat[i] += adj_y[t * state_size + i] * store->x[t * state_size + i];
-        }
+    for (size_t i = 0; i < state_size; i++) {
+        s->g_A_log[i] += scan_dA[i];
+        s->g_B_mat[i] += scan_dB[i];
+        s->g_C_mat[i] += scan_dC[i];
     }
 
-    /* Backprop through recurrent scan:
-     * h_t = dA_t * h_{t-1} + dB_t * u_t
-     * dA_t = exp(dt_t * A_i), dB_t = dt_t * B_i
-     */
-    for (int t = (int)seq_len - 1; t >= 0; t--) {
-        real_t dt_t = block->delta[t];
-        real_t ddt_t = 0.0f;
-
-        for (size_t i = 0; i < state_size; i++) {
-            real_t ah = adj_h[t * state_size + i];
-            if (ah == 0.0f) continue;
-
-            real_t u_i = store->u_seq[t * state_size + i];
-            real_t dA_i = store->A_diag[t * state_size + i];
-            real_t B_i = block->B_mat.data[i];
-            real_t A_i = block->A_log.data[i];
-            real_t x_prev = (t == 0) ? 0.0f : store->x[(t-1)*state_size + i];
-
-            /* dL/dB_i and dL/dA_i */
-            s->g_B_mat[i] += ah * dt_t * u_i;
-            s->g_A_log[i] += ah * dt_t * dA_i * x_prev;
-
-            /* propagate to previous hidden state */
-            if (t > 0) adj_h[(t-1)*state_size + i] += ah * dA_i;
-
-            /* accumulate scalar gradient wrt dt_t */
-            ddt_t += ah * (A_i * dA_i * x_prev + B_i * u_i);
-        }
+    for (size_t t = 0; t < seq_len; t++) {
+        const real_t *x_input_t = &input_flat[t * dim];
+        real_t ddt_t = scan_ddelta[t];
 
         /* dt_t = clamp(softplus(raw_t)); raw_t = delta_proj @ x_t */
         {
-            const real_t *x_input_t = &input_flat[(size_t)t * dim];
             real_t raw_t = 0.0f;
             for (size_t k = 0; k < dim; k++) {
                 raw_t += block->delta_proj.data[k] * x_input_t[k];
             }
-            real_t sp = softplus(raw_t);
-            if (sp > block->config.dt_min && sp < block->config.dt_max) {
-                real_t draw = ddt_t * sigmoid(raw_t);
-                for (size_t k = 0; k < dim; k++) {
-                    s->g_delta_proj[k] += draw * x_input_t[k];
+            {
+                real_t sp = softplus(raw_t);
+                if (sp > block->config.dt_min && sp < block->config.dt_max) {
+                    real_t draw = ddt_t * sigmoid(raw_t);
+                    for (size_t k = 0; k < dim; k++) {
+                        s->g_delta_proj[k] += draw * x_input_t[k];
+                    }
                 }
             }
         }
-    }
-
-    /* Backprop into W_in via u_t = silu(W_in @ x_t). */
-    for (size_t t = 0; t < seq_len; t++) {
-        const real_t *x_input_t = &input_flat[t * dim];
 
         /* reconstruct pre-activation z = W_in @ x_input_t (length state_size) */
-        real_t *z = (real_t *)malloc(state_size * sizeof(real_t));
         matrix_vec_mult(z, &block->W_in, x_input_t);
 
         for (size_t j = 0; j < state_size; j++) {
-            /* dL/du_j = dL/dh_t_j * dB_t_j */
-            real_t bbar = store->B_bar[t * state_size + j]; /* dt_t * B[j] */
-            real_t du = adj_h[t * state_size + j] * bbar;
-
             /* silu'(z) */
             real_t sig = sigmoid(z[j]);
             real_t dz = sig * (1.0f + z[j] * (1.0f - sig));
-            real_t contrib = du * dz; /* no mean pooling */
-
-            /* accumulate gradient into W_in row j */
-            for (size_t k = 0; k < block->W_in.cols; k++) {
-                s->g_W_in[j * block->W_in.cols + k] += contrib * x_input_t[k];
-            }
+            scan_out[t * state_size + j] = scan_du[t * state_size + j] * dz;
         }
-        free(z);
     }
 
+    transpose_row_major(scan_out, contrib_T, seq_len, state_size);
+    gemm_avx2(contrib_T, (real_t *)input_flat, s->g_W_in,
+              (long)state_size, (long)seq_len, (long)dim);
+
+    free(scan_out);
+    free(dY_T);
+    free(z);
     free(adj_y);
-    free(adj_h);
+    free(scan_du);
+    free(scan_dA);
+    free(scan_dB);
+    free(scan_dC);
+    free(scan_ddelta);
+    free(contrib_T);
 }
 
 /* Backward entrypoint: compute gradients for a single batch element (batch_index unused here as we perform batch_size=1 in examples) */
@@ -648,30 +716,24 @@ void mamba_backward(MambaBlock *block, const real_t *dY, const real_t *input, si
     if (!u_seq) { matrix_free(A_bar); free(B_bar); return; }
 
     /* temporary buffer for delta projection (delta_proj has rows=1) */
-    real_t *tmp_delta = (real_t *)calloc(block->delta_proj.rows, sizeof(real_t));
+    real_t *tmp_delta = (real_t *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
+                                         sizeof(real_t));
+    real_t *z = (real_t *)malloc(state_size * sizeof(real_t));
+    if (!tmp_delta || !z) {
+        free(z);
+        free(tmp_delta);
+        free(u_seq);
+        matrix_free(A_bar);
+        free(B_bar);
+        return;
+    }
 
     for (size_t t = 0; t < seq_len; t++) {
         const real_t *x_t = &input[t * dim];
-        /* z = W_in @ x_t  (length state_size) */
-        real_t *z = (real_t *)calloc(state_size, sizeof(real_t));
-        matrix_vec_mult(z, &block->W_in, x_t);
-        for (size_t j = 0; j < state_size; j++) {
-            real_t s = z[j] * sigmoid(z[j]);
-            u_seq[t * state_size + j] = s;
-        }
-        free(z);
-
-        /* compute delta from delta_proj: scalar projection then softplus+clamp */
-        if (block->delta_proj.rows > 0) {
-            matrix_vec_mult(tmp_delta, &block->delta_proj, x_t); /* tmp_delta length = delta_proj.rows (1) */
-            real_t dval = softplus(tmp_delta[0]);
-            if (dval < block->config.dt_min) dval = block->config.dt_min;
-            if (dval > block->config.dt_max) dval = block->config.dt_max;
-            block->delta[t] = dval;
-        } else {
-            block->delta[t] = block->config.dt_scale * ((real_t)t / (real_t)seq_len + 1.0f);
-        }
+        project_controller(block, x_t, z, &u_seq[t * state_size]);
+        block->delta[t] = project_delta_value(block, x_t, tmp_delta, t, seq_len);
     }
+    free(z);
     free(tmp_delta);
 
     selective_scan_forward_store(&store, block->hidden, u_seq, block->delta, A_bar, B_bar, &block->C_mat, 0.0f, seq_len, state_size);
@@ -699,33 +761,28 @@ void mamba_forward(MambaBlock *block, real_t *output, const real_t *input,
         
         /* Project input: compute vector controller u_seq (seq_len x state_size) */
         real_t *u_seq = (real_t *)calloc(seq_len * state_size, sizeof(real_t));
-        if (!u_seq) continue;
+        real_t *z = (real_t *)malloc(state_size * sizeof(real_t));
+        if (!u_seq || !z) {
+            free(z);
+            free(u_seq);
+            continue;
+        }
 
         /* temporary for delta projection */
-        real_t *tmp_delta = (real_t *)calloc(block->delta_proj.rows, sizeof(real_t));
+        real_t *tmp_delta = (real_t *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
+                                             sizeof(real_t));
+        if (!tmp_delta) {
+            free(z);
+            free(u_seq);
+            continue;
+        }
 
         for (size_t t = 0; t < seq_len; t++) {
             const real_t *x_t = &batch_input[t * dim];
-            /* z = W_in @ x_t -> length state_size */
-            real_t *z = (real_t *)malloc(state_size * sizeof(real_t));
-            matrix_vec_mult(z, &block->W_in, x_t);
-            for (size_t j = 0; j < state_size; j++) {
-                real_t s = z[j] * sigmoid(z[j]);
-                u_seq[t * state_size + j] = s;
-            }
-            free(z);
-
-            /* Compute delta for this timestep using delta_proj -> softplus + clamp */
-            if (block->delta_proj.rows > 0) {
-                matrix_vec_mult(tmp_delta, &block->delta_proj, x_t);
-                real_t dval = softplus(tmp_delta[0]);
-                if (dval < block->config.dt_min) dval = block->config.dt_min;
-                if (dval > block->config.dt_max) dval = block->config.dt_max;
-                block->delta[t] = dval;
-            } else {
-                block->delta[t] = block->config.dt_scale * ((real_t)t / (real_t)seq_len + 1.0f);
-            }
+            project_controller(block, x_t, z, &u_seq[t * state_size]);
+            block->delta[t] = project_delta_value(block, x_t, tmp_delta, t, seq_len);
         }
+        free(z);
         free(tmp_delta);
 
         /* Selective scan via scan1d ASM kernel — L=seq_len, D=state_size, M=1 */
@@ -756,12 +813,14 @@ void mamba_forward(MambaBlock *block, real_t *output, const real_t *input,
         
         /* Output projection: y_t = W_out @ state_t (scan_out contains state vectors) */
         real_t *ybuf = (real_t *)malloc(dim * sizeof(real_t));
-        for (size_t t = 0; t < seq_len; t++) {
-            const real_t *state_t = &scan_out[t * state_size];
-            matrix_vec_mult(ybuf, &block->W_out, state_t); /* ybuf length = dim */
-            for (size_t j = 0; j < dim; j++) batch_output[t * dim + j] = ybuf[j];
+        if (ybuf) {
+            for (size_t t = 0; t < seq_len; t++) {
+                const real_t *state_t = &scan_out[t * state_size];
+                matrix_vec_mult(ybuf, &block->W_out, state_t); /* ybuf length = dim */
+                for (size_t j = 0; j < dim; j++) batch_output[t * dim + j] = ybuf[j];
+            }
+            free(ybuf);
         }
-        free(ybuf);
         
         free(u_seq);
         free(scan_out);
@@ -783,10 +842,12 @@ void mamba_forward_2d(MambaBlock *block, real_t *output, const real_t *input,
     /* --- 1. Projection d'entrée : u[p, D] = silu(W_in @ x[p, dim]) --- */
     real_t *u          = (real_t *)calloc(P * D, sizeof(real_t));
     real_t *delta_pos  = (real_t *)calloc(P,     sizeof(real_t));
-    real_t *tmp_delta  = (real_t *)calloc(block->delta_proj.rows, sizeof(real_t));
+    real_t *tmp_delta  = (real_t *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
+                                          sizeof(real_t));
+    real_t *z          = (real_t *)malloc(D * sizeof(real_t));
 
-    if (!u || !delta_pos || !tmp_delta) {
-        free(u); free(delta_pos); free(tmp_delta);
+    if (!u || !delta_pos || !tmp_delta || !z) {
+        free(u); free(delta_pos); free(tmp_delta); free(z);
         return;
     }
 
@@ -794,19 +855,10 @@ void mamba_forward_2d(MambaBlock *block, real_t *output, const real_t *input,
         const real_t *x_p = &input[p * dim];
         real_t *u_p       = &u[p * D];
 
-        real_t *z = (real_t *)malloc(D * sizeof(real_t));
-        if (!z) continue;
-        matrix_vec_mult(z, &block->W_in, x_p);
-        for (size_t d = 0; d < D; d++)
-            u_p[d] = z[d] * sigmoid(z[d]);
-        free(z);
-
-        matrix_vec_mult(tmp_delta, &block->delta_proj, x_p);
-        real_t dval = softplus(tmp_delta[0]);
-        if (dval < block->config.dt_min) dval = block->config.dt_min;
-        if (dval > block->config.dt_max) dval = block->config.dt_max;
-        delta_pos[p] = dval;
+        project_controller(block, x_p, z, u_p);
+        delta_pos[p] = project_delta_value(block, x_p, tmp_delta, p, P);
     }
+    free(z);
     free(tmp_delta);
 
     /* --- 2. Préparer les tableaux pour scan2d --- */
@@ -884,38 +936,31 @@ void mamba_backward_2d(MambaBlock *block, const real_t *dY, const real_t *input,
     /* --- Re-run forward pour capturer u, delta_pos, h_all --- */
     real_t *u          = (real_t *)calloc(P * D, sizeof(real_t));
     real_t *delta_pos  = (real_t *)calloc(P,     sizeof(real_t));
-    real_t *tmp_delta  = (real_t *)calloc(block->delta_proj.rows, sizeof(real_t));
+    real_t *tmp_delta  = (real_t *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
+                                          sizeof(real_t));
     real_t *B_s        = (real_t *)malloc(P * D * sizeof(real_t));
     real_t *C_s        = (real_t *)malloc(P * D * sizeof(real_t));
     real_t *d1_s       = (real_t *)malloc(P * D * sizeof(real_t));
     real_t *d2_s       = (real_t *)malloc(P * D * sizeof(real_t));
     real_t *h_all      = (real_t *)calloc(P * D, sizeof(real_t));
     real_t *y_scan     = (real_t *)malloc(P * D * sizeof(real_t));
+    real_t *z          = (real_t *)malloc(D * sizeof(real_t));
 
     if (!u || !delta_pos || !tmp_delta || !B_s || !C_s ||
-        !d1_s || !d2_s || !h_all || !y_scan) {
+        !d1_s || !d2_s || !h_all || !y_scan || !z) {
         free(u); free(delta_pos); free(tmp_delta);
         free(B_s); free(C_s); free(d1_s); free(d2_s);
-        free(h_all); free(y_scan);
+        free(h_all); free(y_scan); free(z);
         return;
     }
 
     /* Projection d'entrée */
     for (size_t p = 0; p < P; p++) {
         const real_t *x_p = &input[p * dim];
-        real_t *z = (real_t *)malloc(D * sizeof(real_t));
-        if (!z) continue;
-        matrix_vec_mult(z, &block->W_in, x_p);
-        for (size_t d = 0; d < D; d++)
-            u[p * D + d] = z[d] * sigmoid(z[d]);
-        free(z);
-
-        matrix_vec_mult(tmp_delta, &block->delta_proj, x_p);
-        real_t dval = softplus(tmp_delta[0]);
-        if (dval < block->config.dt_min) dval = block->config.dt_min;
-        if (dval > block->config.dt_max) dval = block->config.dt_max;
-        delta_pos[p] = dval;
+        project_controller(block, x_p, z, &u[p * D]);
+        delta_pos[p] = project_delta_value(block, x_p, tmp_delta, p, P);
     }
+    free(z);
     free(tmp_delta);
 
     for (size_t p = 0; p < P; p++) {
@@ -995,10 +1040,14 @@ void mamba_backward_2d(MambaBlock *block, const real_t *dY, const real_t *input,
     free(h_all); free(delta_pos);
 
     /* --- Backward SiLU + W_in --- */
+    z = (real_t *)malloc(D * sizeof(real_t));
+    if (!z) {
+        free(u); free(adj_h); free(adj_u);
+        return;
+    }
+
     for (size_t p = 0; p < P; p++) {
         const real_t *x_p = &input[p * dim];
-        real_t *z = (real_t *)malloc(D * sizeof(real_t));
-        if (!z) continue;
         matrix_vec_mult(z, &block->W_in, x_p);
 
         for (size_t d = 0; d < D; d++) {
@@ -1008,8 +1057,8 @@ void mamba_backward_2d(MambaBlock *block, const real_t *dY, const real_t *input,
             for (size_t kk = 0; kk < dim; kk++)
                 s->g_W_in[d * dim + kk] += contrib * x_p[kk];
         }
-        free(z);
     }
 
+    free(z);
     free(u); free(adj_h); free(adj_u);
 }

@@ -72,6 +72,53 @@ typedef struct {
 /* Scan sélectif 1D — interface principale */
 void scan1d(ScanParams *p);
 
+typedef struct {
+    float *x;       /* [L, D]       — entrée du scan */
+    float *A;       /* [D, M]       — paramètres de transition */
+    float *B;       /* [L, D, M]    — matrice d'entrée sélective */
+    float *C;       /* [L, D, M]    — matrice de sortie sélective */
+    float *delta;   /* [L, D]       — pas de discrétisation */
+    float *h0;      /* [D, M]       — état initial optionnel (NULL => zéro) */
+    float *h;       /* [L, D, M]    — états forward après mise à jour */
+    float *dy;      /* [L, D]       — gradient amont sur y */
+    float *dx;      /* [L, D]       — gradient sur x */
+    float *dA;      /* [D, M]       — gradient sur A */
+    float *dB;      /* [L, D, M]    — gradient sur B */
+    float *dC;      /* [L, D, M]    — gradient sur C */
+    float *ddelta;  /* [L, D]       — gradient sur delta */
+    long   L;
+    long   D;
+    long   M;
+} ScanBackwardParams;
+
+/* Backward du scan sélectif 1D.
+ * Les buffers de sortie sont remis à zéro puis écrits.
+ */
+void scan1d_backward(ScanBackwardParams *p);
+
+typedef struct {
+    float *x;       /* [L, D]       — entrée du scan */
+    float *A;       /* [D]          — paramètres de transition */
+    float *B;       /* [D]          — matrice B partagée par canal */
+    float *C;       /* [D]          — matrice C partagée par canal */
+    float *delta;   /* [L]          — pas scalaire par timestep */
+    float *h0;      /* [D]          — état initial optionnel (NULL => zéro) */
+    float *h;       /* [L, D]       — états forward après mise à jour */
+    float *dy;      /* [L, D]       — gradient amont sur y */
+    float *dx;      /* [L, D]       — gradient sur x */
+    float *dA;      /* [D]          — gradient sur A */
+    float *dB;      /* [D]          — gradient sur B */
+    float *dC;      /* [D]          — gradient sur C */
+    float *ddelta;  /* [L]          — gradient sur delta */
+    long   L;
+    long   D;
+} ScanBackwardSharedParams;
+
+/* Backward spécialisé pour M=1 avec B/C partagés par canal
+ * et delta[t] scalaire. Les buffers de sortie sont remis à zéro puis écrits.
+ */
+void scan1d_backward_m1_shared_bc(ScanBackwardSharedParams *p);
+
 /* ---- Selective Scan 2D (Wavefront) -------------------------------- */
 
 typedef struct {

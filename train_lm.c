@@ -16,11 +16,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
 #include <time.h>
 
 #define DEFAULT_DATASET  "data/conversations.txt"
 #define DEFAULT_MODEL    "lm_checkpoint.bin"
 #define DEFAULT_EPOCHS   200
+
+static double wall_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
 
 static char *load_corpus_bytes(const char *path, size_t *out_len) {
     FILE *fin = fopen(path, "rb");
@@ -132,9 +139,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* ---- 4. Training loop ---- */
+    double train_start = wall_seconds();
     for (int epoch = 0; epoch < num_epochs; epoch++) {
         double total_loss = 0.0;
         size_t count      = 0;
+        double epoch_start = wall_seconds();
 
         for (size_t pos = 0; pos + seq_len < corpus_len; pos += seq_len) {
             for (size_t t = 0; t < seq_len; t++) {
@@ -148,7 +157,11 @@ int main(int argc, char *argv[]) {
 
         double avg_loss = (count > 0) ? total_loss / (double)count : 0.0;
         double ppl      = exp(avg_loss);
-        printf("Epoch %3d  loss=%.4f  ppl=%.2f\n", epoch, avg_loss, ppl);
+        double elapsed  = wall_seconds() - epoch_start;
+        double win_per_s = (elapsed > 0.0) ? (double)count / elapsed : 0.0;
+        double tok_per_s = (elapsed > 0.0) ? (double)(count * seq_len) / elapsed : 0.0;
+        printf("Epoch %3d  loss=%.4f  ppl=%.2f  time=%.2fs  win/s=%.2f  tok/s=%.2f\n",
+               epoch, avg_loss, ppl, elapsed, win_per_s, tok_per_s);
         fflush(stdout);
 
         /* Checkpoint every 10 epochs */
@@ -160,7 +173,8 @@ int main(int argc, char *argv[]) {
 
     /* Final save */
     lm_save(lm, model_path);
-    printf("\nTraining complete. Model saved to '%s'\n", model_path);
+    printf("\nTraining complete in %.2fs. Model saved to '%s'\n",
+           wall_seconds() - train_start, model_path);
 
     free(in_seq);
     free(tgt_seq);

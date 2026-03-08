@@ -16,11 +16,17 @@ OPT_SRCS  = $(OPT_DIR)/src/gemv.asm \
             $(OPT_DIR)/src/activations.asm \
             $(OPT_DIR)/src/scan1d.asm \
             $(OPT_DIR)/src/scan2d.asm
-OPT_OBJS  = $(patsubst $(OPT_DIR)/src/%.asm, $(OPT_OBJ)/%.o, $(OPT_SRCS))
+OPT_C_SRCS = $(OPT_DIR)/src/scan1d_backward.c
+OPT_OBJS  = $(patsubst $(OPT_DIR)/src/%.asm, $(OPT_OBJ)/%.o, $(OPT_SRCS)) \
+            $(patsubst $(OPT_DIR)/src/%.c, $(OPT_OBJ)/%.o, $(OPT_C_SRCS))
 
 $(OPT_OBJ)/%.o: $(OPT_DIR)/src/%.asm
 	@mkdir -p $(OPT_OBJ)
 	$(NASM) -f elf64 -I $(OPT_DIR)/include/ $< -o $@
+
+$(OPT_OBJ)/%.o: $(OPT_DIR)/src/%.c
+	@mkdir -p $(OPT_OBJ)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # CUDA / cuBLAS flags
 # Targets sm_80 (A100/3090), sm_86 (RTX 30xx), sm_89 (RTX 40xx), sm_90 (H100)
