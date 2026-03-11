@@ -1,6 +1,6 @@
-# BissiMamba
+# BissiMamba (CPU)
 
-Language model based on the Mamba State Space Model architecture, built entirely on [optimatrix](https://github.com/goldensam777/optimatrix) — a compute engine written in x86-64 assembly and C.
+Language model based on the Mamba State Space Model architecture, built entirely on [optimatrix-cpu](https://github.com/goldensam777/optimatrix-cpu) — a compute engine written in x86-64 assembly and C.
 
 No Python. No GPU. No dependencies beyond libc and libm.
 
