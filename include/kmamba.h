@@ -1,5 +1,5 @@
-#ifndef BISSIMAMBA_H
-#define BISSIMAMBA_H
+#ifndef KMAMBA_H
+#define KMAMBA_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -15,10 +15,10 @@ typedef struct {
     float dt_scale;
     float dt_min;
     float dt_max;
-} BissiMambaConfig;
+} KMambaConfig;
 
 typedef struct {
-    BissiMambaConfig cfg;
+    KMambaConfig cfg;
 
     /* Parameters */
     float *embedding; /* [vocab_size, dim] row-major */
@@ -32,27 +32,27 @@ typedef struct {
     MBOptimConfig opt_blocks;
     float lr_embed_head;
     float weight_decay;
-} BissiMamba;
+} KMamba;
 
-BissiMamba* bissimamba_create(const BissiMambaConfig *cfg);
-void        bissimamba_free(BissiMamba *m);
+KMamba* kmamba_create(const KMambaConfig *cfg);
+void        kmamba_free(KMamba *m);
 
-int  bissimamba_init(BissiMamba *m, uint32_t seed);
-int  bissimamba_enable_training(BissiMamba *m, const MBOptimConfig *opt_blocks,
+int  kmamba_init(KMamba *m, uint32_t seed);
+int  kmamba_enable_training(KMamba *m, const MBOptimConfig *opt_blocks,
                                 float lr_embed_head, float weight_decay);
 
-int         bissimamba_save(const BissiMamba *m, const char *path);
-BissiMamba* bissimamba_load(const char *path, int for_training,
+int         kmamba_save(const KMamba *m, const char *path);
+KMamba* kmamba_load(const char *path, int for_training,
                             const MBOptimConfig *opt_blocks,
                             float lr_embed_head, float weight_decay);
 
 /* Inference: tokens length must equal cfg.seq_len. logits_out: [seq_len, vocab_size]. */
-int bissimamba_forward(BissiMamba *m, const uint8_t *tokens, float *logits_out);
+int kmamba_forward(KMamba *m, const uint8_t *tokens, float *logits_out);
 
 /* One training step on one sequence. */
-float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1);
+float kmamba_train_step(KMamba *m, const uint8_t *tokens_plus1);
 
 /* Batch training: B sequences of (seq_len+1) bytes each. Returns mean loss. */
-float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t batch_size);
+float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_size);
 
-#endif /* BISSIMAMBA_H */
+#endif /* KMAMBA_H */

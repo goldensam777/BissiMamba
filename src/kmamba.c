@@ -1,4 +1,4 @@
-#include "bissimamba.h"
+#include "../include/kmamba.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -44,7 +44,7 @@ static void softmax(float *probs, const float *logits, size_t n) {
 
 /* ========= embedding ========= */
 
-static void embed_lookup(const BissiMamba *m, float *out, const uint8_t *tokens) {
+static void embed_lookup(const KMamba *m, float *out, const uint8_t *tokens) {
     size_t D = m->cfg.dim;
     for (size_t t = 0; t < m->cfg.seq_len; t++)
         memcpy(&out[t * D], &m->embedding[(size_t)tokens[t] * D], D * sizeof(float));
@@ -52,11 +52,11 @@ static void embed_lookup(const BissiMamba *m, float *out, const uint8_t *tokens)
 
 /* ========= create / free ========= */
 
-BissiMamba* bissimamba_create(const BissiMambaConfig *cfg) {
+KMamba* kmamba_create(const KMambaConfig *cfg) {
     if (!cfg || !cfg->vocab_size || !cfg->dim || !cfg->seq_len || !cfg->n_layers)
         return NULL;
 
-    BissiMamba *m = (BissiMamba *)xcalloc(1, sizeof(BissiMamba));
+    KMamba *m = (KMamba *)xcalloc(1, sizeof(KMamba));
     m->cfg = *cfg;
 
     m->embedding = (float *)xcalloc(cfg->vocab_size * cfg->dim, sizeof(float));
@@ -75,13 +75,13 @@ BissiMamba* bissimamba_create(const BissiMambaConfig *cfg) {
             .dt_max     = cfg->dt_max
         };
         m->layers[i] = mamba_block_create(&bc);
-        if (!m->layers[i]) { bissimamba_free(m); return NULL; }
+        if (!m->layers[i]) { kmamba_free(m); return NULL; }
     }
 
     return m;
 }
 
-void bissimamba_free(BissiMamba *m) {
+void kmamba_free(KMamba *m) {
     if (!m) return;
     if (m->layers) {
         for (size_t i = 0; i < m->cfg.n_layers; i++) {
@@ -97,7 +97,7 @@ void bissimamba_free(BissiMamba *m) {
     free(m);
 }
 
-int bissimamba_init(BissiMamba *m, uint32_t seed) {
+int kmamba_init(KMamba *m, uint32_t seed) {
     if (!m) return -1;
     srand((unsigned)seed);
     xavier_uniform(m->embedding, m->cfg.vocab_size, m->cfg.dim, m->cfg.vocab_size * m->cfg.dim);
@@ -107,7 +107,7 @@ int bissimamba_init(BissiMamba *m, uint32_t seed) {
     return 0;
 }
 
-int bissimamba_enable_training(BissiMamba *m, const MBOptimConfig *opt_blocks,
+int kmamba_enable_training(KMamba *m, const MBOptimConfig *opt_blocks,
                                float lr_embed_head, float weight_decay) {
     if (!m || !opt_blocks) return -1;
     m->for_training = 1;
@@ -122,7 +122,7 @@ int bissimamba_enable_training(BissiMamba *m, const MBOptimConfig *opt_blocks,
 /* ========= checkpoint IO ========= */
 
 typedef struct {
-    char magic[8];       /* "BISSILM\0" */
+    char magic[8];       /* "KMAMBA\0\0" */
     uint32_t version;
     uint32_t reserved;
     uint64_t vocab_size;
@@ -143,13 +143,13 @@ static int read_floats(FILE *f, float *p, size_t n) {
     return fread(p, sizeof(float), n, f) == n ? 0 : -1;
 }
 
-int bissimamba_save(const BissiMamba *m, const char *path) {
+int kmamba_save(const KMamba *m, const char *path) {
     if (!m || !path) return -1;
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
 
     CheckpointHeader h = {0};
-    memcpy(h.magic, "BISSILM", 7);
+    memcpy(h.magic, "KMAMBA", 6);
     h.version    = 1;
     h.vocab_size = (uint64_t)m->cfg.vocab_size;
     h.dim        = (uint64_t)m->cfg.dim;
@@ -180,7 +180,7 @@ int bissimamba_save(const BissiMamba *m, const char *path) {
     return 0;
 }
 
-BissiMamba* bissimamba_load(const char *path, int for_training,
+KMamba* kmamba_load(const char *path, int for_training,
                             const MBOptimConfig *opt_blocks,
                             float lr_embed_head, float weight_decay) {
     if (!path) return NULL;
@@ -189,9 +189,9 @@ BissiMamba* bissimamba_load(const char *path, int for_training,
 
     CheckpointHeader h;
     if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return NULL; }
-    if (memcmp(h.magic, "BISSILM", 7) != 0 || h.version != 1) { fclose(f); return NULL; }
+    if (memcmp(h.magic, "KMAMBA", 6) != 0 || h.version != 1) { fclose(f); return NULL; }
 
-    BissiMambaConfig cfg = {
+    KMambaConfig cfg = {
         .vocab_size  = (size_t)h.vocab_size,
         .dim         = (size_t)h.dim,
         .state_size  = (size_t)h.state_size,
@@ -202,18 +202,18 @@ BissiMamba* bissimamba_load(const char *path, int for_training,
         .dt_max      = h.dt_max
     };
 
-    BissiMamba *m = bissimamba_create(&cfg);
+    KMamba *m = kmamba_create(&cfg);
     if (!m) { fclose(f); return NULL; }
     if (for_training) {
-        if (!opt_blocks) { bissimamba_free(m); fclose(f); return NULL; }
-        if (bissimamba_enable_training(m, opt_blocks, lr_embed_head, weight_decay)) {
-            bissimamba_free(m); fclose(f); return NULL;
+        if (!opt_blocks) { kmamba_free(m); fclose(f); return NULL; }
+        if (kmamba_enable_training(m, opt_blocks, lr_embed_head, weight_decay)) {
+            kmamba_free(m); fclose(f); return NULL;
         }
     }
 
     if (read_floats(f, m->embedding, cfg.vocab_size * cfg.dim) ||
         read_floats(f, m->head, cfg.dim * cfg.vocab_size)) {
-        bissimamba_free(m); fclose(f); return NULL;
+        kmamba_free(m); fclose(f); return NULL;
     }
 
     for (size_t i = 0; i < cfg.n_layers; i++) {
@@ -224,7 +224,7 @@ BissiMamba* bissimamba_load(const char *path, int for_training,
             read_floats(f, b->B_mat.data,     b->B_mat.rows * b->B_mat.cols)          ||
             read_floats(f, b->C_mat.data,     b->C_mat.rows * b->C_mat.cols)          ||
             read_floats(f, b->delta_proj.data, b->delta_proj.rows * b->delta_proj.cols)) {
-            bissimamba_free(m); fclose(f); return NULL;
+            kmamba_free(m); fclose(f); return NULL;
         }
     }
 
@@ -234,7 +234,7 @@ BissiMamba* bissimamba_load(const char *path, int for_training,
 
 /* ========= forward ========= */
 
-int bissimamba_forward(BissiMamba *m, const uint8_t *tokens, float *logits_out) {
+int kmamba_forward(KMamba *m, const uint8_t *tokens, float *logits_out) {
     if (!m || !tokens || !logits_out) return -1;
 
     size_t L = m->cfg.seq_len;
@@ -252,7 +252,6 @@ int bissimamba_forward(BissiMamba *m, const uint8_t *tokens, float *logits_out) 
         const float *tmp = cur; cur = next; next = (float *)tmp;
     }
 
-    /* logits[L,V] = hidden[L,D] @ head[D,V] */
     gemm_avx2((float *)cur, m->head, logits_out,
               (long)L, (long)D, (long)m->cfg.vocab_size);
 
@@ -263,7 +262,7 @@ int bissimamba_forward(BissiMamba *m, const uint8_t *tokens, float *logits_out) 
 
 /* ========= training ========= */
 
-float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
+float kmamba_train_step(KMamba *m, const uint8_t *tokens_plus1) {
     if (!m || !tokens_plus1 || !m->for_training) return NAN;
 
     size_t V = m->cfg.vocab_size;
@@ -273,7 +272,6 @@ float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
     const uint8_t *tokens_in  = tokens_plus1;
     const uint8_t *tokens_tgt = tokens_plus1 + 1;
 
-    /* activations per layer */
     float *acts    = (float *)xcalloc((m->cfg.n_layers + 1) * L * D, sizeof(float));
     float *d_hidden = (float *)xcalloc(L * D, sizeof(float));
     float *logits  = (float *)xcalloc(L * V, sizeof(float));
@@ -284,7 +282,6 @@ float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
     float *g_head  = (float *)xcalloc(D * V, sizeof(float));
     float *g_embed = (float *)xcalloc(V * D, sizeof(float));
 
-    /* forward: embed + layers */
     embed_lookup(m, &acts[0], tokens_in);
     for (size_t i = 0; i < m->cfg.n_layers; i++)
         mamba_block_forward(m->layers[i], &acts[(i + 1) * L * D], &acts[i * L * D], 1);
@@ -292,7 +289,6 @@ float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
     const float *hidden = &acts[m->cfg.n_layers * L * D];
     gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
 
-    /* cross-entropy loss + dlogits */
     float loss = 0.0f;
     float invL = 1.0f / (float)L;
     for (size_t t = 0; t < L; t++) {
@@ -307,15 +303,12 @@ float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
     }
     loss *= invL;
 
-    /* backward: d_hidden = dlogits @ head^T */
     transpose(m->head, head_T, D, V);
     gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
 
-    /* g_head = hidden^T @ dlogits */
     transpose(hidden, hidden_T, L, D);
     gemm_avx2(hidden_T, dlogits, g_head, (long)D, (long)L, (long)V);
 
-    /* backward through layers */
     for (size_t i = 0; i < m->cfg.n_layers; i++) mamba_zero_grads(m->layers[i]);
 
     float *d_buf = (float *)xcalloc(L * D, sizeof(float));
@@ -327,18 +320,15 @@ float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
         float *tmp = dcur; dcur = dnext; dnext = tmp;
     }
 
-    /* gradient on embedding */
     for (size_t t = 0; t < L; t++) {
         float *g = &g_embed[(size_t)tokens_in[t] * D];
         const float *d = &dcur[t * D];
         for (size_t j = 0; j < D; j++) g[j] += d[j];
     }
 
-    /* optimizer step: blocks */
     for (size_t i = 0; i < m->cfg.n_layers; i++)
         mamba_optimizer_step(m->layers[i], &m->opt_blocks);
 
-    /* SGD: embedding + head */
     float lr = m->lr_embed_head, wd = m->weight_decay;
     for (size_t i = 0; i < V * D; i++)
         m->embedding[i] -= lr * (g_embed[i] + wd * m->embedding[i]);
@@ -352,9 +342,7 @@ float bissimamba_train_step(BissiMamba *m, const uint8_t *tokens_plus1) {
     return loss;
 }
 
-/* ========= batch training ========= */
-
-float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t batch_size) {
+float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_size) {
     if (!m || !batch_tokens || !m->for_training || batch_size == 0) return NAN;
 
     size_t V = m->cfg.vocab_size;
@@ -365,13 +353,11 @@ float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t 
     float invL = 1.0f / (float)L;
     float invBL = invB * invL;
 
-    /* shared across batch */
     float *g_head  = (float *)xcalloc(D * V, sizeof(float));
     float *g_embed = (float *)xcalloc(V * D, sizeof(float));
     float *head_T  = (float *)xcalloc(V * D, sizeof(float));
     transpose(m->head, head_T, D, V);
 
-    /* per-sample buffers */
     float *acts     = (float *)xcalloc((m->cfg.n_layers + 1) * L * D, sizeof(float));
     float *logits   = (float *)xcalloc(L * V, sizeof(float));
     float *probs    = (float *)xcalloc(V, sizeof(float));
@@ -390,18 +376,14 @@ float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t 
         const uint8_t *tok_in  = seq;
         const uint8_t *tok_tgt = seq + 1;
 
-        /* forward: embed */
         embed_lookup(m, &acts[0], tok_in);
 
-        /* forward: layers */
         for (size_t i = 0; i < m->cfg.n_layers; i++)
             mamba_block_forward(m->layers[i], &acts[(i + 1) * L * D], &acts[i * L * D], 1);
 
-        /* forward: logits */
         const float *hidden = &acts[m->cfg.n_layers * L * D];
         gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
 
-        /* cross-entropy + dlogits (scaled by 1/B) */
         float sample_loss = 0.0f;
         for (size_t t = 0; t < L; t++) {
             softmax(probs, &logits[t * V], V);
@@ -415,15 +397,12 @@ float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t 
         }
         total_loss += sample_loss * invL;
 
-        /* backward: d_hidden = dlogits @ head^T */
         gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
 
-        /* accumulate g_head += hidden^T @ dlogits */
         transpose(hidden, hidden_T, L, D);
         gemm_avx2(hidden_T, dlogits, g_head_b, (long)D, (long)L, (long)V);
         for (size_t i = 0; i < D * V; i++) g_head[i] += g_head_b[i];
 
-        /* backward through layers (gradients accumulate inside MambaBlocks) */
         float *dcur  = d_hidden;
         float *dnext = d_buf;
         for (size_t li = m->cfg.n_layers; li-- > 0;) {
@@ -432,7 +411,6 @@ float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t 
             float *tmp = dcur; dcur = dnext; dnext = tmp;
         }
 
-        /* accumulate g_embed */
         for (size_t t = 0; t < L; t++) {
             float *g = &g_embed[(size_t)tok_in[t] * D];
             const float *d = &dcur[t * D];
@@ -440,11 +418,9 @@ float bissimamba_train_batch(BissiMamba *m, const uint8_t *batch_tokens, size_t 
         }
     }
 
-    /* single optimizer step for all blocks */
     for (size_t i = 0; i < m->cfg.n_layers; i++)
         mamba_optimizer_step(m->layers[i], &m->opt_blocks);
 
-    /* SGD: embedding + head */
     float lr = m->lr_embed_head, wd = m->weight_decay;
     for (size_t i = 0; i < V * D; i++)
         m->embedding[i] -= lr * (g_embed[i] + wd * m->embedding[i]);
