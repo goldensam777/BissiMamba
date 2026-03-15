@@ -9,6 +9,10 @@
 
 #include "kmamba.h"
 #include "optimatrix.h"
+#include "mamba_scan.h"
+#ifdef KMAMBA_BUILD_CUDA
+#include "mamba_scan_cuda.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -608,7 +612,7 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
               (long)seq_len, (long)dim, (long)state_size);
 
     {
-        ScanBackwardSharedParams bp = {
+        MambaScan1DBackwardM1Params bp = {
             .x = store->u_seq,
             .A = block->A_log.data,
             .A_diag = store->A_diag,
@@ -626,7 +630,7 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
             .L = (long)seq_len,
             .D = (long)state_size
         };
-        scan1d_backward_m1_shared_bc(&bp);
+        mamba_scan1d_backward_m1_shared_bc(&bp);
     }
 
     for (size_t i = 0; i < state_size; i++) {
@@ -780,14 +784,14 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
         }
         memset(block->scan_h, 0, (size_t)D * sizeof(float));
 
-        ScanParams sp = {
+        MambaScan1DParams sp = {
             .x = u_seq, .A = block->A_log.data,
             .B = block->scan_B, .C = block->scan_C,
             .delta = block->scan_delta, .h = block->scan_h,
             .y = scan_out,
             .L = L, .D = D, .M = 1
         };
-        scan1d(&sp);
+        mamba_scan1d_forward(&sp);
         memcpy(block->hidden, block->scan_h, (size_t)D * sizeof(float));
 
         float *ybuf = (float *)malloc(dim * sizeof(float));
@@ -861,7 +865,7 @@ void mamba_block_forward_2d(MambaBlock *block, float *output, const float *input
     }
     free(delta_pos);
 
-    Scan2DParams sp = {
+    MambaScan2DParams sp = {
         .x      = u,
         .A1     = block->A_log.data,
         .A2     = block->A_log.data,
@@ -876,7 +880,7 @@ void mamba_block_forward_2d(MambaBlock *block, float *output, const float *input
         .D      = (long)D,
         .M      = M
     };
-    scan2d(&sp);
+    mamba_scan2d_forward(&sp);
 
     float *ybuf = (float *)malloc(dim * sizeof(float));
     if (ybuf) {
@@ -942,13 +946,13 @@ void mamba_backward_2d(MambaBlock *block, const float *dY, const float *input,
         }
     }
 
-    Scan2DParams sp = {
+    MambaScan2DParams sp = {
         .x = u, .A1 = block->A_log.data, .A2 = block->A_log.data,
         .B = B_s, .C = C_s, .delta1 = d1_s, .delta2 = d2_s,
         .h = h_all, .y = y_scan,
         .d1 = (long)d1, .d2 = (long)d2, .D = (long)D, .M = 1
     };
-    scan2d(&sp);
+    mamba_scan2d_forward(&sp);
     free(B_s); free(C_s); free(d1_s); free(d2_s);
 
     float *adj_h = (float *)calloc(P * D, sizeof(float));

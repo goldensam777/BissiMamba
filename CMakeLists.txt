@@ -4,6 +4,8 @@ project(k-mamba VERSION 0.1.0 LANGUAGES C ASM_NASM)
 # Options
 option(KMAMBA_BUILD_TESTS "Build tests" OFF)
 option(KMAMBA_BUILD_EXAMPLES "Build examples" OFF)
+option(KMAMBA_BUILD_CPU "Build CPU backend" ON)
+option(KMAMBA_BUILD_CUDA "Build CUDA backend" OFF)
 
 # NASM flags
 set(CMAKE_ASM_NASM_COMPILE_OBJECT "<CMAKE_ASM_NASM_COMPILER> <INCLUDES> <FLAGS> -o <OBJECT> <SOURCE>")
@@ -15,6 +17,16 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/optimatrix/CMakeLists.txt)
 endif()
 
 add_subdirectory(optimatrix)
+
+# K-Mamba specific backends
+if(KMAMBA_BUILD_CPU)
+    add_subdirectory(cpu)
+endif()
+
+if(KMAMBA_BUILD_CUDA)
+    enable_language(CUDA)
+    add_subdirectory(cuda)
+endif()
 
 # Library target - Mamba orchestration only
 set(KMAMBA_C_SRCS
@@ -38,6 +50,15 @@ target_include_directories(k-mamba
 target_link_libraries(k-mamba
     PUBLIC optimatrix::optimatrix
 )
+
+# Link K-Mamba specific backends
+if(KMAMBA_BUILD_CPU)
+    target_link_libraries(k-mamba PUBLIC k-mamba-cpu)
+endif()
+
+if(KMAMBA_BUILD_CUDA)
+    target_link_libraries(k-mamba PUBLIC k-mamba-cuda)
+endif()
 
 target_compile_options(k-mamba PRIVATE
     -O3 -mavx2 -Wall -Wextra -Wpedantic
