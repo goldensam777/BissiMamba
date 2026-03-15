@@ -36,6 +36,20 @@ if(KMAMBA_BUILD_CUDA)
     )
 endif()
 
+# Tests unitaires pour les kernels optimatrix
+add_executable(test_optimatrix_kernels unit/test_optimatrix_kernels.c)
+
+# Linker avec optimatrix
+target_link_libraries(test_optimatrix_kernels PRIVATE optimatrix::optimatrix m)
+
+# Flags de compilation pour les tests
+target_compile_options(test_optimatrix_kernels PRIVATE
+    -O3 -mavx2 -Wall -Wextra -g
+)
+
+# Ajouter aux tests CTest
+add_test(NAME optimatrix_kernels_unit COMMAND test_optimatrix_kernels)
+
 # Activer les tests
 enable_testing()
 add_test(NAME OptimizersTest COMMAND test_optimizers)
