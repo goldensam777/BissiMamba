@@ -9,12 +9,12 @@ set(CMAKE_ASM_NASM_FLAGS "-f elf64")
 set(CPU_ASM_SRCS
     scan1d.asm
     scan2d.asm
-    # scan1d_backward_m1_shared_bc.asm  # Temporarily disabled due to ASM syntax error
-    # scan1d_backward_m1_shared_bc_simple.asm  # Temporarily disabled
+    # scan1d_backward_m1_shared_bc.asm       # TODO: fix "two index registers" ASM bug
+    # scan1d_backward_m1_shared_bc_simple.asm # TODO: fix "two index registers" ASM bug
 )
 
 set(CPU_C_SRCS
-    # scan1d_backward.c  # Temporarily disabled due to header issues
+    scan1d_backward.c
     scan1d_backward_m.c
     mamba_scan.c
 )
@@ -40,6 +40,7 @@ add_library(k-mamba-cpu STATIC ${CPU_C_SRCS} ${CPU_OBJS})
 target_include_directories(k-mamba-cpu
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../optimatrix/include>
 )
 

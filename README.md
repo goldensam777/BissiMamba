@@ -99,18 +99,16 @@ k-mamba/                              ← Bibliothèque principale (modèle Mamb
 │   ├── kmamba.c                   # Orchestration du modèle
 │   ├── mamba_block.c              # Bloc SSM complet avec MUON
 │   └── convnd.c                  # Convolution ND (logique modèle)
-├── optimatrix/                    # Submodule git — moteur de calcul
-│   ├── include/optimatrix.h       # API des kernels
-│   └── src/
-│       ├── activations.asm         # SiLU, Sigmoid, Softplus (AVX2)
-│       ├── conv1d_avx2.asm        # Noyau Conv1D depthwise
-│       ├── gemm*.asm, gemv*.asm   # Multiplication matricielle
-│       ├── hadamard.asm           # Produit élément par élément
-│       ├── scan1d.asm             # Scan sélectif 1D
-│       ├── scan2d.asm             # Scan sélectif 2D wavefront
-│       ├── scan1d_backward.c      # Rétropropagation scan 1D
-│       ├── scan1d_backward_m.c    # Scan 1D backward M-générique
-│       └── scan1d_backward_*.asm # Kernels ASM optimisés
+├── optimatrix/                    # Submodule git — moteur de calcul matriciel
+│   ├── include/optimatrix.h       # API (extern "C" pour CUDA)
+│   ├── cpu/
+│   │   ├── gemm*.asm, gemv*.asm   # GEMM/GEMV scalaire + AVX2
+│   │   ├── activations.asm        # SiLU, Sigmoid, Softplus (AVX2)
+│   │   ├── conv1d_avx2.asm        # Conv1D depthwise AVX2
+│   │   ├── hadamard.asm           # Produit Hadamard AVX2
+│   │   └── optimizer_utils.c      # Gradient clipping, AdamW, MUON CPU
+│   └── cuda/
+│       └── optimizer_utils.cu     # Gradient clipping, AdamW, MUON CUDA
 ├── cmake/
 │   └── k-mambaConfig.cmake.in
 ├── CMakeLists.txt
@@ -133,11 +131,24 @@ k-mamba/                              ← Bibliothèque principale (modèle Mamb
 ### Compilation
 
 ```bash
-git clone --recursive https://github.com/user/k-mamba
-cd k-mamba && mkdir build && cd build
-cmake ..
-make -j
-sudo make install  # Optionnel
+git clone --recursive https://github.com/goldensam777/k-mamba
+cd k-mamba
+
+# CPU seul
+cmake -B build -DKMAMBA_BUILD_TESTS=ON
+cmake --build build -j
+
+# CPU + CUDA
+cmake -B build-cuda -DKMAMBA_BUILD_CUDA=ON -DKMAMBA_BUILD_TESTS=ON
+sed -i 's/OPTIMATRIX_BUILD_CUDA:BOOL=OFF/OPTIMATRIX_BUILD_CUDA:BOOL=ON/' build-cuda/CMakeCache.txt
+cmake build-cuda && cmake --build build-cuda -j
+```
+
+### Tests
+
+```bash
+ctest --test-dir build          # CPU : 3 tests
+ctest --test-dir build-cuda     # CPU + CUDA : 3 tests dont CudaOptimizersTest
 ```
 
 ### Usage dans un projet CMake

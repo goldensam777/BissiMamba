@@ -9,10 +9,11 @@ include_directories(
 
 # Test des optimiseurs CPU
 add_executable(test_optimizers test_optimizers.c)
-target_link_libraries(test_optimizers 
-    PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/mamba_block.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../optimatrix/src/optimizer_utils.c
+target_link_libraries(test_optimizers
+    PRIVATE
+    k-mamba
+    k-mamba-cpu
+    optimatrix::optimatrix
     m
 )
 
@@ -20,19 +21,24 @@ target_link_libraries(test_optimizers
 if(KMAMBA_BUILD_CUDA)
     enable_language(CUDA)
     add_executable(test_cuda_optimizers test_cuda_optimizers.cu)
-    
-    # Inclure les sources CUDA
-    target_sources(test_cuda_optimizers PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../optimatrix/src/optimizer_utils.cu
+
+    target_include_directories(test_cuda_optimizers PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../optimatrix/include
     )
-    
-    target_link_libraries(test_cuda_optimizers PRIVATE cuda cudart)
-    
-    # Options de compilation CUDA
-    target_compile_options(test_cuda_optimizers PRIVATE 
+
+    target_link_libraries(test_cuda_optimizers PRIVATE
+        optimatrix::optimatrix
+        cuda cudart
+    )
+
+    set_target_properties(test_cuda_optimizers PROPERTIES
+        CUDA_ARCHITECTURES "75"
+    )
+
+    target_compile_options(test_cuda_optimizers PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-        -arch=sm_70
     )
 endif()
 
@@ -41,6 +47,10 @@ add_executable(test_optimatrix_kernels unit/test_optimatrix_kernels.c)
 
 # Linker avec optimatrix
 target_link_libraries(test_optimatrix_kernels PRIVATE optimatrix::optimatrix m)
+
+# ASM utilise des relocations 32-bit : désactiver PIE pour les exécutables de test
+target_link_options(test_optimizers       PRIVATE -no-pie)
+target_link_options(test_optimatrix_kernels PRIVATE -no-pie)
 
 # Flags de compilation pour les tests
 target_compile_options(test_optimatrix_kernels PRIVATE

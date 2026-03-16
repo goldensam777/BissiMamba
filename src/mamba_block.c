@@ -429,14 +429,24 @@ void mamba_attach_optimizer(MambaBlock *block, OptimizerType type, const MBOptim
     s->g_C_mat = (float *)calloc(state, sizeof(float));
     s->g_delta_proj = (float *)calloc(dim, sizeof(float));
 
-    /* Allocate moments only for ADAM-based optimizers */
+    /* Allocate first moments for all momentum-based optimizers */
+    if (type == OPTIMIZER_ADAM_CLIP || type == OPTIMIZER_ADAMW ||
+        type == OPTIMIZER_MUON      || type == OPTIMIZER_SGD) {
+        s->m_W_in       = (float *)calloc(size_in,  sizeof(float));
+        s->m_W_out      = (float *)calloc(size_out, sizeof(float));
+        s->m_A_log      = (float *)calloc(state,    sizeof(float));
+        s->m_B_mat      = (float *)calloc(state,    sizeof(float));
+        s->m_C_mat      = (float *)calloc(state,    sizeof(float));
+        s->m_delta_proj = (float *)calloc(dim,      sizeof(float));
+    }
+    /* Allocate second moments only for Adam-based optimizers */
     if (type == OPTIMIZER_ADAM_CLIP || type == OPTIMIZER_ADAMW) {
-        s->m_W_in = (float *)calloc(size_in, sizeof(float)); s->v_W_in = (float *)calloc(size_in, sizeof(float));
-        s->m_W_out = (float *)calloc(size_out, sizeof(float)); s->v_W_out = (float *)calloc(size_out, sizeof(float));
-        s->m_A_log = (float *)calloc(state, sizeof(float)); s->v_A_log = (float *)calloc(state, sizeof(float));
-        s->m_B_mat = (float *)calloc(state, sizeof(float)); s->v_B_mat = (float *)calloc(state, sizeof(float));
-        s->m_C_mat = (float *)calloc(state, sizeof(float)); s->v_C_mat = (float *)calloc(state, sizeof(float));
-        s->m_delta_proj = (float *)calloc(dim, sizeof(float)); s->v_delta_proj = (float *)calloc(dim, sizeof(float));
+        s->v_W_in       = (float *)calloc(size_in,  sizeof(float));
+        s->v_W_out      = (float *)calloc(size_out, sizeof(float));
+        s->v_A_log      = (float *)calloc(state,    sizeof(float));
+        s->v_B_mat      = (float *)calloc(state,    sizeof(float));
+        s->v_C_mat      = (float *)calloc(state,    sizeof(float));
+        s->v_delta_proj = (float *)calloc(dim,      sizeof(float));
     }
 
     s->step = 0;

@@ -67,6 +67,26 @@ target_compile_options(k-mamba PRIVATE
 # Installation
 include(GNUInstallDirs)
 
+install(TARGETS optimatrix
+    EXPORT k-mamba-targets
+)
+
+if(OPTIMATRIX_BUILD_CPU)
+    install(TARGETS optimatrix-cpu
+        EXPORT k-mamba-targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
+
+if(OPTIMATRIX_BUILD_CUDA)
+    install(TARGETS optimatrix-cuda
+        EXPORT k-mamba-targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
+
 install(TARGETS k-mamba
     EXPORT k-mamba-targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

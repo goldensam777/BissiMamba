@@ -5,6 +5,7 @@
 #include "../include/kmamba.h"
 #include "../optimatrix/include/optimatrix.h"
 
+static MBOptimState* _find_opt(MambaBlock *block);
 /* Test du gradient clipping */
 int test_gradient_clipping() {
     printf("=== Test Gradient Clipping ===\n");

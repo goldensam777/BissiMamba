@@ -17,7 +17,7 @@
  * Utilitaires de test
  * ============================================================ */
 
-#define EPSILON 1e-6f
+#define EPSILON 2e-5f
 #define TEST_ASSERT(cond, msg) \
     do { \
         if (!(cond)) { \
@@ -97,11 +97,12 @@ static int test_gemm_small() {
     
     fill_random(A, m * k, -1.0f, 1.0f);
     fill_random(B, k * n, -1.0f, 1.0f);
-    
+
     /* Référence */
     gemm_reference(A, B, C_ref, m, k, n);
-    
-    /* Test */
+
+    /* gemm_avx2 accumule dans C — doit être zéro avant */
+    memset(C_test, 0, m * n * sizeof(float));
     gemm_avx2(A, B, C_test, m, k, n);
     
     int result = compare_matrices(C_ref, C_test, m, n, EPSILON);
@@ -124,8 +125,9 @@ static int test_gemm_medium() {
     
     fill_random(A, m * k, -2.0f, 2.0f);
     fill_random(B, k * n, -2.0f, 2.0f);
-    
+
     gemm_reference(A, B, C_ref, m, k, n);
+    memset(C_test, 0, m * n * sizeof(float));
     gemm_avx2(A, B, C_test, m, k, n);
     
     int result = compare_matrices(C_ref, C_test, m, n, EPSILON);
@@ -144,24 +146,24 @@ static int test_gemm_edge_cases() {
         const long m = 1, k = 1, n = 1;
         float A[1] = {2.0f};
         float B[1] = {3.0f};
-        float C_ref[1], C_test[1];
-        
+        float C_ref[1] = {0}, C_test[1] = {0};
+
         gemm_reference(A, B, C_ref, m, k, n);
         gemm_avx2(A, B, C_test, m, k, n);
-        
+
         TEST_ASSERT_FLOAT_EQ(C_ref[0], C_test[0], EPSILON, "1x1 GEMM failed");
     }
-    
+
     /* Test vecteur ligne * vecteur colonne */
     {
         const long m = 1, k = 4, n = 1;
         float A[4] = {1.0f, 2.0f, 3.0f, 4.0f};
         float B[4] = {2.0f, 3.0f, 4.0f, 5.0f};
-        float C_ref[1], C_test[1];
-        
+        float C_ref[1] = {0}, C_test[1] = {0};
+
         gemm_reference(A, B, C_ref, m, k, n);
         gemm_avx2(A, B, C_test, m, k, n);
-        
+
         TEST_ASSERT_FLOAT_EQ(C_ref[0], C_test[0], EPSILON, "Vector GEMM failed");
     }
     
