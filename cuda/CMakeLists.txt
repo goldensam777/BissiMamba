@@ -4,8 +4,10 @@ project(k-mamba-cuda VERSION 1.0.0 LANGUAGES CUDA)
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
 
-# Mamba-specific CUDA kernels (scan kernels are now in optimatrix/cuda/)
+# Mamba-specific CUDA kernels
 set(CUDA_SRCS
+    scan1d.cu
+    scan1d_backward.cu
     mamba_scan.cu
     # mamba_block.cu          (à implémenter)
     # mamba_block_backward.cu (à implémenter)
@@ -27,7 +29,7 @@ target_compile_options(k-mamba-cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_70>
 )
 
-# Link against optimatrix-cuda (fournit om_scan1d_forward/backward)
+# Link CUDA libraries
 target_link_libraries(k-mamba-cuda
     PUBLIC  optimatrix-cuda
     PRIVATE cuda cudart
