@@ -50,5 +50,9 @@ Thumbs.db
 bissi_mamba/
 __pycache__/
 
+# Build directories
+build/
+build-*/
+
 #Almost personal
 CLAUDE.md
