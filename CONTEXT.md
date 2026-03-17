@@ -35,6 +35,7 @@ Elle ne sait rien de Mamba, des modèles de langage, ni d'apprentissage automati
 Son seul rôle : effectuer des opérations mathématiques élémentaires le plus vite possible.
 
 Concrètement, optimatrix fournit :
+
 - Multiplication matrice-vecteur et matrice-matrice (GEMV, GEMM) en AVX2
 - Activations non-linéaires vectorisées (SiLU, Sigmoid, Softplus, ReLU)
 - Convolution 1D depthwise causale et convolution ND séparable
