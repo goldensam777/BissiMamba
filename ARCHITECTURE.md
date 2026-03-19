@@ -39,7 +39,7 @@ k-mamba/ — Les Volontés (orchestration du modèle Mamba)
 │
 ├── src/
 │   ├── kmamba.c           — Embedding, softmax, cross-entropy, training loop, checkpoint I/O
-│   ├── mamba_block.c      — Bloc SSM : projections, scan dispatch, MUONCLIP, buffers
+│   ├── mamba_block.c      — Bloc SSM : projections, scan dispatch, MUON, buffers
 │   └── convnd.c           — Convolution ND (appelle conv1d_avx2 d'optimatrix)
 │
 ├── cpu/                   — Kernels scan SSM (logique Mamba, CPU)
@@ -81,8 +81,7 @@ optimatrix/ — La Puissance (kernels GÉNÉRIQUES réutilisables, sans logique 
 │   ├── hadamard.asm                  ← Produit élément par élément
 │   ├── activations.asm               ← SiLU, Sigmoid, Softplus (AVX2)
 │   ├── conv1d_avx2.asm              ← Conv1D depthwise causale
-│   ├── generic_ops.c                ← ConvND séparable forward+backward
-│   └── optimizer_utils.c            ← Gradient clipping, AdamW, MUON CPU
+│   └── optimizer_utils.c            ← gradient_clip, Newton-Schulz, MUON CPU
 │
 └── cuda/
     └── optimizer_utils.cu           ← Gradient clipping, AdamW, MUON CUDA ✅
@@ -144,7 +143,7 @@ Appel utilisateur
 │  5. Pour chaque layer (reverse) :   │
 │     mamba_backward()                │
 │  6. Gradients embedding (scatter)   │
-│  7. Optimizer step (MUONCLIP)       │
+│  7. Optimizer step (MUON + AdamW)   │
 └─────────────────────────────────────┘
                                    │
        ▼                           
@@ -161,7 +160,7 @@ Appel utilisateur
                      ▼
 ┌─────────────────────────────────────┐
 │ optimatrix : mamba_optimizer_step()  │
-│  (MUONCLIP via Newton-Schulz)        │
+│  (MUON via Newton-Schulz)        │
 └─────────────────────────────────────┘
 ```
 
@@ -189,7 +188,7 @@ void mamba_block_forward(MambaBlock *block, float *out, const float *in, size_t 
 }
 ```
 
-### MUONCLIP arbitre les tensions
+### MUON arbitre les tensions
 
 ```c
 // Les gradients sont des tensions entre Volontés

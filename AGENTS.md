@@ -38,9 +38,8 @@ k-mamba/
 │   ├── scan1d.asm            # Scan sélectif 1D forward (ASM AVX2)
 │   ├── scan2d.asm            # Scan sélectif 2D wavefront (ASM)
 │   ├── scan1d_backward.c     # Backward 1D (M générique, C)
-│   ├── scan1d_backward_m.c   # Backward 1D (M > 1)
 │   ├── scan1d_backward_m1_shared_bc.asm      # Backward M=1 (ASM — bug connu)
-│   ├── scan1d_backward_m1_shared_bc_simple.asm  # Variante simplifiée
+│   ├── scan1d_backward_m1_shared_bc_simple.asm  # Variante simplifiée (bug connu)
 │   └── mamba_scan.c          # Dispatch CPU : choisit la routine scan
 ├── cuda/                     # Scan SSM CUDA (Blelloch — propre à k-mamba)
 │   ├── scan1d.cu             # Blelloch parallel prefix scan 1D
@@ -56,9 +55,8 @@ k-mamba/
 │   └── cuda/                 # Kernels CUDA génériques (optimiseurs uniquement)
 │       └── optimizer_utils.cu # Gradient clipping, AdamW, MUON CUDA ✅ testé
 ├── tests/
-│   ├── unit/test_optimatrix_kernels.c  # GEMM/GEMV (5/5 ✅)
-│   ├── unit/test_optimizers.c          # CPU optimizers (2/2 ✅)
-│   └── cuda/test_cuda_optimizers.cu    # CUDA optimizers (4/4 ✅)
+│   ├── test_optimizers.c               # Optimiseurs CPU (15/15 ✅)
+│   └── unit/test_optimatrix_kernels.c  # GEMM/GEMV (5/5 ✅)
 ├── bench/
 │   └── bench_paper.c         # G1-G7 benchmarks (GEMM, wavefront, Blelloch, roofline)
 ├── paper/
@@ -185,7 +183,7 @@ Les scans sont dans k-mamba parce qu'ils encodent la logique SSM (structure du m
 |--------|---------------|
 | GEMM / GEMV | `cpu/gemm*.asm, gemv*.asm` (scalaire + AVX2) |
 | Conv1D depthwise | `cpu/conv1d_avx2.asm` (ASM AVX2) |
-| ConvND séparable | `cpu/generic_ops.c` (forward + backward ND) |
+| ConvND séparable | `src/convnd.c` (forward + backward ND, appelle conv1d_avx2) |
 | Activations (SiLU, Sigmoid, Softplus, ReLU) | `cpu/activations.asm` |
 | Hadamard product | `cpu/hadamard.asm` (AVX2) |
 | Gradient clipping, AdamW, MUON (CPU) | `cpu/optimizer_utils.c` |
@@ -205,8 +203,8 @@ Les scans sont dans k-mamba parce qu'ils encodent la logique SSM (structure du m
 | seq_len | 128 |
 | n_layers | 1 |
 | batch_size | 8 (default) |
-| optimizer (blocks) | MUONCLIP (lr=1e-3, momentum=0.9, beta2=0.999, clip=1.0) |
-| optimizer (embed/head) | SGD (lr=1e-3, wd=1e-5) |
+| optimizer (blocks)     | MUON (Newton-Schulz + momentum, lr=1e-3, clip=1.0)     |
+| optimizer (embed/head) | AdamW (lr=1e-3, β1=0.9, β2=0.999, wd=1e-5)            |
 | checkpoint magic | `KMAMBA` |
 
 ---
@@ -233,8 +231,8 @@ Pour chaque séquence du batch :
     6. Accumulation g_embed par scatter-add
 
 Après le batch :
-    7. mamba_optimizer_step (MUONCLIP) — un seul step
-    8. SGD sur embedding et head
+    7. mamba_optimizer_step (MUON) — un seul step
+    8. AdamW sur embedding et head (moments m, v avec correction de biais)
 ```
 
 ---
@@ -278,7 +276,7 @@ Samuel a développé la **Théorie des Volontés** : les systèmes doivent opér
 En contexte k-mamba :
 - Le modèle ne minimise pas une loss — il cherche l'**équilibre de ses Volontés internes**
 - Chaque MambaBlock est une Volonté qui transforme la séquence
-- L'optimiseur MUONCLIP arbitre les tensions entre gradients (directions isotropiques)
+- L'optimiseur MUON arbitre les tensions entre gradients (directions isotropiques)
 - Un bug n'est pas une erreur d'instruction — c'est un **conflit de Volontés non résolu**
 
 Vision long terme : k-mamba → fondation d'un OS-IA sur architecture post-Von Neumann.

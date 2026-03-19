@@ -7,6 +7,25 @@
 
 /* ========= utils ========= */
 
+/* Adam update pour embedding et head (mêmes hyperparams que opt_blocks) */
+#define ADAM_EH_UPDATE(km, param, grad_arr, m_arr, v_arr, N) do {          \
+    float _mu    = (km)->opt_blocks.mu;                                      \
+    float _b2    = (km)->opt_blocks.beta2;                                   \
+    float _eps   = (km)->opt_blocks.eps;                                     \
+    float _lr    = (km)->lr_embed_head;                                      \
+    float _wd    = (km)->weight_decay;                                       \
+    float _bc1   = 1.0f - powf(_mu, (float)(km)->step_embed_head);          \
+    float _bc2   = 1.0f - powf(_b2, (float)(km)->step_embed_head);          \
+    for (size_t _i = 0; _i < (N); _i++) {                                   \
+        float _g = (grad_arr)[_i] + _wd * (param)[_i];                      \
+        (m_arr)[_i] = _mu * (m_arr)[_i] + (1.0f - _mu) * _g;               \
+        (v_arr)[_i] = _b2 * (v_arr)[_i] + (1.0f - _b2) * _g * _g;         \
+        float _mh = (m_arr)[_i] / _bc1;                                      \
+        float _vh = (v_arr)[_i] / _bc2;                                      \
+        (param)[_i] -= _lr * _mh / (sqrtf(_vh) + _eps);                     \
+    }                                                                         \
+} while (0)
+
 static void *xcalloc(size_t n, size_t sz) {
     void *p = calloc(n, sz);
     if (!p) { fprintf(stderr, "OOM\n"); abort(); }
@@ -68,9 +87,7 @@ KMamba* kmamba_create(const KMambaConfig *cfg) {
             .dim        = cfg->dim,
             .state_size = cfg->state_size,
             .seq_len    = cfg->seq_len,
-            .dt_rank    = 1.0f,
             .dt_scale   = cfg->dt_scale,
-            .dt_init    = 1.0f,
             .dt_min     = cfg->dt_min,
             .dt_max     = cfg->dt_max
         };
@@ -94,6 +111,10 @@ void kmamba_free(KMamba *m) {
     }
     free(m->embedding);
     free(m->head);
+    free(m->m_embedding);
+    free(m->v_embedding);
+    free(m->m_head);
+    free(m->v_head);
     free(m);
 }
 
@@ -123,6 +144,13 @@ int kmamba_enable_training_with_optimizer(KMamba *m, OptimizerType opt_type,
     m->weight_decay = weight_decay;
     for (size_t i = 0; i < m->cfg.n_layers; i++)
         mamba_attach_optimizer(m->layers[i], opt_type, opt_blocks);
+
+    size_t VD = m->cfg.vocab_size * m->cfg.dim;
+    m->m_embedding     = (float *)xcalloc(VD, sizeof(float));
+    m->v_embedding     = (float *)xcalloc(VD, sizeof(float));
+    m->m_head          = (float *)xcalloc(VD, sizeof(float));
+    m->v_head          = (float *)xcalloc(VD, sizeof(float));
+    m->step_embed_head = 0;
     return 0;
 }
 
@@ -336,11 +364,9 @@ float kmamba_train_step(KMamba *m, const uint8_t *tokens_plus1) {
     for (size_t i = 0; i < m->cfg.n_layers; i++)
         mamba_optimizer_step(m->layers[i], &m->opt_blocks);
 
-    float lr = m->lr_embed_head, wd = m->weight_decay;
-    for (size_t i = 0; i < V * D; i++)
-        m->embedding[i] -= lr * (g_embed[i] + wd * m->embedding[i]);
-    for (size_t i = 0; i < D * V; i++)
-        m->head[i] -= lr * (g_head[i] + wd * m->head[i]);
+    m->step_embed_head++;
+    ADAM_EH_UPDATE(m, m->embedding, g_embed, m->m_embedding, m->v_embedding, V * D);
+    ADAM_EH_UPDATE(m, m->head,      g_head,  m->m_head,      m->v_head,      D * V);
 
     free(acts); free(d_hidden); free(logits); free(probs);
     free(dlogits); free(head_T); free(hidden_T);
@@ -389,6 +415,7 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
             mamba_block_forward(m->layers[i], &acts[(i + 1) * L * D], &acts[i * L * D], 1);
 
         const float *hidden = &acts[m->cfg.n_layers * L * D];
+        memset(logits, 0, L * V * sizeof(float));
         gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
 
         float sample_loss = 0.0f;
@@ -404,6 +431,7 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
         }
         total_loss += sample_loss * invL;
 
+        memset(d_hidden, 0, L * D * sizeof(float));
         gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
 
         transpose(hidden, hidden_T, L, D);
@@ -428,11 +456,9 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
     for (size_t i = 0; i < m->cfg.n_layers; i++)
         mamba_optimizer_step(m->layers[i], &m->opt_blocks);
 
-    float lr = m->lr_embed_head, wd = m->weight_decay;
-    for (size_t i = 0; i < V * D; i++)
-        m->embedding[i] -= lr * (g_embed[i] + wd * m->embedding[i]);
-    for (size_t i = 0; i < D * V; i++)
-        m->head[i] -= lr * (g_head[i] + wd * m->head[i]);
+    m->step_embed_head++;
+    ADAM_EH_UPDATE(m, m->embedding, g_embed, m->m_embedding, m->v_embedding, V * D);
+    ADAM_EH_UPDATE(m, m->head,      g_head,  m->m_head,      m->v_head,      D * V);
 
     free(acts); free(logits); free(probs); free(dlogits);
     free(d_hidden); free(d_buf); free(hidden_T);

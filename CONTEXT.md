@@ -75,8 +75,7 @@ optimatrix/
 │   ├── activations.asm       ← SiLU, Sigmoid, Softplus, ReLU (AVX2)
 │   ├── hadamard.asm          ← Produit élément par élément (AVX2)
 │   ├── conv1d_avx2.asm       ← Conv1D depthwise causale (AVX2)
-│   ├── generic_ops.c         ← ConvND séparable : forward + backward (C pur)
-│   └── optimizer_utils.c     ← Gradient clipping, AdamW, MUON (C pur, CPU)
+│   └── optimizer_utils.c     ← gradient_clip, newton_schulz5_inplace (C pur, CPU)
 │
 ├── cuda/
 │   └── optimizer_utils.cu    ← Gradient clipping, AdamW, MUON (CUDA) ✅ testé
@@ -279,7 +278,6 @@ k-mamba/
 │   ├── scan1d.asm            ← Scan 1D forward (ASM AVX2)
 │   ├── scan2d.asm            ← Scan 2D wavefront (ASM)
 │   ├── scan1d_backward.c     ← Backward 1D générique [L,D,M] (C pur)
-│   ├── scan1d_backward_m.c   ← Backward 1D pour M > 1 (C pur)
 │   ├── scan1d_backward_m1_shared_bc.asm      ← ⚠️ bug "two index registers" — DÉSACTIVÉ
 │   ├── scan1d_backward_m1_shared_bc_simple.asm  ← ⚠️ même bug — DÉSACTIVÉ
 │   └── mamba_scan.c          ← Dispatch CPU : choisit la routine selon les params
@@ -336,10 +334,15 @@ typedef struct {
 
     MambaBlock **layers; // stack de n_layers blocs SSM
 
-    int         for_training;
+    int           for_training;
     MBOptimConfig opt_blocks;
     float         lr_embed_head;
     float         weight_decay;
+
+    // Adam state pour embedding et head
+    float  *m_embedding, *v_embedding;
+    float  *m_head,      *v_head;
+    size_t  step_embed_head;
 } KMamba;
 ```
 
@@ -493,11 +496,10 @@ kmamba_train_batch(m, batch_tokens, B)
 │                                                         │
 │ Après les B séquences :                                 │
 │                                                         │
-│  6. mamba_optimizer_step (MUONCLIP) — un seul step     │
-│     → Newton-Schulz sur les gradients des blocs        │
+│  7. mamba_optimizer_step (MUON + NS) — un seul step    │
 │                                                         │
-│  7. SGD sur embedding et head                           │
-│     → param -= lr * grad                               │
+│  8. AdamW sur embedding et head                         │
+│     → moments m, v + correction de biais               │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -588,12 +590,8 @@ cmake --build build -j
 ctest --test-dir build
 
 # CPU + CUDA (MX450 = sm_75)
-cmake -B build-cuda -DKMAMBA_BUILD_CUDA=ON -DKMAMBA_BUILD_TESTS=ON
-# IMPORTANT : le flag CUDA d'optimatrix ne passe pas via CLI (cache déjà créé)
-# Il faut forcer dans le cache :
-sed -i 's/OPTIMATRIX_BUILD_CUDA:BOOL=OFF/OPTIMATRIX_BUILD_CUDA:BOOL=ON/' build-cuda/CMakeCache.txt
-cmake build-cuda && cmake --build build-cuda -j
-ctest --test-dir build-cuda
+cmake -B build-cuda -DKMAMBA_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-cuda -j
 
 # Test spécifique
 ctest --test-dir build -R OptimizersTest -V
@@ -610,14 +608,14 @@ cmake --build build-bench --target bench_paper
 
 ---
 
-## État des tests (17/03/2026)
+## État des tests (18/03/2026)
 
 | Suite | Tests | Statut |
 |-------|-------|--------|
 | `test_optimatrix_kernels` | 5/5 | ✅ PASS |
-| `test_optimizers` (CPU) | 2/2 | ✅ PASS |
-| `CudaOptimizersTest` | 4/4 | ✅ PASS |
-| Scan CUDA | — | Compile, pas encore dans CTest |
+| `test_optimizers` (CPU) | 15/15 | ✅ PASS |
+| `test_scan1d_backward_asm` | 1/1 | ✅ PASS |
+| Scan CUDA | — | Compile, non enregistré dans CTest |
 
 **Plateforme** : x86-64 Linux, NVIDIA MX450 (sm_75), CUDA 12.0.
 **Benchmark GEMM** : AVX2 ASM ≈ 6.0 GFLOPS sur 64×128 × 128×256 (8× vs scalaire).
@@ -639,7 +637,7 @@ cmake --build build-bench --target bench_paper
 3. **`gemm_avx2` accumule** : `C += A*B`. Zéroïser C avant si nécessaire.
 4. **`optimatrix.h` a un guard `extern "C"`** pour compatibilité NVCC — ne pas le retirer.
 5. **Exécutables de test** : compilés avec `-no-pie` (ASM 32-bit incompatible avec PIE).
-6. **`OPTIMATRIX_BUILD_CUDA` s'active via `sed` sur CMakeCache**, pas via flag CLI.
+6. **`OPTIMATRIX_BUILD_CUDA` s'active via `-DKMAMBA_BUILD_CUDA=ON`** lors du cmake initial.
 7. **Toujours `-O3 -mavx2`** — sans ça, les kernels ASM perdent leur intérêt.
 8. **Pas de Python, pas de dépendances externes** (libc + libm uniquement).
 9. **k-mamba est une bibliothèque** — pas de CLI dans le projet principal.

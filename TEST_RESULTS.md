@@ -1,8 +1,7 @@
 # TEST_RESULTS.md — Résultats des Tests k-mamba
 
-**Date** : 17 Mars 2026
-**Version** : k-mamba v0.1.0
-**Plateforme** : x86-64 Linux, NVIDIA MX450 (sm_75), CUDA 12.0
+**Date** : 18 Mars 2026
+**Plateforme** : x86-64 Linux, AVX2, GCC 11
 
 ---
 
@@ -10,8 +9,8 @@
 
 | Build | Flags | Statut |
 |-------|-------|--------|
-| CPU seul | `KMAMBA_BUILD_CPU=ON` | ✅ |
-| CPU + CUDA | `KMAMBA_BUILD_CUDA=ON OPTIMATRIX_BUILD_CUDA=ON` | ✅ |
+| CPU seul | `KMAMBA_BUILD_CPU=ON KMAMBA_BUILD_TESTS=ON` | ✅ |
+| CPU + CUDA | `KMAMBA_BUILD_CUDA=ON` (optimizer steps GPU) | ✅ compile |
 
 ---
 
@@ -29,9 +28,7 @@
 
 **5/5 tests passés.**
 
-Tolérance numérique : `EPSILON = 2e-5f` — justifiée par l'accumulation float32 sur 128 éléments
-(erreur max théorique ≈ 6e-5). `gemm_avx2` accumule dans C (`C += A*B`) : l'appelant doit
-zéroïser C avant appel (contrat documenté).
+Tolérance : `EPSILON = 2e-5f`. `gemm_avx2` accumule dans C (`C += A@B`) : zéroïser avant appel.
 
 #### Benchmark GEMM (64×128 × 128×256)
 
@@ -44,53 +41,117 @@ zéroïser C avant appel (contrat documenté).
 
 ### test_optimizers — Optimiseurs CPU
 
+| Test | Description | Résultat |
+|------|-------------|----------|
+| clip_no_op | norme < max → pas de modification | ✅ |
+| clip_actif | norme après clip == max_norm | ✅ |
+| clip_direction | direction préservée après clip | ✅ |
+| ns_diagonale | G·Gᵀ diagonale ≈ 1 | ✅ |
+| ns_orthogonalite | G·Gᵀ hors-diag ≈ 0 (max err 0.003) | ✅ |
+| ns_gradient_nul | gradient nul : pas de crash | ✅ |
+| muon_block | W_in modifié après MUON step (NS + momentum) | ✅ |
+| adam_diff_sgd | Adam != SGD (variance adaptative active) | ✅ |
+| adam_m_embed | m_embedding alloué | ✅ |
+| adam_v_embed | v_embedding alloué | ✅ |
+| adam_m_head | m_head alloué | ✅ |
+| adam_v_head | v_head alloué | ✅ |
+| adam_step_init | step_embed_head initialisé à 0 | ✅ |
+| adam_step_inc | step_embed_head == 1 après train_step | ✅ |
+| adam_m_nonzero | m_embedding non nul après step | ✅ |
+| adamw_no_double_wd | formule correcte != double WD | ✅ |
+| adamw_w_in_evolue | W_in évolue à chaque step (WD simple) | ✅ |
+
+**15/15 tests passés.**
+
+Bugs corrigés lors de cette session (18/03/2026) :
+- MUON : était un stub SGDM sans Newton-Schulz → remplacé par vrai MUON (NS 5 itérations)
+- AdamW : double weight decay (wd appliqué dans la formule ET dans le gradient) → supprimé
+- Embedding/head : SGD pur → AdamW avec moments m, v et correction de biais
+- `gemm_avx2` accumule : zéroïser les buffers A, AG avant chaque appel NS
+
+---
+
+### test_scan1d_backward_asm — Backward ASM vs C (7/7)
+
+Compare `scan1d_backward_m1_shared_bc_asm` (AVX2) et `scan1d_backward_m1_shared_bc_simple_asm`
+avec la référence C. Tolérance 1e-4.
+
 | Test | Résultat |
 |------|----------|
-| Gradient clipping (no-op) | ✅ |
-| Gradient clipping (actif) | ✅ norme clampée à max_norm |
-| ADAM_CLIP + clipping | ✅ |
-| MUON + clipping | ✅ |
-
-**2/2 tests passés.**
-
-Fix appliqué : `mamba_attach_optimizer` n'allouait les buffers `m_*` (first moment) que pour
-`OPTIMIZER_ADAM_CLIP` / `OPTIMIZER_ADAMW`. MUON et SGD utilisent aussi `m_*` → SEGFAULT.
-Correction : condition étendue à `|| OPTIMIZER_MUON || OPTIMIZER_SGD`.
+| Simple ASM small (L=8 D=4) | ✅ |
+| Simple ASM medium (L=32 D=16) | ✅ |
+| Simple ASM large (L=64 D=32) | ✅ |
+| AVX2 ASM small (L=8 D=4) | ✅ |
+| AVX2 ASM medium (L=32 D=16) | ✅ |
+| AVX2 ASM D=17 (queue scalaire) | ✅ |
+| AVX2 ASM large (L=64 D=32) | ✅ |
 
 ---
 
-## Résultats (build CPU + CUDA)
+### test_scan1d — ASM forward vs référence C (7/7)
 
-### test_cuda_optimizers — Optimiseurs GPU
+| Test | Résultat |
+|------|----------|
+| small M=1 (L=4 D=8) | ✅ |
+| medium M=1 (L=16 D=16) | ✅ |
+| large M=1 (L=64 D=32) | ✅ |
+| D non multiple de 8 (D=24) | ✅ |
+| small M=2 (L=4 D=8) | ✅ |
+| medium M=2 (L=16 D=16) | ✅ |
+| Cas dégénéré x=0 B=0 | ✅ |
 
-| Test | Résultat | Détail |
-|------|----------|--------|
-| Gradient clipping CUDA | ✅ | norme 18518 → 5.0 |
-| AdamW CUDA | ✅ | 3 steps, convergence monotone |
-| MUON CUDA | ✅ | momentum stable après step 1 |
-| Consistance CPU/CUDA | ✅ | max diff = 2.98e-08 |
-
-**4/4 tests passés.**
-
-Fix appliqué : `optimatrix.h` manquait de `extern "C"`. NVCC compilant les `.cu` en C++,
-les symboles C (`gradient_norm`, `gradient_clip_inplace`) n'étaient pas résolus. Ajout du guard
-`#ifdef __cplusplus extern "C" { } #endif` autour de toutes les déclarations.
+Note: l'ASM maintient h comme état courant [D,M] (pas [L,D,M]).
 
 ---
 
-## Tests désactivés / Known Issues
+### test_scan1d_backward — Gradient check numérique (4/4)
 
-| Fichier | Raison | Priorité |
-|---------|--------|----------|
-| `cpu/scan1d_backward_m1_shared_bc.asm` | Bug ASM "two index registers" (pré-existant) | TODO |
-| `cpu/scan1d_backward_m1_shared_bc_simple.asm` | Même bug | TODO |
-| CUDA scan (`scan1d.cu`, `scan1d_backward.cu`) | Compilent, non testés dans la suite actuelle | Prochain |
+Différences finies centrées (eps=1e-3, tol=1e-3) sur x, A, B, C, delta.
+
+| Test | max_err |
+|------|---------|
+| small M=1 | < 2e-5 |
+| medium M=1 | < 2e-5 |
+| small M=2 | < 5e-6 |
+| medium M=2 | < 1e-4 |
+
+---
+
+### test_kmamba_e2e — End-to-end (4/4)
+
+Micro-modèle dim=16, state=8, n_layers=1, seq_len=8.
+
+| Test | Résultat |
+|------|----------|
+| forward : logits finis | ✅ |
+| train_step : loss finie ~5.5 | ✅ |
+| Décroissance 5.57 → 4.54 sur 20 steps | ✅ |
+| train_batch loss finie (batch_size=4) | ✅ |
+
+---
+
+## CTest global : 6/6 suites ✅
+
+---
+
+## Bugs corrigés (18/03/2026)
+
+| Bug | Correctif |
+|-----|-----------|
+| MUON : stub SGDM sans Newton-Schulz | Vrai MUON (NS 5 itérations) |
+| AdamW double weight decay | Supprimé |
+| Embedding/head : SGD → AdamW | AdamW avec moments m, v |
+| `gemm_avx2` accumule : buffers A, AG | memset avant chaque appel NS |
+| `kmamba_train_batch` : `logits` accumule sur le batch | `memset(logits, 0, ...)` avant gemm |
+| `kmamba_train_batch` : `d_hidden` accumule sur le batch | `memset(d_hidden, 0, ...)` avant gemm |
+
+Le bug `-nan` sur `train.txt` (batch_size=32) était causé par les deux derniers : `gemm_avx2`
+accumule et les buffers n'étaient pas réinitialisés entre séquences. Après fix : descente
+monotone 5.38 → 3.74 → 3.07 sur `data/train.txt` (327 KB, DIM=128, STATE=256, N_LAYERS=2).
 
 ---
 
 ## Prochaines étapes
 
-- Écrire tests pour scan1D/2D (forward + backward)
-- Tester MambaBlock complet (forward → backward → optimizer step)
-- Benchmark Scan1D CPU ASM vs CUDA
-- Fixer les bugs ASM dans `scan1d_backward_m1_shared_bc.asm`
+- Test CUDA scan1D sous `KMAMBA_BUILD_CUDA`
+- Activer `scan1d_backward_m1_shared_bc_asm` dans le dispatch si gain perf mesuré

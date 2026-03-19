@@ -15,7 +15,6 @@ set(CPU_ASM_SRCS
 
 set(CPU_C_SRCS
     scan1d_backward.c
-    scan1d_backward_m.c
     mamba_scan.c
 )
 

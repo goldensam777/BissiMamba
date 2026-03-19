@@ -103,28 +103,6 @@ void scan1d_backward_m1_shared_bc(ScanBackwardSharedParams *p);
 void scan1d_backward_m1_shared_bc_asm(ScanBackwardSharedParams *p);
 void scan1d_backward_m1_shared_bc_simple_asm(ScanBackwardSharedParams *p);
 
-/* ── Selective Scan 1D — backward générique sur M ───────────── */
-typedef struct {
-    float *x;
-    float *A;
-    float *B;
-    float *C;
-    float *delta;
-    float *h0;
-    float *h;
-    float *dy;
-    float *dx;
-    float *dA;
-    float *dB;
-    float *dC;
-    float *ddelta;
-    long   L;
-    long   D;
-    long   M;
-} ScanBackwardMParams;
-
-void scan1d_backward_m_generic(ScanBackwardMParams *p);
-
 /* ── Selective Scan 2D — wavefront ──────────────────────────── */
 /*
  * Récurrence 2D sur grille (d1 x d2) :

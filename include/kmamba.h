@@ -26,9 +26,7 @@ typedef struct {
     float dt_scale;
     float dt_min;
     float dt_max;
-    float dt_rank;
-    float dt_init;
-    
+
     /* ConvND parameters */
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND avant scan */
     long   convnd_K;       /* Taille du noyau ConvND (K>=1) */
@@ -140,6 +138,13 @@ typedef struct {
     MBOptimConfig opt_blocks;
     float lr_embed_head;
     float weight_decay;
+
+    /* Adam state pour embedding et head */
+    float  *m_embedding;
+    float  *v_embedding;
+    float  *m_head;
+    float  *v_head;
+    size_t  step_embed_head;
 } KMamba;
 
 /* ============================================================================
@@ -151,8 +156,6 @@ void        mamba_block_init(MambaBlock *block);
 
 void mamba_block_forward(MambaBlock *block, float *output, const float *input,
                         size_t batch_size);
-void mamba_block_forward_2d(MambaBlock *block, float *output, const float *input,
-                            size_t d1, size_t d2);
 
 /* Training functions */
 void mamba_attach_optimizer(MambaBlock *block, OptimizerType type, const MBOptimConfig *optconf);
@@ -162,8 +165,6 @@ void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf);
 
 void mamba_backward(MambaBlock *block, const float *dY, const float *input,
                     float *d_input, size_t batch_index);
-void mamba_backward_2d(MambaBlock *block, const float *dY, const float *input,
-                       float *d_input, size_t d1, size_t d2);
 
 /* ============================================================================
  * Matrix Operations

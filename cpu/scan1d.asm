@@ -27,6 +27,10 @@
 %include "types.inc"
 %include "scan.inc"
 
+section .rodata
+h_clamp_pos: dd 1000.0
+h_clamp_neg: dd -1000.0
+
 section .text
     global scan1d
     extern expf
@@ -126,6 +130,12 @@ scan1d:
     mulss xmm0, xmm4                        ; xmm0 = dA * h_old
     mulss xmm2, xmm3                        ; xmm2 = dB * xt
     addss xmm0, xmm2                        ; xmm0 = h_new
+
+    ; clamp h_new à [-1000, 1000] pour éviter la divergence des états cachés
+    movss xmm5, [rel h_clamp_pos]
+    minss xmm0, xmm5                        ; h_new = min(h_new, 1000)
+    movss xmm5, [rel h_clamp_neg]
+    maxss xmm0, xmm5                        ; h_new = max(h_new, -1000)
 
     ; stocker h[dm_idx] = h_new
     movss [rdx + rbx*FLOAT32_SIZE], xmm0   ; rdx = h pointer

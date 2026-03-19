@@ -79,6 +79,7 @@ __global__ void scan1d_seq_kernel(
         float b = dt_val * B[t_dm] * x[t_d];
 
         float h_cur = a * h_prev + b;
+        h_cur = fmaxf(-1000.0f, fminf(1000.0f, h_cur));
         h[t_dm]  = h_cur;
         h_prev   = h_cur;
 
@@ -228,6 +229,7 @@ __global__ void scan1d_blelloch_kernel(
     float b_t = d_b[idx];
     float h_val = a_t * sb[t] + b_t;   /* = a_t * h_prefix + b_t */
     /* Note : sb[t] apres down-sweep = h_{t-1} (h precedent) */
+    h_val = fmaxf(-1000.0f, fminf(1000.0f, h_val));
     h[idx] = h_val;
     __syncthreads();
 }

@@ -419,13 +419,3 @@ void convnd(ConvNDParams *p, ConvNDMode mode, ConvNDWorkspace *ws) {
     }
 }
 
-/* ============================================================
- * Wrappers legacy — backward-compatible
- * ============================================================ */
-void convnd_forward(ConvNDParams *p) {
-    convnd(p, CONVND_FORWARD, NULL);
-}
-
-void convnd_backward(ConvNDParams *p) {
-    convnd(p, CONVND_BACKWARD, NULL);
-}

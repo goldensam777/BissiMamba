@@ -242,9 +242,10 @@ void mb_selective_scan(float *output, float *state,
 
         for (size_t i = 0; i < state_size; i++) {
             float a_val = A_bar->data[i * state_size + i];
+            if (a_val > -1e-5f) a_val = -1e-5f;   /* clamp A ≤ -1e-5 */
             float a_diag = expf(dt_t * a_val);
             A_diag_t[i] = a_diag;
-            if (fabsl(a_val) < 1e-8) {
+            if (fabsf(a_val) < 1e-8f) {
                 B_bar_t[i] = dt_t * B_bar[i];
             } else {
                 B_bar_t[i] = (a_diag - 1.0f) / a_val * B_bar[i];
@@ -351,9 +352,11 @@ void mamba_block_free(MambaBlock *block) {
 void mamba_block_init(MambaBlock *block) {
     if (!block) return;
 
+    /* A_log stocke directement A (valeur négative).
+     * A = -1 pour toutes les dimensions → decay = exp(-Δ) ∈ (0.37, 0.999).
+     * La stabilité est garantie par le clamp A ≤ -1e-5 dans le forward. */
     for (size_t i = 0; i < block->config.state_size; i++) {
-        float spacing = (float)(i + 1) / (float)block->config.state_size;
-        block->A_log.data[i] = -expf(spacing * logf(block->config.dt_scale));
+        block->A_log.data[i] = -1.0f;
     }
 
     for (size_t i = 0; i < block->config.state_size; i++) {
@@ -508,13 +511,20 @@ static MBOptimState* _find_opt(MambaBlock *block) {
 static void adam_clip_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
     size_t dim = block->config.dim; size_t state = block->config.state_size;
     size_t size_in = state * dim; size_t size_out = dim * state;
-    float lr = conf->lr; float mu = conf->mu; float beta2 = conf->beta2; 
+
+#ifdef KMAMBA_BUILD_CUDA
+    adamw_update_cuda(block->W_in.data,       s->g_W_in,       s->m_W_in,       s->v_W_in,       size_in,   conf, s->step);
+    adamw_update_cuda(block->W_out.data,      s->g_W_out,      s->m_W_out,      s->v_W_out,      size_out,  conf, s->step);
+    adamw_update_cuda(block->A_log.data,      s->g_A_log,      s->m_A_log,      s->v_A_log,      state,     conf, s->step);
+    adamw_update_cuda(block->B_mat.data,      s->g_B_mat,      s->m_B_mat,      s->v_B_mat,      state,     conf, s->step);
+    adamw_update_cuda(block->C_mat.data,      s->g_C_mat,      s->m_C_mat,      s->v_C_mat,      state,     conf, s->step);
+    adamw_update_cuda(block->delta_proj.data, s->g_delta_proj, s->m_delta_proj, s->v_delta_proj, dim,       conf, s->step);
+#else
+    float lr = conf->lr; float mu = conf->mu; float beta2 = conf->beta2;
     float eps = conf->eps; float clip = conf->clip_norm; float wd = conf->weight_decay;
 
 #define ADAM_CLIP_UPDATE(param, grad, m, v, N) do { \
-    /* 1. Gradient clipping avec fonction optimatrix */ \
     if (clip > 0.0f) gradient_clip_inplace(grad, (N), clip); \
-    /* 2. Adam updates */ \
     for (size_t _i=0; _i < (N); _i++) { float g = grad[_i] + wd * param[_i]; \
         m[_i] = mu * m[_i] + (1.0f - mu) * g; \
         v[_i] = beta2 * v[_i] + (1.0f - beta2) * (g * g); \
@@ -531,6 +541,7 @@ static void adam_clip_update(MambaBlock *block, MBOptimState *s, const MBOptimCo
     ADAM_CLIP_UPDATE(block->delta_proj.data, s->g_delta_proj, s->m_delta_proj, s->v_delta_proj, dim);
 
 #undef ADAM_CLIP_UPDATE
+#endif
 }
 
 static void adamw_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
@@ -579,35 +590,51 @@ static void sgd_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *
 #undef SGD_UPDATE
 }
 
-/* MUON implementation with gradient clipping */
+/* MUON : matrices (W_in, W_out) — Newton-Schulz + momentum + clipping */
 static void muon_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
     size_t dim = block->config.dim; size_t state = block->config.state_size;
-    size_t size_in = state * dim; size_t size_out = dim * state;
+
+#ifdef KMAMBA_BUILD_CUDA
+    muon_update_mat_cuda(block->W_in.data,  s->g_W_in,  s->m_W_in,  state, dim,   conf);
+    muon_update_mat_cuda(block->W_out.data, s->g_W_out, s->m_W_out, dim,   state, conf);
+    muon_update_vec_cuda(block->A_log.data,      s->g_A_log,      s->m_A_log,      state, conf);
+    muon_update_vec_cuda(block->B_mat.data,      s->g_B_mat,      s->m_B_mat,      state, conf);
+    muon_update_vec_cuda(block->C_mat.data,      s->g_C_mat,      s->m_C_mat,      state, conf);
+    muon_update_vec_cuda(block->delta_proj.data, s->g_delta_proj, s->m_delta_proj, dim,   conf);
+#else
     float lr = conf->lr; float mu = conf->mu; float wd = conf->weight_decay;
     float clip = conf->clip_norm;
 
-#define MUON_UPDATE(param, grad, m, N) do { \
-    /* 1. Momentum avec weight decay */ \
-    for (size_t _i=0; _i < (N); _i++) { \
-        float g = grad[_i] + wd * param[_i]; \
-        m[_i] = mu * m[_i] + (1.0f - mu) * g; \
+#define MUON_UPDATE_MAT(param, grad, m, rows, cols) do { \
+    size_t _N = (rows) * (cols); \
+    newton_schulz5_inplace(grad, rows, cols, 5); \
+    for (size_t _i = 0; _i < _N; _i++) { \
+        float _g = grad[_i] + wd * param[_i]; \
+        m[_i] = mu * m[_i] + (1.0f - mu) * _g; \
     } \
-    /* 2. Gradient clipping sur momentum */ \
-    if (clip > 0.0f) gradient_clip_inplace(m, (N), clip); \
-    /* 3. Update avec momentum clippé */ \
-    for (size_t _i=0; _i < (N); _i++) { \
-        param[_i] -= lr * m[_i]; \
-    } \
+    if (clip > 0.0f) gradient_clip_inplace(m, _N, clip); \
+    for (size_t _i = 0; _i < _N; _i++) param[_i] -= lr * m[_i]; \
     } while (0)
 
-    MUON_UPDATE(block->W_in.data, s->g_W_in, s->m_W_in, size_in);
-    MUON_UPDATE(block->W_out.data, s->g_W_out, s->m_W_out, size_out);
-    MUON_UPDATE(block->A_log.data, s->g_A_log, s->m_A_log, state);
-    MUON_UPDATE(block->B_mat.data, s->g_B_mat, s->m_B_mat, state);
-    MUON_UPDATE(block->C_mat.data, s->g_C_mat, s->m_C_mat, state);
-    MUON_UPDATE(block->delta_proj.data, s->g_delta_proj, s->m_delta_proj, dim);
+#define MUON_UPDATE_VEC(param, grad, m, N) do { \
+    for (size_t _i = 0; _i < (N); _i++) { \
+        float _g = grad[_i] + wd * param[_i]; \
+        m[_i] = mu * m[_i] + (1.0f - mu) * _g; \
+    } \
+    if (clip > 0.0f) gradient_clip_inplace(m, (N), clip); \
+    for (size_t _i = 0; _i < (N); _i++) param[_i] -= lr * m[_i]; \
+    } while (0)
 
-#undef MUON_UPDATE
+    MUON_UPDATE_MAT(block->W_in.data,  s->g_W_in,  s->m_W_in,  state, dim);
+    MUON_UPDATE_MAT(block->W_out.data, s->g_W_out, s->m_W_out, dim,   state);
+    MUON_UPDATE_VEC(block->A_log.data,       s->g_A_log,       s->m_A_log,       state);
+    MUON_UPDATE_VEC(block->B_mat.data,       s->g_B_mat,       s->m_B_mat,       state);
+    MUON_UPDATE_VEC(block->C_mat.data,       s->g_C_mat,       s->m_C_mat,       state);
+    MUON_UPDATE_VEC(block->delta_proj.data,  s->g_delta_proj,  s->m_delta_proj,  dim);
+
+#undef MUON_UPDATE_MAT
+#undef MUON_UPDATE_VEC
+#endif
 }
 
 void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
@@ -669,7 +696,10 @@ static void selective_scan_forward_store(ForwardStore *store, float *state,
 #pragma omp parallel for
 #endif
         for (size_t i = 0; i < state_size; i++) {
+            /* Clamp A ≤ -1e-5 : garantit exp(dt*A) < 1 (scan stable)
+             * même si AdamW pousse A_log vers des valeurs positives. */
             float a_val = A_bar->data[i * state_size + i];
+            if (a_val > -1e-5f) a_val = -1e-5f;
             float a_diag_t = expf(dt_t * a_val);
             store->A_diag[t * state_size + i] = a_diag_t;
             store->B_bar[t * state_size + i] = dt_t * B_bar[i];
@@ -774,12 +804,13 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                 raw_t += block->delta_proj.data[k] * x_input_t[k];
             }
             {
-                float sp = scalar_softplus(raw_t);
-                if (sp > block->config.dt_min && sp < block->config.dt_max) {
-                    float draw = ddt_t * scalar_sigmoid(raw_t);
-                    for (size_t k = 0; k < dim; k++) {
-                        s->g_delta_proj[k] += draw * x_input_t[k];
-                    }
+                /* Straight-through estimator pour le clamp :
+                 * on propage le gradient même si delta est clampé.
+                 * Sans ça, softplus(x) >= ln(2) > dt_max=0.1 toujours,
+                 * et delta_proj ne recevrait jamais de gradient. */
+                float draw = ddt_t * scalar_sigmoid(raw_t);
+                for (size_t k = 0; k < dim; k++) {
+                    s->g_delta_proj[k] += draw * x_input_t[k];
                 }
             }
         }
@@ -801,6 +832,9 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
     if (d_input_out) {
         gemm_avx2(scan_out, block->W_in.data, d_input_out,
                   (long)seq_len, (long)state_size, (long)dim);
+        /* Residual gradient: d_input += dY (identity path) */
+        for (size_t i = 0; i < seq_len * dim; i++)
+            d_input_out[i] += dY[i];
     }
 
     free(scan_out); free(dY_T); free(z); free(adj_y);
@@ -924,7 +958,9 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
             for (size_t t = 0; t < seq_len; t++) {
                 const float *state_t = &scan_out[t * state_size];
                 mb_matrix_vec_mult(ybuf, &block->W_out, state_t);
-                for (size_t j = 0; j < dim; j++) batch_output[t * dim + j] = ybuf[j];
+                /* Residual connection: output = input + mamba(input) */
+                for (size_t j = 0; j < dim; j++)
+                    batch_output[t * dim + j] = batch_input[t * dim + j] + ybuf[j];
             }
             free(ybuf);
         }
@@ -934,237 +970,3 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
     }
 }
 
-/* ============================================================================
- * Forward 2D — Mamba on grid [d1, d2, dim] via scan2d ASM (wavefront)
- * ============================================================================ */
-
-void mamba_block_forward_2d(MambaBlock *block, float *output, const float *input,
-                            size_t d1, size_t d2) {
-    if (!block || !output || !input) return;
-
-    size_t dim  = block->config.dim;
-    size_t D    = block->config.state_size;
-    size_t P    = d1 * d2;
-    long   M    = 1;
-
-    float *u          = (float *)calloc(P * D, sizeof(float));
-    float *delta_pos  = (float *)calloc(P,     sizeof(float));
-    float *tmp_delta  = (float *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
-                                         sizeof(float));
-    float *z          = (float *)malloc(D * sizeof(float));
-
-    if (!u || !delta_pos || !tmp_delta || !z) {
-        free(u); free(delta_pos); free(tmp_delta); free(z);
-        return;
-    }
-
-    for (size_t p = 0; p < P; p++) {
-        const float *x_p = &input[p * dim];
-        float *u_p       = &u[p * D];
-        project_controller(block, x_p, z, u_p);
-        delta_pos[p] = project_delta_value(block, x_p, tmp_delta, p, P);
-    }
-    free(z);
-    free(tmp_delta);
-
-    float *B_s  = (float *)malloc(P * D * sizeof(float));
-    float *C_s  = (float *)malloc(P * D * sizeof(float));
-    float *d1_s = (float *)malloc(P * D * sizeof(float));
-    float *d2_s = (float *)malloc(P * D * sizeof(float));
-    float *h_s  = (float *)calloc(P * D, sizeof(float));
-    float *y_s  = (float *)malloc(P * D * sizeof(float));
-
-    if (!B_s || !C_s || !d1_s || !d2_s || !h_s || !y_s) {
-        free(B_s); free(C_s); free(d1_s); free(d2_s); free(h_s); free(y_s);
-        free(u); free(delta_pos);
-        return;
-    }
-
-    for (size_t p = 0; p < P; p++) {
-        for (size_t d = 0; d < D; d++) {
-            B_s [p*D + d] = block->B_mat.data[d];
-            C_s [p*D + d] = 1.0f;
-            d1_s[p*D + d] = delta_pos[p];
-            d2_s[p*D + d] = delta_pos[p];
-        }
-    }
-    free(delta_pos);
-
-    MambaScan2DParams sp = {
-        .x      = u,
-        .A1     = block->A_log.data,
-        .A2     = block->A_log.data,
-        .B      = B_s,
-        .C      = C_s,
-        .delta1 = d1_s,
-        .delta2 = d2_s,
-        .h      = h_s,
-        .y      = y_s,
-        .d1     = (long)d1,
-        .d2     = (long)d2,
-        .D      = (long)D,
-        .M      = M
-    };
-    mamba_scan2d_forward(&sp);
-
-    float *ybuf = (float *)malloc(dim * sizeof(float));
-    if (ybuf) {
-        for (size_t p = 0; p < P; p++) {
-            mb_matrix_vec_mult(ybuf, &block->W_out, &y_s[p * D]);
-            memcpy(&output[p * dim], ybuf, dim * sizeof(float));
-        }
-        free(ybuf);
-    }
-
-    free(u); free(B_s); free(C_s); free(d1_s); free(d2_s); free(h_s); free(y_s);
-}
-
-/* ============================================================================
- * Backward 2D
- * ============================================================================ */
-
-void mamba_backward_2d(MambaBlock *block, const float *dY, const float *input,
-                       float *d_input, size_t d1, size_t d2) {
-    if (!block || !dY || !input) return;
-
-    size_t dim = block->config.dim;
-    size_t D   = block->config.state_size;
-    size_t P   = d1 * d2;
-
-    MBOptimState *s = _find_opt(block);
-    if (!s) return;
-
-    float *u          = (float *)calloc(P * D, sizeof(float));
-    float *delta_pos  = (float *)calloc(P,     sizeof(float));
-    float *tmp_delta  = (float *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
-                                         sizeof(float));
-    float *B_s        = (float *)malloc(P * D * sizeof(float));
-    float *C_s        = (float *)malloc(P * D * sizeof(float));
-    float *d1_s       = (float *)malloc(P * D * sizeof(float));
-    float *d2_s       = (float *)malloc(P * D * sizeof(float));
-    float *h_all      = (float *)calloc(P * D, sizeof(float));
-    float *y_scan     = (float *)malloc(P * D * sizeof(float));
-    float *z          = (float *)malloc(D * sizeof(float));
-
-    if (!u || !delta_pos || !tmp_delta || !B_s || !C_s ||
-        !d1_s || !d2_s || !h_all || !y_scan || !z) {
-        free(u); free(delta_pos); free(tmp_delta);
-        free(B_s); free(C_s); free(d1_s); free(d2_s);
-        free(h_all); free(y_scan); free(z);
-        return;
-    }
-
-    for (size_t p = 0; p < P; p++) {
-        const float *x_p = &input[p * dim];
-        project_controller(block, x_p, z, &u[p * D]);
-        delta_pos[p] = project_delta_value(block, x_p, tmp_delta, p, P);
-    }
-    free(z);
-    free(tmp_delta);
-
-    for (size_t p = 0; p < P; p++) {
-        for (size_t d = 0; d < D; d++) {
-            B_s [p*D + d] = block->B_mat.data[d];
-            C_s [p*D + d] = 1.0f;
-            d1_s[p*D + d] = delta_pos[p];
-            d2_s[p*D + d] = delta_pos[p];
-        }
-    }
-
-    MambaScan2DParams sp = {
-        .x = u, .A1 = block->A_log.data, .A2 = block->A_log.data,
-        .B = B_s, .C = C_s, .delta1 = d1_s, .delta2 = d2_s,
-        .h = h_all, .y = y_scan,
-        .d1 = (long)d1, .d2 = (long)d2, .D = (long)D, .M = 1
-    };
-    mamba_scan2d_forward(&sp);
-    free(B_s); free(C_s); free(d1_s); free(d2_s);
-
-    float *adj_h = (float *)calloc(P * D, sizeof(float));
-    float *adj_u = (float *)calloc(P * D, sizeof(float));
-    if (!adj_h || !adj_u) {
-        free(adj_h); free(adj_u);
-        free(u); free(delta_pos); free(h_all); free(y_scan);
-        return;
-    }
-
-    for (size_t p = 0; p < P; p++) {
-        for (size_t j = 0; j < dim; j++) {
-            float dy = dY[p * dim + j];
-            for (size_t d = 0; d < D; d++) {
-                s->g_W_out[j * D + d] += dy * y_scan[p * D + d];
-                adj_h[p * D + d]      += dy * block->W_out.data[j * D + d];
-            }
-        }
-    }
-    free(y_scan);
-
-    for (long k = (long)(d1 + d2 - 2); k >= 0; k--) {
-        long i_min = k - (long)d2 + 1; if (i_min < 0) i_min = 0;
-        long i_max = k;                 if (i_max > (long)d1 - 1) i_max = (long)d1 - 1;
-
-        for (long i = i_min; i <= i_max; i++) {
-            long j = k - i;
-            size_t p = (size_t)(i * (long)d2 + j);
-
-            float dt = delta_pos[p];
-
-            for (size_t d = 0; d < D; d++) {
-                float ah  = adj_h[p * D + d];
-                if (ah == 0.0f) continue;
-
-                float a_val = block->A_log.data[d];
-                float dA    = expf(dt * a_val);
-
-                float h_prev1 = (i > 0) ? h_all[((size_t)(i-1) * d2 + (size_t)j) * D + d] : 0.0f;
-                float h_prev2 = (j > 0) ? h_all[((size_t)i * d2 + (size_t)(j-1)) * D + d] : 0.0f;
-
-                s->g_A_log[d] += ah * dt * dA * (h_prev1 + h_prev2);
-
-                if (i > 0) adj_h[((size_t)(i-1) * d2 + (size_t)j) * D + d] += ah * dA;
-                if (j > 0) adj_h[((size_t)i * d2 + (size_t)(j-1)) * D + d] += ah * dA;
-
-                s->g_B_mat[d] += ah * dt * u[p * D + d];
-                adj_u[p * D + d] += ah * dt * block->B_mat.data[d];
-            }
-        }
-    }
-    free(h_all); free(delta_pos);
-
-    z = (float *)malloc(D * sizeof(float));
-    if (!z) {
-        free(u); free(adj_h); free(adj_u);
-        return;
-    }
-
-    /* adj_u -> scan_dz (adj_u * dsilu) pour g_W_in et d_input */
-    float *scan_dz = (float *)calloc(P * D, sizeof(float));
-    if (!scan_dz) {
-        free(z); free(u); free(adj_h); free(adj_u);
-        return;
-    }
-
-    for (size_t p = 0; p < P; p++) {
-        const float *x_p = &input[p * dim];
-        mb_matrix_vec_mult(z, &block->W_in, x_p);
-
-        for (size_t d = 0; d < D; d++) {
-            float sig    = scalar_sigmoid(z[d]);
-            float dsilu  = sig * (1.0f + z[d] * (1.0f - sig));
-            float contrib = adj_u[p * D + d] * dsilu;
-            scan_dz[p * D + d] = contrib;
-            for (size_t kk = 0; kk < dim; kk++)
-                s->g_W_in[d * dim + kk] += contrib * x_p[kk];
-        }
-    }
-
-    /* d_input = scan_dz @ W_in  :  [P x D] @ [D x dim] = [P x dim] */
-    if (d_input) {
-        gemm_avx2(scan_dz, block->W_in.data, d_input,
-                  (long)P, (long)D, (long)dim);
-    }
-
-    free(z);
-    free(scan_dz);
-    free(u); free(adj_h); free(adj_u);
-}

@@ -47,7 +47,7 @@ Différence avec l'état de l'art :
 
 ### 2. Architecture Volontés/Puissance
 
-```plan
+```
 k-mamba/              ← Volontés (intentions, orchestration)
 ├── Embedding lookup
 ├── Stack MambaBlocks
@@ -58,25 +58,25 @@ optimatrix/           ← Puissance (calcul brut, kernels)
 ├── GEMM/GEMV AVX2
 ├── Scan 1D/2D ASM
 ├── ConvND separable
-└── MUONCLIP
+└── MUON + AdamW
 ```
 
 Séparation philosophique : la logique modèle (triviale, 5-10 lignes) reste en C lisible ; le calcul lourd (millions d'itérations) est en assembleur AVX2 optimisé.
 
-### 3. MUONCLIP natif CPU
+### 3. MUON natif CPU
 
 Implémentation C/ASM de l'optimiseur MUON (arXiv:2502.16982, Moonshot AI) :
 
-- Newton-Schulz orthogonalisation (5 itérations)
-- Momentum Nesterov + gradient clipping
-- Weight decay découplé
+- Newton-Schulz orthogonalisation (5 itérations cubiques)
+- Momentum Nesterov + gradient clipping global (L2)
+- AdamW avec weight decay découplé pour embedding et LM head
 - **Pas de dépendance PyTorch** — production pure C
 
 ### 4. Backend duel CPU/CUDA
 
-- **CPU pur** : libc + libm, zéro dépendance — déployable sur CPU edge (embarqué, IoT)
+- **CPU pur** : libc + libm, zéro dépendance — déployable sur CPU edge
 - **Backend CUDA** (optionnel) : gradient_clip, AdamW, MUON sur GPU — testé sur MX450 (sm_75)
-- **CUDA scan** (optionnel) : Blelloch parallel prefix scan pour accélérer les scans SSM sur GPU
+- **CUDA scan** (optionnel) : Blelloch parallel prefix scan pour les scans SSM sur GPU
 - Pas de Python, pas de PyTorch
 
 ### 5. Théorie des Volontés
@@ -84,51 +84,58 @@ Implémentation C/ASM de l'optimiseur MUON (arXiv:2502.16982, Moonshot AI) :
 Cadre conceptuel original : les systèmes doivent opérer par **intentions** (Volontés) qui convergent vers un équilibre, pas par instructions séquentielles.
 
 - Chaque MambaBlock = une Volonté qui transforme la séquence
-- MUONCLIP = arbitre des tensions entre gradients
+- MUON = arbitre des tensions entre gradients
 - Un bug = un **conflit de Volontés non résolu**
 
 ---
 
 ## Structure
 
-```plain
+```
 k-mamba/                              ← Bibliothèque principale (modèle Mamba)
 ├── include/
-│   └── kmamba.h                   # API publique du modèle
+│   ├── kmamba.h                   # API publique du modèle
+│   └── scan.h                     # Types et API des scans sélectifs
 ├── src/
-│   ├── kmamba.c                   # Orchestration du modèle
-│   ├── mamba_block.c              # Bloc SSM complet avec MUON
-│   └── convnd.c                  # Convolution ND (logique modèle)
+│   ├── kmamba.c                   # Orchestration : forward, backward, checkpoint
+│   ├── mamba_block.c              # Bloc SSM complet (MUON + AdamW)
+│   └── convnd.c                   # Convolution ND séparable (logique modèle)
 ├── cpu/                           # Kernels scan k-mamba (CPU)
-│   ├── scan1d.asm                 # Scan sélectif 1D forward
+│   ├── scan1d.asm                 # Scan sélectif 1D forward (AVX2)
 │   ├── scan2d.asm                 # Scan sélectif 2D wavefront
-│   ├── scan1d_backward*.c/.asm    # Backward 1D (C générique + ASM M=1)
-│   └── mamba_scan.c              # Dispatch CPU scan
+│   ├── scan1d_backward.c          # Backward générique [L, D, M]
+│   ├── scan1d_backward_m1_shared_bc.asm   # Backward M=1 optimisé ASM
+│   └── mamba_scan.c               # Dispatch CPU scan
 ├── cuda/                          # Kernels scan k-mamba (CUDA)
 │   ├── scan1d.cu                  # Blelloch scan 1D CUDA
 │   ├── scan1d_backward.cu         # Backward scan 1D CUDA
-│   └── mamba_scan.cu             # Dispatch CUDA scan
-├── optimatrix/                    # Submodule git — moteur de calcul matriciel
-│   ├── include/optimatrix.h       # API (extern "C" pour CUDA)
+│   └── mamba_scan.cu              # Dispatch CUDA scan
+├── optimatrix/                    # Moteur de calcul matriciel
+│   ├── include/optimatrix.h       # API (extern "C" compatible CUDA)
 │   ├── cpu/
-│   │   ├── gemm*.asm, gemv*.asm   # GEMM/GEMV scalaire + AVX2
+│   │   ├── gemm_avx2.asm          # GEMM AVX2 (C += A@B — accumule)
+│   │   ├── gemv_avx2.asm          # GEMV AVX2
 │   │   ├── activations.asm        # SiLU, Sigmoid, Softplus (AVX2)
 │   │   ├── conv1d_avx2.asm        # Conv1D depthwise AVX2
 │   │   ├── hadamard.asm           # Produit Hadamard AVX2
-│   │   └── optimizer_utils.c      # Gradient clipping, AdamW, MUON CPU
+│   │   └── optimizer_utils.c      # gradient_clip, AdamW, MUON + Newton-Schulz (CPU)
 │   └── cuda/
-│       └── optimizer_utils.cu     # Gradient clipping, AdamW, MUON CUDA ✅ testé
-├── bench/                         # Benchmarks pour le paper
-│   └── bench_paper.c             # G1-G7 : GEMM, wavefront, Blelloch, roofline
-├── paper/                         # Publication arXiv
-│   ├── kmamba.tex                 # Paper LaTeX (arXiv style, deux colonnes)
-│   └── kmamba.bib                 # Bibliographie BibTeX
-├── cmake/
-│   └── k-mambaConfig.cmake.in
+│       └── optimizer_utils.cu     # gradient_clip, AdamW, MUON (CUDA)
+├── tests/
+│   ├── test_optimizers.c          # 15 tests : clip L2, Newton-Schulz, MUON, AdamW
+│   └── unit/
+│       ├── test_optimatrix_kernels.c    # Kernels GEMM/conv/activation
+│       ├── test_scan1d_backward_asm.c   # Backward ASM vs C de référence
+│       └── test_conv1d_final.c          # Conv1D depthwise
+├── bench/
+│   └── bench_paper.c              # Benchmarks G1-G7
+├── paper/
+│   ├── kmamba.tex                 # Paper LaTeX
+│   └── kmamba.bib                 # Bibliographie
 ├── CMakeLists.txt
-├── THEORY.md                     # Fondement mathématique Mamba-ND
-├── ESTIMATIONS.md                # Complexité et benchmarks
-└── ARCHITECTURE.md               # Philosophie Volontés/Puissance
+├── THEORY.md                      # Fondement mathématique Mamba-ND
+├── ESTIMATIONS.md                 # Complexité et benchmarks
+└── ARCHITECTURE.md                # Philosophie Volontés/Puissance
 ```
 
 ---
@@ -141,6 +148,7 @@ k-mamba/                              ← Bibliothèque principale (modèle Mamb
 - `nasm >= 2.15`
 - `cmake >= 3.18`
 - CPU avec AVX2 (Intel Haswell+ / AMD Ryzen+)
+- CUDA Toolkit >= 11.0 + GPU sm_75+ (optionnel)
 
 ### Compilation
 
@@ -152,20 +160,23 @@ cd k-mamba
 cmake -B build -DKMAMBA_BUILD_TESTS=ON
 cmake --build build -j
 
-# CPU + CUDA
-cmake -B build-cuda -DKMAMBA_BUILD_CUDA=ON -DKMAMBA_BUILD_TESTS=ON
-sed -i 's/OPTIMATRIX_BUILD_CUDA:BOOL=OFF/OPTIMATRIX_BUILD_CUDA:BOOL=ON/' build-cuda/CMakeCache.txt
-cmake build-cuda && cmake --build build-cuda -j
+# CPU + CUDA (sm_75, MX450)
+cmake -B build-cuda -DKMAMBA_BUILD_CUDA=ON -DKMAMBA_BUILD_TESTS=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-cuda -j
 ```
 
 ### Tests
 
 ```bash
-ctest --test-dir build          # CPU : 3 suites (optimatrix kernels, optimizers, mamba_block)
-ctest --test-dir build-cuda     # CPU + CUDA : 4 suites dont CudaOptimizersTest (4/4 ✅)
+# CPU : optimatrix kernels + 15 tests optimiseurs + backward ASM
+ctest --test-dir build
+
+# Résultats attendus : 15/15 PASS
+./build/tests/test_optimizers
 ```
 
-Résultats validés (17 mars 2026, MX450 sm_75) : voir **[TEST_RESULTS.md](TEST_RESULTS.md)**.
+Résultats validés (18 mars 2026, x86-64 AVX2) : voir **[TEST_RESULTS.md](TEST_RESULTS.md)**.
 
 ### Usage dans un projet CMake
 

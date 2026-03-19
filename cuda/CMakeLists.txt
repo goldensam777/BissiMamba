@@ -9,10 +9,7 @@ set(CUDA_SRCS
     scan1d.cu
     scan1d_backward.cu
     mamba_scan.cu
-    # mamba_block.cu          (à implémenter)
-    # mamba_block_backward.cu (à implémenter)
-    # muon.cu                 (à implémenter)
-    # muon_mamba.cu           (à implémenter)
+    mamba_block.cu
 )
 
 add_library(k-mamba-cuda STATIC ${CUDA_SRCS})
@@ -26,11 +23,11 @@ target_include_directories(k-mamba-cuda
 target_compile_options(k-mamba-cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_70>
+    $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_75>
 )
 
 # Link CUDA libraries
 target_link_libraries(k-mamba-cuda
     PUBLIC  optimatrix-cuda
-    PRIVATE cuda cudart
+    PRIVATE cuda cudart cublas
 )

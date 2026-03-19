@@ -64,6 +64,10 @@ target_compile_options(k-mamba PRIVATE
     -O3 -mavx2 -Wall -Wextra -Wpedantic
 )
 
+if(KMAMBA_BUILD_CUDA)
+    target_compile_definitions(k-mamba PRIVATE KMAMBA_BUILD_CUDA=1)
+endif()
+
 # Installation
 include(GNUInstallDirs)
 
