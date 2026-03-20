@@ -1162,8 +1162,9 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                 dC_seq[t * state_size * R_rank + r * state_size + d] =
                     adj_y_R[t * R_rank + r] * h_t_d;
 
-            /* Gradient for Bu_t (through gamma_t * Bu_t term) */
-            float d_bu_t = ah_actual * gamma_t;
+            /* Gradient for Bu_t: gamma term (h_t) + beta contribution from h_{t+1}
+             * adj_prev_Bu[d] holds ah_{t+1} * beta_{t+1} from the previous iteration */
+            float d_bu_t = ah_actual * gamma_t + adj_prev_Bu[d];
 
             /* MIMO dB_t[n,r] = d_bu_t * u_t[r],   scan_du[t,r] += d_bu_t * B_t[n,r]
              * B_seq[t * N*R + r*N + d] = B_t[d,r] */
