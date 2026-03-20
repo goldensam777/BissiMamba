@@ -178,8 +178,8 @@ extern "C" void gpu_block_forward(
     const float *d_W_in,        /* [state, dim]  */
     const float *d_W_out,       /* [dim,  state] */
     const float *d_A_log,       /* [state]       */
-    const float *d_B_mat,       /* [state]       */
-    const float *d_C_mat,       /* [state]       */
+    const float *d_W_B,         /* [state, dim]  data-dependent B projection */
+    const float *d_W_C,         /* [state, dim]  data-dependent C projection */
     const float *d_delta_proj,  /* [dim]         */
     /* Entrée / sortie */
     const float *d_x,           /* [L, dim]  input  */
@@ -207,10 +207,12 @@ extern "C" void gpu_block_forward(
     blk = (L + 255) / 256;
     softplus_clamp_fwd_kernel<<<blk, 256>>>(d_dt_raw, d_dt, L);
 
-    /* 4. Broadcast B, C [state] -> [L, state] ; dt [L] -> [L, state] */
+    /* 4. Data-dependent B, C: B_exp [L,state] = x [L,dim] @ W_B^T [state,dim]
+     *                          C_exp [L,state] = x [L,dim] @ W_C^T [state,dim]
+     *    dt [L] -> [L, state] broadcast */
+    gemm_bt(cublas, L, state, dim, a1, d_x, d_W_B, b0, d_B_exp);
+    gemm_bt(cublas, L, state, dim, a1, d_x, d_W_C, b0, d_C_exp);
     blk = (L * state + 255) / 256;
-    broadcast_d_to_ld<<<blk, 256>>>(d_B_mat, d_B_exp, L, state);
-    broadcast_d_to_ld<<<blk, 256>>>(d_C_mat, d_C_exp, L, state);
     broadcast_l_to_ld<<<blk, 256>>>(d_dt,    d_dt_exp, L, state);
 
     /* 5. scan1d Blelloch (M=1, D=state) */
@@ -244,7 +246,7 @@ extern "C" void gpu_block_backward(
     /* Paramètres (lecture seule) */
     const float *d_W_in, const float *d_W_out,
     const float *d_A_log,
-    const float *d_B_mat, const float *d_C_mat,
+    const float *d_W_B, const float *d_W_C,
     const float *d_delta_proj,
     /* Activations sauvées au forward */
     const float *d_x,
@@ -257,7 +259,7 @@ extern "C" void gpu_block_backward(
     /* Gradients des paramètres (accumulés, +=) */
     float *d_dW_in, float *d_dW_out,
     float *d_dA_log,
-    float *d_dB_mat, float *d_dC_mat,
+    float *d_dW_B, float *d_dW_C,
     float *d_ddelta_proj,
     /* Gradient de sortie */
     float *d_dx,                /* [L, dim] downstream gradient */
@@ -304,12 +306,11 @@ extern "C" void gpu_block_backward(
     blk = (state + 255) / 256;
     add_inplace_kernel<<<blk, 256>>>(d_dA_log, d_dA_tmp, state);
 
-    /* dB_mat [state] += sum_t dB_scan [t, :] */
-    blk = (state + 255) / 256;
-    reduce_sum_L<<<blk, 256>>>(d_dB_scan, d_dB_mat, L, state);
+    /* g_W_B [state,dim] += dB_scan^T [state,L] @ x [L,dim]  (A^T @ B form) */
+    gemm_at(cublas, state, dim, L, a1, d_dB_scan, d_x, a1, d_dW_B);
 
-    /* dC_mat [state] += sum_t dC_scan [t, :] */
-    reduce_sum_L<<<blk, 256>>>(d_dC_scan, d_dC_mat, L, state);
+    /* g_W_C [state,dim] += dC_scan^T [state,L] @ x [L,dim] */
+    gemm_at(cublas, state, dim, L, a1, d_dC_scan, d_x, a1, d_dW_C);
 
     /* ddt [L] = sum_d ddt_scan [t, d] */
     blk = (L + 255) / 256;

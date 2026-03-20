@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(k-mamba VERSION 0.1.0 LANGUAGES C ASM_NASM)
 
+find_package(OpenMP)
+
 # Options
 option(KMAMBA_BUILD_TESTS "Build tests" OFF)
 option(KMAMBA_BUILD_EXAMPLES "Build examples" OFF)
@@ -63,6 +65,11 @@ endif()
 target_compile_options(k-mamba PRIVATE
     -O3 -mavx2 -Wall -Wextra -Wpedantic
 )
+
+if(OpenMP_C_FOUND)
+    target_link_libraries(k-mamba PUBLIC OpenMP::OpenMP_C)
+    target_compile_definitions(k-mamba PRIVATE _OPENMP)
+endif()
 
 if(KMAMBA_BUILD_CUDA)
     target_compile_definitions(k-mamba PRIVATE KMAMBA_BUILD_CUDA=1)

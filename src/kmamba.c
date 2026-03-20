@@ -4,6 +4,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ========= utils ========= */
 
@@ -204,8 +207,8 @@ int kmamba_save(const KMamba *m, const char *path) {
         if (write_floats(f, b->W_in.data,      b->W_in.rows * b->W_in.cols)           ||
             write_floats(f, b->W_out.data,     b->W_out.rows * b->W_out.cols)          ||
             write_floats(f, b->A_log.data,     b->A_log.rows * b->A_log.cols)          ||
-            write_floats(f, b->B_mat.data,     b->B_mat.rows * b->B_mat.cols)          ||
-            write_floats(f, b->C_mat.data,     b->C_mat.rows * b->C_mat.cols)          ||
+            write_floats(f, b->W_B.data,       b->W_B.rows * b->W_B.cols)              ||
+            write_floats(f, b->W_C.data,       b->W_C.rows * b->W_C.cols)              ||
             write_floats(f, b->delta_proj.data, b->delta_proj.rows * b->delta_proj.cols)) {
             fclose(f); return -1;
         }
@@ -256,8 +259,8 @@ KMamba* kmamba_load(const char *path, int for_training,
         if (read_floats(f, b->W_in.data,      b->W_in.rows * b->W_in.cols)           ||
             read_floats(f, b->W_out.data,     b->W_out.rows * b->W_out.cols)          ||
             read_floats(f, b->A_log.data,     b->A_log.rows * b->A_log.cols)          ||
-            read_floats(f, b->B_mat.data,     b->B_mat.rows * b->B_mat.cols)          ||
-            read_floats(f, b->C_mat.data,     b->C_mat.rows * b->C_mat.cols)          ||
+            read_floats(f, b->W_B.data,       b->W_B.rows * b->W_B.cols)              ||
+            read_floats(f, b->W_C.data,       b->W_C.rows * b->W_C.cols)              ||
             read_floats(f, b->delta_proj.data, b->delta_proj.rows * b->delta_proj.cols)) {
             kmamba_free(m); fclose(f); return NULL;
         }
@@ -391,66 +394,79 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
     float *head_T  = (float *)xcalloc(V * D, sizeof(float));
     transpose(m->head, head_T, D, V);
 
-    float *acts     = (float *)xcalloc((m->cfg.n_layers + 1) * L * D, sizeof(float));
-    float *logits   = (float *)xcalloc(L * V, sizeof(float));
-    float *probs    = (float *)xcalloc(V, sizeof(float));
-    float *dlogits  = (float *)xcalloc(L * V, sizeof(float));
-    float *d_hidden = (float *)xcalloc(L * D, sizeof(float));
-    float *d_buf    = (float *)xcalloc(L * D, sizeof(float));
-    float *hidden_T = (float *)xcalloc(D * L, sizeof(float));
-    float *g_head_b = (float *)xcalloc(D * V, sizeof(float));
-
     for (size_t i = 0; i < m->cfg.n_layers; i++) mamba_zero_grads(m->layers[i]);
 
     float total_loss = 0.0f;
 
-    for (size_t b = 0; b < batch_size; b++) {
-        const uint8_t *seq     = &batch_tokens[b * Lp1];
-        const uint8_t *tok_in  = seq;
-        const uint8_t *tok_tgt = seq + 1;
+    #pragma omp parallel reduction(+:total_loss)
+    {
+        /* Buffers privés par thread */
+        float *acts     = (float *)xcalloc((m->cfg.n_layers + 1) * L * D, sizeof(float));
+        float *logits   = (float *)xcalloc(L * V, sizeof(float));
+        float *probs    = (float *)xcalloc(V, sizeof(float));
+        float *dlogits  = (float *)xcalloc(L * V, sizeof(float));
+        float *d_hidden = (float *)xcalloc(L * D, sizeof(float));
+        float *d_buf    = (float *)xcalloc(L * D, sizeof(float));
+        float *hidden_T = (float *)xcalloc(D * L, sizeof(float));
+        float *g_head_b = (float *)xcalloc(D * V, sizeof(float));
 
-        embed_lookup(m, &acts[0], tok_in);
+        #pragma omp for schedule(dynamic)
+        for (size_t b = 0; b < batch_size; b++) {
+            const uint8_t *seq     = &batch_tokens[b * Lp1];
+            const uint8_t *tok_in  = seq;
+            const uint8_t *tok_tgt = seq + 1;
 
-        for (size_t i = 0; i < m->cfg.n_layers; i++)
-            mamba_block_forward(m->layers[i], &acts[(i + 1) * L * D], &acts[i * L * D], 1);
+            /* Forward — lecture seule sur les poids, safe en parallèle */
+            embed_lookup(m, &acts[0], tok_in);
+            for (size_t i = 0; i < m->cfg.n_layers; i++)
+                mamba_block_forward(m->layers[i], &acts[(i + 1) * L * D], &acts[i * L * D], 1);
 
-        const float *hidden = &acts[m->cfg.n_layers * L * D];
-        memset(logits, 0, L * V * sizeof(float));
-        gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
+            const float *hidden = &acts[m->cfg.n_layers * L * D];
+            memset(logits, 0, L * V * sizeof(float));
+            gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
 
-        float sample_loss = 0.0f;
-        for (size_t t = 0; t < L; t++) {
-            softmax(probs, &logits[t * V], V);
-            float p = probs[(size_t)tok_tgt[t]];
-            if (p < 1e-20f) p = 1e-20f;
-            sample_loss += -logf(p);
+            float sample_loss = 0.0f;
+            for (size_t t = 0; t < L; t++) {
+                softmax(probs, &logits[t * V], V);
+                float p = probs[(size_t)tok_tgt[t]];
+                if (p < 1e-20f) p = 1e-20f;
+                sample_loss += -logf(p);
+                float *dl = &dlogits[t * V];
+                for (size_t i = 0; i < V; i++) dl[i] = probs[i] * invBL;
+                dl[(size_t)tok_tgt[t]] -= invBL;
+            }
+            total_loss += sample_loss * invL;
 
-            float *dl = &dlogits[t * V];
-            for (size_t i = 0; i < V; i++) dl[i] = probs[i] * invBL;
-            dl[(size_t)tok_tgt[t]] -= invBL;
+            /* Backward dlogits → d_hidden */
+            memset(d_hidden, 0, L * D * sizeof(float));
+            gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
+
+            transpose(hidden, hidden_T, L, D);
+            memset(g_head_b, 0, D * V * sizeof(float));
+            gemm_avx2(hidden_T, dlogits, g_head_b, (long)D, (long)L, (long)V);
+
+            float *dcur  = d_hidden;
+            float *dnext = d_buf;
+
+            /* Backward à travers les couches — section critique (grads partagés) */
+            #pragma omp critical
+            {
+                for (size_t i = 0; i < D * V; i++) g_head[i] += g_head_b[i];
+                for (size_t li = m->cfg.n_layers; li-- > 0;) {
+                    memset(dnext, 0, L * D * sizeof(float));
+                    mamba_backward(m->layers[li], dcur, &acts[li * L * D], dnext, b);
+                    float *tmp = dcur; dcur = dnext; dnext = tmp;
+                }
+                for (size_t t = 0; t < L; t++) {
+                    float *g = &g_embed[(size_t)tok_in[t] * D];
+                    const float *d = &dcur[t * D];
+                    for (size_t j = 0; j < D; j++) g[j] += d[j];
+                }
+            }
         }
-        total_loss += sample_loss * invL;
 
-        memset(d_hidden, 0, L * D * sizeof(float));
-        gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
-
-        transpose(hidden, hidden_T, L, D);
-        gemm_avx2(hidden_T, dlogits, g_head_b, (long)D, (long)L, (long)V);
-        for (size_t i = 0; i < D * V; i++) g_head[i] += g_head_b[i];
-
-        float *dcur  = d_hidden;
-        float *dnext = d_buf;
-        for (size_t li = m->cfg.n_layers; li-- > 0;) {
-            memset(dnext, 0, L * D * sizeof(float));
-            mamba_backward(m->layers[li], dcur, &acts[li * L * D], dnext, b);
-            float *tmp = dcur; dcur = dnext; dnext = tmp;
-        }
-
-        for (size_t t = 0; t < L; t++) {
-            float *g = &g_embed[(size_t)tok_in[t] * D];
-            const float *d = &dcur[t * D];
-            for (size_t j = 0; j < D; j++) g[j] += d[j];
-        }
+        free(acts); free(logits); free(probs); free(dlogits);
+        free(d_hidden); free(d_buf); free(hidden_T); free(g_head_b);
     }
 
     for (size_t i = 0; i < m->cfg.n_layers; i++)
@@ -460,9 +476,7 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
     ADAM_EH_UPDATE(m, m->embedding, g_embed, m->m_embedding, m->v_embedding, V * D);
     ADAM_EH_UPDATE(m, m->head,      g_head,  m->m_head,      m->v_head,      D * V);
 
-    free(acts); free(logits); free(probs); free(dlogits);
-    free(d_hidden); free(d_buf); free(hidden_T);
-    free(g_head); free(g_head_b); free(g_embed); free(head_T);
+    free(g_head); free(g_embed); free(head_T);
 
     return total_loss * invB;
 }

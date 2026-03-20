@@ -43,8 +43,8 @@ typedef struct {
     MBMatrix W_in;        /* [state_size x dim] */
     MBMatrix W_out;       /* [dim x state_size] */
     MBMatrix A_log;       /* [state_size] diagonal */
-    MBMatrix B_mat;       /* [state_size] shared */
-    MBMatrix C_mat;       /* [state_size] shared */
+    MBMatrix W_B;         /* [state_size x dim] — data-dependent B projection */
+    MBMatrix W_C;         /* [state_size x dim] — data-dependent C projection */
     MBMatrix delta_proj;   /* [1 x dim] */
     
     /* ConvND parameters */
@@ -84,10 +84,10 @@ typedef struct {
     float *g_W_in;
     float *g_W_out;
     float *g_A_log;
-    float *g_B_mat;
-    float *g_C_mat;
+    float *g_W_B;
+    float *g_W_C;
     float *g_delta_proj;
-    
+
     /* Moments (used by ADAM-based optimizers) */
     float *m_W_in;
     float *v_W_in;
@@ -95,10 +95,10 @@ typedef struct {
     float *v_W_out;
     float *m_A_log;
     float *v_A_log;
-    float *m_B_mat;
-    float *v_B_mat;
-    float *m_C_mat;
-    float *v_C_mat;
+    float *m_W_B;
+    float *v_W_B;
+    float *m_W_C;
+    float *v_W_C;
     float *m_delta_proj;
     float *v_delta_proj;
 } MBOptimState;
