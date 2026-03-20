@@ -1125,17 +1125,16 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
     /* adj_prev_Bu: adjoint of prev_Bu that we need to carry backward */
     float *adj_prev_Bu = (float *)calloc(state_size, sizeof(float));
     float *scan_dlambda = (float *)calloc(seq_len, sizeof(float)); /* d_loss/d_lambda_t */
-    if (!adj_prev_Bu || !scan_dlambda) {
-        free(adj_prev_Bu); free(scan_dlambda);
+    /* d_h_rot: scratch buffer reused across timesteps (avoids malloc in tight loop) */
+    float *d_h_rot = (float *)malloc(state_size * sizeof(float));
+    if (!adj_prev_Bu || !scan_dlambda || !d_h_rot) {
+        free(adj_prev_Bu); free(scan_dlambda); free(d_h_rot);
         goto cleanup_bwd;
     }
 
     for (long t = (long)seq_len - 1; t >= 0; t--) {
         float dt_t    = ws->delta[t];
         float lam_t   = store->lambda ? store->lambda[t] : 0.5f;
-        /* d_h_rot[d] holds intermediate: ah * alpha_t */
-        float *d_h_rot = (float *)malloc(state_size * sizeof(float));
-        if (!d_h_rot) continue;
 
         /* acc for d_lambda_t (scalar per timestep, across dims) */
         float d_lambda_t = 0.0f;
@@ -1219,29 +1218,27 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
             }
             if (state_size & 1) adj_h[state_size-1] = d_h_rot[state_size-1];
         }
-        free(d_h_rot);
     }
+    free(d_h_rot);
 
     /* Gradient for lambda_proj: g_lambda_proj += sum_t d_lambda_t * sigmoid'(raw_t) * x_t^T */
     {
         MBOptimState *s_opt = _find_opt(block);
         if (s_opt && s_opt->g_lambda_proj && block->lambda_proj.data) {
-            float *lam_raw = (float *)malloc(sizeof(float));
-            if (lam_raw) {
-                for (size_t t = 0; t < seq_len; t++) {
-                    const float *x_t = &input_flat[t * dim];
-                    mb_matrix_vec_mult(lam_raw, &block->lambda_proj, x_t);
-                    float sig = 1.0f / (1.0f + expf(-lam_raw[0]));
-                    float dsig = sig * (1.0f - sig);
-                    float d_raw = scan_dlambda[t] * dsig;
+            float lam_raw_val;
+            float *lam_raw = &lam_raw_val;
+            for (size_t t = 0; t < seq_len; t++) {
+                const float *x_t = &input_flat[t * dim];
+                mb_matrix_vec_mult(lam_raw, &block->lambda_proj, x_t);
+                float sig = 1.0f / (1.0f + expf(-lam_raw[0]));
+                float dsig = sig * (1.0f - sig);
+                float d_raw = scan_dlambda[t] * dsig;
+                for (size_t k = 0; k < dim; k++)
+                    s_opt->g_lambda_proj[k] += d_raw * x_t[k];
+                /* d_input[t] += d_raw * lambda_proj  (gradient through lambda path) */
+                if (d_input_out)
                     for (size_t k = 0; k < dim; k++)
-                        s_opt->g_lambda_proj[k] += d_raw * x_t[k];
-                    /* d_input[t] += d_raw * lambda_proj  (gradient through lambda path) */
-                    if (d_input_out)
-                        for (size_t k = 0; k < dim; k++)
-                            d_input_out[t * dim + k] += d_raw * block->lambda_proj.data[k];
-                }
-                free(lam_raw);
+                        d_input_out[t * dim + k] += d_raw * block->lambda_proj.data[k];
             }
         }
     }
@@ -1261,11 +1258,11 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
     {
         const float eps = 1e-6f;
         size_t NR = state_size * R_rank;
-        for (size_t t = 0; t < seq_len; t++) {
+        /* Allocate z_B/z_C once outside the loop — reused each timestep */
+        float *z_B = (float *)malloc(NR * sizeof(float));
+        float *z_C = (float *)malloc(NR * sizeof(float));
+        if (z_B && z_C) for (size_t t = 0; t < seq_len; t++) {
             /* Recompute z_B = W_B · x_t  [N*R] and  z_C = W_C · x_t [N*R] */
-            float *z_B = (float *)malloc(NR * sizeof(float));
-            float *z_C = (float *)malloc(NR * sizeof(float));
-            if (!z_B || !z_C) { free(z_B); free(z_C); continue; }
             mb_matrix_vec_mult(z_B, &block->W_B, &input_flat[t * dim]);
             mb_matrix_vec_mult(z_C, &block->W_C, &input_flat[t * dim]);
 
@@ -1304,8 +1301,8 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                 for (size_t d = 0; d < state_size; d++)
                     dC_r[d] = dC_r[d] * rms_c - zc_r[d] * (rms_c*rms_c*rms_c) * dot_c;
             }
-            free(z_B); free(z_C);
         }
+        free(z_B); free(z_C);
     }
 
     /* g_W_C += sum_t dC_t @ x_t^T  — dC_seq [L x N*R]^T @ input [L x dim] → [N*R x dim] */
