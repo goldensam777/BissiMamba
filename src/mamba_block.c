@@ -1235,6 +1235,10 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                     float d_raw = scan_dlambda[t] * dsig;
                     for (size_t k = 0; k < dim; k++)
                         s_opt->g_lambda_proj[k] += d_raw * x_t[k];
+                    /* d_input[t] += d_raw * lambda_proj  (gradient through lambda path) */
+                    if (d_input_out)
+                        for (size_t k = 0; k < dim; k++)
+                            d_input_out[t * dim + k] += d_raw * block->lambda_proj.data[k];
                 }
                 free(lam_raw);
             }
@@ -1327,6 +1331,19 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
         }
     }
 
+    /* d_input += dB_seq @ W_B + dC_seq @ W_C
+     * x_t feeds W_B and W_C; their pre-BCNorm gradients (stored in dB_seq/dC_seq
+     * after the BCNorm backward above) must be propagated back to d_input.
+     * dB_seq [L x N*R] @ W_B [N*R x dim] → [L x dim]  (+=)
+     * dC_seq [L x N*R] @ W_C [N*R x dim] → [L x dim]  (+=) */
+    if (d_input_out) {
+        size_t NR = state_size * R_rank;
+        gemm_avx2(dB_seq, block->W_B.data, d_input_out,
+                  (long)seq_len, (long)NR, (long)dim);
+        gemm_avx2(dC_seq, block->W_C.data, d_input_out,
+                  (long)seq_len, (long)NR, (long)dim);
+    }
+
     /* Delta and W_in gradients
      * scan_du: [L x R] — grad w.r.t. u_t ∈ R^R
      * W_in: [R x dim], W_in grad: scan_du_silu^T @ input [R x dim]
@@ -1335,7 +1352,7 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
         const float *x_input_t = &input_flat[t * dim];
         float ddt_t = scan_ddelta[t];
 
-        /* delta_proj gradient */
+        /* delta_proj gradient + d_input contribution */
         {
             float raw_t = 0.0f;
             for (size_t k = 0; k < dim; k++)
@@ -1343,6 +1360,10 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
             float draw = ddt_t * scalar_sigmoid(raw_t);
             for (size_t k = 0; k < dim; k++)
                 s->g_delta_proj[k] += draw * x_input_t[k];
+            /* d_input[t] += draw * delta_proj  (gradient through delta path) */
+            if (d_input_out)
+                for (size_t k = 0; k < dim; k++)
+                    d_input_out[t * dim + k] += draw * block->delta_proj.data[k];
         }
 
         /* W_in gradient: z = W_in @ x_t, u_t = SiLU(z), du = scan_du[t] ∈ R^R
