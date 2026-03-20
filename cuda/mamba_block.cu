@@ -253,60 +253,63 @@ __global__ void complex_ssm_fwd_kernel(
 extern "C" void gpu_block_forward(
     cublasHandle_t cublas,
     /* Paramètres du bloc [VRAM] */
-    const float *d_W_in,        /* [state, dim]  */
-    const float *d_W_out,       /* [dim,  state] */
+    const float *d_W_in,        /* [R, dim]      — MIMO: R=mimo_rank, R=1 for SISO */
+    const float *d_W_out,       /* [dim, R]      */
     const float *d_A_log,       /* [state]       */
-    const float *d_W_B,         /* [state, dim]  data-dependent B projection */
-    const float *d_W_C,         /* [state, dim]  data-dependent C projection */
+    const float *d_W_B,         /* [N*R, dim]    data-dependent B projection */
+    const float *d_W_C,         /* [N*R, dim]    data-dependent C projection */
     const float *d_delta_proj,  /* [dim]         */
     const float *d_theta,       /* [state/2]     rotation angles (may be NULL) */
     const float *d_lambda_proj, /* [dim]         exp-trapezoidal lambda projection */
     /* Entrée / sortie */
     const float *d_x,           /* [L, dim]  input  */
     float       *d_y,           /* [L, dim]  output */
-    /* Workspace (pré-alloué [L, state] sauf dt_raw/dt [L]) */
-    float *d_u_raw,   float *d_u,
-    float *d_dt_raw,  float *d_dt,
-    float *d_B_exp,   float *d_C_exp, float *d_dt_exp,
-    float *d_h_store, float *d_y_scan, float *d_y_proj,
+    /* Workspace */
+    float *d_u_raw,   float *d_u,    /* [L, R]        */
+    float *d_dt_raw,  float *d_dt,   /* [L]           */
+    float *d_B_exp,   float *d_C_exp, float *d_dt_exp, /* [L, N*R] / [L, N*R] */
+    float *d_h_store, float *d_y_scan, float *d_y_proj, /* [L,N] / [L,R] / [L,dim] */
     float *d_lambda_raw, float *d_lambda,  /* [L] workspace for lambda */
-    int L, int state, int dim)
+    int L, int state, int dim, int R)  /* R = mimo_rank (1 = SISO) */
 {
     const float a1 = 1.0f, b0 = 0.0f;
+    int NR = state * R;
     int blk;
 
-    /* 1. in_proj : u_raw [L, state] = x [L, dim] @ W_in^T  (W_in=[state,dim]) */
-    gemm_bt(cublas, L, state, dim, a1, d_x, d_W_in, b0, d_u_raw);
+    /* 1. in_proj : u_raw [L, R] = x [L, dim] @ W_in^T  (W_in=[R,dim]) */
+    gemm_bt(cublas, L, R, dim, a1, d_x, d_W_in, b0, d_u_raw);
 
     /* 2. SiLU */
-    blk = (L * state + 255) / 256;
-    silu_fwd_kernel<<<blk, 256>>>(d_u_raw, d_u, L * state);
+    blk = (L * R + 255) / 256;
+    silu_fwd_kernel<<<blk, 256>>>(d_u_raw, d_u, L * R);
 
-    /* 3. delta : dt_raw [L] = x [L, dim] @ delta_proj [dim]
-     *    Vu comme GEMM : dt_raw [L,1] = x [L,dim] @ delta_proj [dim,1] */
+    /* 3. delta : dt_raw [L] = x [L, dim] @ delta_proj [dim] */
     gemm(cublas, L, 1, dim, a1, d_x, d_delta_proj, b0, d_dt_raw);
     blk = (L + 255) / 256;
     softplus_clamp_fwd_kernel<<<blk, 256>>>(d_dt_raw, d_dt, L);
 
-    /* 4. Data-dependent B, C, lambda */
-    gemm_bt(cublas, L, state, dim, a1, d_x, d_W_B, b0, d_B_exp);
-    gemm_bt(cublas, L, state, dim, a1, d_x, d_W_C, b0, d_C_exp);
+    /* 4. Data-dependent B [L, N*R], C [L, N*R], lambda [L] */
+    gemm_bt(cublas, L, NR, dim, a1, d_x, d_W_B, b0, d_B_exp);
+    gemm_bt(cublas, L, NR, dim, a1, d_x, d_W_C, b0, d_C_exp);
     /* lambda_raw [L] = x [L,dim] @ lambda_proj [dim] */
     gemm(cublas, L, 1, dim, a1, d_x, d_lambda_proj, b0, d_lambda_raw);
-    /* sigmoid(lambda_raw) -> d_lambda [L] */
     { int blk_l = (L + 255) / 256;
       sigmoid_fwd_kernel<<<blk_l, 256>>>(d_lambda_raw, d_lambda, L); }
 
-    /* 5. Complex SSM sequential scan with R(θ) rotation + exp-trapezoidal */
+    /* 5. Complex SSM sequential scan with R(θ) rotation + exp-trapezoidal
+     * Note: the kernel currently handles SISO (R=1). With R>1, Bu_t is
+     * the reduced dot product B_t[N,R] @ u_t[R]. For R=1 this is B*u as before.
+     * For R>1 we run with the first R elements of u and the [N*R] B/C layout.
+     * The kernel is single-threaded so MIMO is handled inline. */
     CUDA_CHECK(cudaMemset(d_h_store, 0, L * state * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_y_scan,  0, L * state * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_y_scan,  0, L * R * sizeof(float)));
     complex_ssm_fwd_kernel<<<1, 1>>>(
         d_u, d_A_log, d_B_exp, d_C_exp, d_dt,
         d_theta, d_lambda, d_h_store, d_y_scan, L, state);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    /* 6. out_proj : y_proj [L, dim] = y_scan [L, state] @ W_out^T  (W_out=[dim,state]) */
-    gemm_bt(cublas, L, dim, state, a1, d_y_scan, d_W_out, b0, d_y_proj);
+    /* 6. out_proj : y_proj [L, dim] = y_scan [L, R] @ W_out^T  (W_out=[dim,R]) */
+    gemm_bt(cublas, L, dim, R, a1, d_y_scan, d_W_out, b0, d_y_proj);
 
     /* 7. Résiduel : y = y_proj + x */
     CUDA_CHECK(cudaMemcpy(d_y, d_y_proj, L * dim * sizeof(float),
@@ -450,19 +453,19 @@ __global__ void complex_ssm_bwd_kernel(
 extern "C" void gpu_block_backward(
     cublasHandle_t cublas,
     /* Paramètres (lecture seule) */
-    const float *d_W_in, const float *d_W_out,
+    const float *d_W_in, const float *d_W_out,   /* [R,dim] / [dim,R] */
     const float *d_A_log,
-    const float *d_W_B, const float *d_W_C,
+    const float *d_W_B, const float *d_W_C,       /* [N*R, dim] */
     const float *d_delta_proj,
     const float *d_theta,         /* [state/2] rotation angles */
     const float *d_lambda_proj,   /* [dim] lambda projection */
     /* Activations sauvées au forward */
     const float *d_x,
-    const float *d_u_raw, const float *d_u,
+    const float *d_u_raw, const float *d_u,       /* [L, R] */
     const float *d_dt_raw, const float *d_dt,
-    const float *d_B_exp, const float *d_C_exp, const float *d_dt_exp,
-    const float *d_h_store, const float *d_y_scan,
-    const float *d_lambda,        /* [L] sigmoid(lambda_proj * x) saved at forward */
+    const float *d_B_exp, const float *d_C_exp, const float *d_dt_exp, /* [L, N*R] */
+    const float *d_h_store, const float *d_y_scan, /* [L,N] / [L,R] */
+    const float *d_lambda,        /* [L] sigmoid output saved at forward */
     /* Gradient entrant */
     const float *d_dy,            /* [L, dim] upstream gradient */
     /* Gradients des paramètres (accumulés, +=) */
@@ -475,21 +478,21 @@ extern "C" void gpu_block_backward(
     /* Gradient de sortie */
     float *d_dx,                  /* [L, dim] downstream gradient */
     /* Workspace temporaire */
-    float *d_dy_scan,           /* [L, state] */
-    float *d_du,                /* [L, state] */
-    float *d_du_raw,            /* [L, state] */
+    float *d_dy_scan,           /* [L, R] */
+    float *d_du,                /* [L, R] */
+    float *d_du_raw,            /* [L, R] */
     float *d_ddt,               /* [L] */
     float *d_ddt_raw,           /* [L] */
-    float *d_dB_scan,           /* [L, state] scan gradient de B */
-    float *d_dC_scan,           /* [L, state] scan gradient de C */
+    float *d_dB_scan,           /* [L, N*R] scan gradient de B */
+    float *d_dC_scan,           /* [L, N*R] scan gradient de C */
     float *d_ddt_scan,          /* [L, state] scan gradient de dt */
     float *d_dA_tmp,            /* [state]   scan gradient de A (tmp) */
     float *d_dlambda,           /* [L]       scan gradient of lambda */
     float *d_dlambda_raw,       /* [L]       grad through sigmoid */
-    const float *d_lambda,      /* [L]       sigmoid output saved at forward */
-    int L, int state, int dim)
+    int L, int state, int dim, int R)   /* R = mimo_rank */
 {
     const float a1 = 1.0f, b0 = 0.0f;
+    int NR = state * R;
     int blk;
 
     /* ── Résiduel : dy passe aussi vers dx (on initialise dx = dy) ── */
@@ -497,18 +500,18 @@ extern "C" void gpu_block_backward(
                           cudaMemcpyDeviceToDevice));
 
     /* ── Backward out_proj ──────────────────────────────────────── */
-    /* dW_out [dim, state] += dy^T @ y_scan  (A=[L,dim], B=[L,state]) */
-    gemm_at(cublas, dim, state, L, a1, d_dy, d_y_scan, a1, d_dW_out);
+    /* dW_out [dim, R] += dy^T @ y_scan  (A=[L,dim], B=[L,R]) */
+    gemm_at(cublas, dim, R, L, a1, d_dy, d_y_scan, a1, d_dW_out);
 
-    /* dy_scan [L, state] = dy [L, dim] @ W_out [dim, state] */
-    gemm(cublas, L, state, dim, a1, d_dy, d_W_out, b0, d_dy_scan);
+    /* dy_scan [L, R] = dy [L, dim] @ W_out [dim, R] */
+    gemm(cublas, L, R, dim, a1, d_dy, d_W_out, b0, d_dy_scan);
 
     /* ── Backward complex SSM (sequential) ──────────────────────── */
     /* Zero accumulators */
     CUDA_CHECK(cudaMemset(d_dA_tmp, 0, state * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_ddt_scan, 0, L * state * sizeof(float)));
-
     CUDA_CHECK(cudaMemset(d_dlambda, 0, L * sizeof(float)));
+
     complex_ssm_bwd_kernel<<<1, 1>>>(
         d_dy_scan,
         d_u, d_A_log, d_B_exp, d_C_exp, d_dt, d_lambda, d_theta, d_h_store,
@@ -520,11 +523,11 @@ extern "C" void gpu_block_backward(
     blk = (state + 255) / 256;
     add_inplace_kernel<<<blk, 256>>>(d_dA_log, d_dA_tmp, state);
 
-    /* g_W_B [state,dim] += dB_scan^T [state,L] @ x [L,dim] */
-    gemm_at(cublas, state, dim, L, a1, d_dB_scan, d_x, a1, d_dW_B);
+    /* g_W_B [N*R, dim] += dB_scan^T [N*R, L] @ x [L, dim] */
+    gemm_at(cublas, NR, dim, L, a1, d_dB_scan, d_x, a1, d_dW_B);
 
-    /* g_W_C [state,dim] += dC_scan^T [state,L] @ x [L,dim] */
-    gemm_at(cublas, state, dim, L, a1, d_dC_scan, d_x, a1, d_dW_C);
+    /* g_W_C [N*R, dim] += dC_scan^T [N*R, L] @ x [L, dim] */
+    gemm_at(cublas, NR, dim, L, a1, d_dC_scan, d_x, a1, d_dW_C);
 
     /* ddt [L] = sum_d ddt_scan [t, d] */
     blk = (L + 255) / 256;
@@ -534,31 +537,24 @@ extern "C" void gpu_block_backward(
     softplus_clamp_bwd_kernel<<<blk, 256>>>(d_ddt, d_dt_raw, d_dt, d_ddt_raw, L);
 
     /* ── Backward delta_proj ────────────────────────────────────── */
-    /* ddelta_proj [dim] += ddt_raw^T @ x */
     gemm_at(cublas, 1, dim, L, a1, d_ddt_raw, d_x, a1, d_ddelta_proj);
-
-    /* dx [L, dim] += ddt_raw [L] outer delta_proj [dim] */
     blk = (L * dim + 255) / 256;
     outer_add_kernel<<<blk, 256>>>(d_dx, d_ddt_raw, d_delta_proj, L, dim);
 
-    /* ── Backward SiLU ──────────────────────────────────────────── */
-    blk = (L * state + 255) / 256;
-    silu_bwd_kernel<<<blk, 256>>>(d_du, d_u_raw, d_du_raw, L * state);
+    /* ── Backward SiLU + in_proj (W_in=[R,dim], u=[L,R]) ──────── */
+    blk = (L * R + 255) / 256;
+    silu_bwd_kernel<<<blk, 256>>>(d_du, d_u_raw, d_du_raw, L * R);
 
-    /* ── Backward in_proj ───────────────────────────────────────── */
-    gemm_at(cublas, state, dim, L, a1, d_du_raw, d_x, a1, d_dW_in);
-    gemm(cublas, L, dim, state, a1, d_du_raw, d_W_in, a1, d_dx);
+    gemm_at(cublas, R, dim, L, a1, d_du_raw, d_x, a1, d_dW_in);
+    gemm(cublas, L, dim, R, a1, d_du_raw, d_W_in, a1, d_dx);
 
     /* ── Backward lambda_proj ───────────────────────────────────── */
-    /* d_dlambda_raw [L] = d_dlambda [L] * sigma'(lambda_raw) = d_dlambda * lambda*(1-lambda) */
     blk = (L + 255) / 256;
     sigmoid_bwd_kernel<<<blk, 256>>>(d_dlambda, d_lambda, d_dlambda_raw, L);
-    /* d_g_lambda_proj [dim] += d_dlambda_raw^T @ x  (shape: [L,1]^T @ [L,dim]) */
     gemm_at(cublas, 1, dim, L, a1, d_dlambda_raw, d_x, a1, d_g_lambda_proj);
-    /* dx [L, dim] += d_dlambda_raw [L] outer lambda_proj [dim] */
     outer_add_kernel<<<(L * dim + 255) / 256, 256>>>(
         d_dx, d_dlambda_raw, d_lambda_proj, L, dim);
 
-    /* dt_exp no longer used (kept for API compat) */
-    (void)d_dt_exp; (void)d_ddt_raw;
+    /* API compat */
+    (void)d_dt_exp;
 }

@@ -22,6 +22,13 @@
 #endif
 
 /* ============================================================================
+ * MIMO rank helper
+ * ============================================================================ */
+static inline size_t _mimo_R(const MBConfig *cfg) {
+    return (cfg->mimo_rank > 1) ? cfg->mimo_rank : 1;
+}
+
+/* ============================================================================
  * Scalar activations (internal — vectorized versions in ASM)
  * ============================================================================ */
 
@@ -159,8 +166,10 @@ void mb_vec_scale(float *v, float alpha, size_t n) {
 static void project_controller(const MambaBlock *block, const float *x_t,
                                 float *z_buf, float *u_out) {
     if (!block || !x_t || !z_buf || !u_out) return;
+    /* W_in is [R x dim]; output u_out ∈ R^R (MIMO rank) */
+    size_t R = _mimo_R(&block->config);
     mb_matrix_vec_mult(z_buf, &block->W_in, x_t);
-    silu_f32(z_buf, u_out, (long)block->config.state_size);
+    silu_f32(z_buf, u_out, (long)R);
 }
 
 static float project_delta_value(const MambaBlock *block, const float *x_t,
@@ -278,12 +287,17 @@ MambaBlock* mamba_block_create(const MBConfig *config) {
     memset(block, 0, sizeof(*block));
 
     block->config = *config;
+    /* Ensure mimo_rank is at least 1 */
+    if (block->config.mimo_rank == 0) block->config.mimo_rank = 1;
 
-    if (matrix_init_owned(&block->W_in, config->state_size, config->dim) != 0 ||
-        matrix_init_owned(&block->W_out, config->dim, config->state_size) != 0 ||
-        matrix_init_owned(&block->A_log, config->state_size, 1) != 0 ||
-        matrix_init_owned(&block->W_B, config->state_size, config->dim) != 0 ||
-        matrix_init_owned(&block->W_C, config->state_size, config->dim) != 0 ||
+    size_t R = _mimo_R(&block->config);
+    size_t N = config->state_size;
+
+    if (matrix_init_owned(&block->W_in, R, config->dim) != 0 ||
+        matrix_init_owned(&block->W_out, config->dim, R) != 0 ||
+        matrix_init_owned(&block->A_log, N, 1) != 0 ||
+        matrix_init_owned(&block->W_B, N * R, config->dim) != 0 ||
+        matrix_init_owned(&block->W_C, N * R, config->dim) != 0 ||
         matrix_init_owned(&block->delta_proj, 1, config->dim) != 0 ||
         matrix_init_owned(&block->lambda_proj, 1, config->dim) != 0) {
         mamba_block_free(block);
@@ -306,14 +320,16 @@ MambaBlock* mamba_block_create(const MBConfig *config) {
         return NULL;
     }
 
-    block->hidden = (float *)calloc(config->state_size, sizeof(float));
+    block->hidden = (float *)calloc(N, sizeof(float));
     block->delta  = (float *)calloc(config->seq_len, sizeof(float));
 
-    size_t LD = config->seq_len * config->state_size;
-    block->scan_B     = (float *)malloc(LD * sizeof(float));
-    block->scan_C     = (float *)malloc(LD * sizeof(float));
-    block->scan_delta = (float *)malloc(LD * sizeof(float));
-    block->scan_h     = (float *)calloc(config->state_size, sizeof(float));
+    /* scan_B/scan_C: [L x N*R] for MIMO (R=1 → identical to previous) */
+    size_t LNR = config->seq_len * N * R;
+    size_t LD  = config->seq_len * N;
+    block->scan_B     = (float *)malloc(LNR * sizeof(float));
+    block->scan_C     = (float *)malloc(LNR * sizeof(float));
+    block->scan_delta = (float *)malloc(LD  * sizeof(float));
+    block->scan_h     = (float *)calloc(N, sizeof(float));
 
     if (!block->W_in.data || !block->W_out.data || !block->A_log.data ||
         !block->W_B.data || !block->W_C.data || !block->delta_proj.data ||
@@ -384,40 +400,17 @@ void mamba_block_init(MambaBlock *block) {
         block->A_log.data[i] = -1.0f;
     }
 
-    /* Xavier uniform init for W_in (state_size x dim) */
+    /* Xavier uniform init for all weight matrices (sizes set in create()) */
     {
-        float fan_in  = (float)block->W_in.cols;
-        float fan_out = (float)block->W_in.rows;
-        float scale   = sqrtf(6.0f / (fan_in + fan_out));
-        for (size_t i = 0; i < block->W_in.rows * block->W_in.cols; i++) {
-            block->W_in.data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
-        }
-    }
-    /* Xavier uniform init for W_out (dim x state_size) */
-    {
-        float fan_in  = (float)block->W_out.cols;
-        float fan_out = (float)block->W_out.rows;
-        float scale   = sqrtf(6.0f / (fan_in + fan_out));
-        for (size_t i = 0; i < block->W_out.rows * block->W_out.cols; i++) {
-            block->W_out.data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
-        }
-    }
-    /* Xavier uniform init for W_B (state_size x dim) */
-    {
-        float fan_in  = (float)block->W_B.cols;
-        float fan_out = (float)block->W_B.rows;
-        float scale   = sqrtf(6.0f / (fan_in + fan_out));
-        for (size_t i = 0; i < block->W_B.rows * block->W_B.cols; i++) {
-            block->W_B.data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
-        }
-    }
-    /* Xavier uniform init for W_C (state_size x dim) */
-    {
-        float fan_in  = (float)block->W_C.cols;
-        float fan_out = (float)block->W_C.rows;
-        float scale   = sqrtf(6.0f / (fan_in + fan_out));
-        for (size_t i = 0; i < block->W_C.rows * block->W_C.cols; i++) {
-            block->W_C.data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
+        MBMatrix *mats[] = { &block->W_in, &block->W_out, &block->W_B, &block->W_C };
+        for (int mi = 0; mi < 4; mi++) {
+            MBMatrix *M = mats[mi];
+            float fan_in  = (float)M->cols;
+            float fan_out = (float)M->rows;
+            float scale   = sqrtf(6.0f / (fan_in + fan_out));
+            size_t total  = M->rows * M->cols;
+            for (size_t i = 0; i < total; i++)
+                M->data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
         }
     }
     /* BCNorm biases — initialisés à zéro (comportement neutre au départ) */
@@ -471,22 +464,24 @@ void mb_compute_delta(float *delta_out, const MambaBlock *block,
 void mamba_attach_optimizer(MambaBlock *block, OptimizerType type, const MBOptimConfig *optconf) {
     if (!block) return;
     MBOptimState *s = (MBOptimState *)malloc(sizeof(MBOptimState));
-    size_t dim = block->config.dim;
+    size_t dim   = block->config.dim;
     size_t state = block->config.state_size;
-    size_t size_in = state * dim;
-    size_t size_out = dim * state;
+    size_t R     = _mimo_R(&block->config);
+    /* MIMO-aware sizes */
+    size_t size_in  = R * dim;        /* W_in:  [R x dim] */
+    size_t size_out = dim * R;        /* W_out: [dim x R] */
+    size_t size_bc  = state * R * dim;/* W_B/W_C: [N*R x dim] */
     memset(s, 0, sizeof(MBOptimState));
-    
+
     s->type = type;
 
-    size_t size_bc = state * dim;
     s->g_W_in = (float *)calloc(size_in, sizeof(float));
     s->g_W_out = (float *)calloc(size_out, sizeof(float));
     s->g_A_log = (float *)calloc(state, sizeof(float));
     s->g_W_B = (float *)calloc(size_bc, sizeof(float));
     s->g_W_C = (float *)calloc(size_bc, sizeof(float));
-    s->g_b_B = (float *)calloc(state,   sizeof(float));
-    s->g_b_C = (float *)calloc(state,   sizeof(float));
+    s->g_b_B = (float *)calloc(state * R, sizeof(float));
+    s->g_b_C = (float *)calloc(state * R, sizeof(float));
     s->g_delta_proj  = (float *)calloc(dim, sizeof(float));
     s->g_lambda_proj = (float *)calloc(dim, sizeof(float));
     size_t theta_size = state / 2; if (theta_size == 0) theta_size = 1;
@@ -500,8 +495,8 @@ void mamba_attach_optimizer(MambaBlock *block, OptimizerType type, const MBOptim
         s->m_A_log      = (float *)calloc(state,    sizeof(float));
         s->m_W_B        = (float *)calloc(size_bc,  sizeof(float));
         s->m_W_C        = (float *)calloc(size_bc,  sizeof(float));
-        s->m_b_B        = (float *)calloc(state,    sizeof(float));
-        s->m_b_C        = (float *)calloc(state,    sizeof(float));
+        s->m_b_B        = (float *)calloc(state * R, sizeof(float));
+        s->m_b_C        = (float *)calloc(state * R, sizeof(float));
         s->m_delta_proj  = (float *)calloc(dim,       sizeof(float));
         s->m_lambda_proj = (float *)calloc(dim,       sizeof(float));
         s->m_theta       = (float *)calloc(theta_size, sizeof(float));
@@ -513,8 +508,8 @@ void mamba_attach_optimizer(MambaBlock *block, OptimizerType type, const MBOptim
         s->v_A_log       = (float *)calloc(state,    sizeof(float));
         s->v_W_B         = (float *)calloc(size_bc,  sizeof(float));
         s->v_W_C         = (float *)calloc(size_bc,  sizeof(float));
-        s->v_b_B         = (float *)calloc(state,    sizeof(float));
-        s->v_b_C         = (float *)calloc(state,    sizeof(float));
+        s->v_b_B         = (float *)calloc(state * R, sizeof(float));
+        s->v_b_C         = (float *)calloc(state * R, sizeof(float));
         s->v_delta_proj  = (float *)calloc(dim,      sizeof(float));
         s->v_lambda_proj = (float *)calloc(dim,      sizeof(float));
         s->v_theta       = (float *)calloc(theta_size, sizeof(float));
@@ -565,13 +560,20 @@ void mamba_zero_grads(MambaBlock *block) {
     for (size_t i = 0; i < g_opt_n; i++) {
         if (g_opt_blocks[i] == block) {
             MBOptimState *s = g_opt_states[i];
-            size_t dim = block->config.dim; size_t state = block->config.state_size;
-            size_t size_in = state * dim; size_t size_out = dim * state;
-            memset(s->g_W_in, 0, size_in * sizeof(float)); memset(s->g_W_out, 0, size_out * sizeof(float));
-            memset(s->g_A_log, 0, state * sizeof(float));
-            memset(s->g_W_B, 0, size_in * sizeof(float)); memset(s->g_W_C, 0, size_in * sizeof(float));
-            memset(s->g_b_B, 0, state * sizeof(float));   memset(s->g_b_C, 0, state * sizeof(float));
-            memset(s->g_delta_proj, 0, dim * sizeof(float));
+            size_t dim   = block->config.dim;
+            size_t state = block->config.state_size;
+            size_t R     = _mimo_R(&block->config);
+            size_t size_in  = R * dim;
+            size_t size_out = dim * R;
+            size_t size_bc  = state * R * dim;
+            memset(s->g_W_in,  0, size_in  * sizeof(float));
+            memset(s->g_W_out, 0, size_out * sizeof(float));
+            memset(s->g_A_log, 0, state    * sizeof(float));
+            memset(s->g_W_B,   0, size_bc  * sizeof(float));
+            memset(s->g_W_C,   0, size_bc  * sizeof(float));
+            memset(s->g_b_B,   0, state * R * sizeof(float));
+            memset(s->g_b_C,   0, state * R * sizeof(float));
+            memset(s->g_delta_proj,  0, dim * sizeof(float));
             memset(s->g_lambda_proj, 0, dim * sizeof(float));
             { size_t ts = state / 2; if (ts == 0) ts = 1; memset(s->g_theta, 0, ts * sizeof(float)); }
             return;
@@ -590,7 +592,9 @@ static MBOptimState* _find_opt(MambaBlock *block) {
 
 static void adam_clip_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
     size_t dim = block->config.dim; size_t state = block->config.state_size;
-    size_t size_in = state * dim; size_t size_out = dim * state;
+    size_t R = _mimo_R(&block->config);
+    size_t size_in = R * dim; size_t size_out = dim * R;
+    size_t size_bc = state * R * dim;
 
 #ifdef KMAMBA_BUILD_CUDA
     adamw_update_cuda(block->W_in.data,       s->g_W_in,       s->m_W_in,       s->v_W_in,       size_in,   conf, s->step);
@@ -616,10 +620,10 @@ static void adam_clip_update(MambaBlock *block, MBOptimState *s, const MBOptimCo
     ADAM_CLIP_UPDATE(block->W_in.data, s->g_W_in, s->m_W_in, s->v_W_in, size_in);
     ADAM_CLIP_UPDATE(block->W_out.data, s->g_W_out, s->m_W_out, s->v_W_out, size_out);
     ADAM_CLIP_UPDATE(block->A_log.data, s->g_A_log, s->m_A_log, s->v_A_log, state);
-    ADAM_CLIP_UPDATE(block->W_B.data, s->g_W_B, s->m_W_B, s->v_W_B, size_in);
-    ADAM_CLIP_UPDATE(block->W_C.data, s->g_W_C, s->m_W_C, s->v_W_C, size_in);
-    ADAM_CLIP_UPDATE(block->b_B, s->g_b_B, s->m_b_B, s->v_b_B, state);
-    ADAM_CLIP_UPDATE(block->b_C, s->g_b_C, s->m_b_C, s->v_b_C, state);
+    ADAM_CLIP_UPDATE(block->W_B.data, s->g_W_B, s->m_W_B, s->v_W_B, size_bc);
+    ADAM_CLIP_UPDATE(block->W_C.data, s->g_W_C, s->m_W_C, s->v_W_C, size_bc);
+    ADAM_CLIP_UPDATE(block->b_B, s->g_b_B, s->m_b_B, s->v_b_B, state * R);
+    ADAM_CLIP_UPDATE(block->b_C, s->g_b_C, s->m_b_C, s->v_b_C, state * R);
     ADAM_CLIP_UPDATE(block->delta_proj.data,  s->g_delta_proj,  s->m_delta_proj,  s->v_delta_proj,  dim);
     ADAM_CLIP_UPDATE(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, s->v_lambda_proj, dim);
     { size_t ts = state/2; if (ts==0) ts=1;
@@ -631,8 +635,10 @@ static void adam_clip_update(MambaBlock *block, MBOptimState *s, const MBOptimCo
 
 static void adamw_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
     size_t dim = block->config.dim; size_t state = block->config.state_size;
-    size_t size_in = state * dim; size_t size_out = dim * state;
-    float lr = conf->lr; float mu = conf->mu; float beta2 = conf->beta2; 
+    size_t R = _mimo_R(&block->config);
+    size_t size_in = R * dim; size_t size_out = dim * R;
+    size_t size_bc = state * R * dim;
+    float lr = conf->lr; float mu = conf->mu; float beta2 = conf->beta2;
     float eps = conf->eps; float wd = conf->weight_decay;
 
 #define ADAMW_UPDATE(param, grad, m, v, N) do { \
@@ -647,10 +653,10 @@ static void adamw_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig
     ADAMW_UPDATE(block->W_in.data, s->g_W_in, s->m_W_in, s->v_W_in, size_in);
     ADAMW_UPDATE(block->W_out.data, s->g_W_out, s->m_W_out, s->v_W_out, size_out);
     ADAMW_UPDATE(block->A_log.data, s->g_A_log, s->m_A_log, s->v_A_log, state);
-    ADAMW_UPDATE(block->W_B.data, s->g_W_B, s->m_W_B, s->v_W_B, size_in);
-    ADAMW_UPDATE(block->W_C.data, s->g_W_C, s->m_W_C, s->v_W_C, size_in);
-    ADAMW_UPDATE(block->b_B, s->g_b_B, s->m_b_B, s->v_b_B, state);
-    ADAMW_UPDATE(block->b_C, s->g_b_C, s->m_b_C, s->v_b_C, state);
+    ADAMW_UPDATE(block->W_B.data, s->g_W_B, s->m_W_B, s->v_W_B, size_bc);
+    ADAMW_UPDATE(block->W_C.data, s->g_W_C, s->m_W_C, s->v_W_C, size_bc);
+    ADAMW_UPDATE(block->b_B, s->g_b_B, s->m_b_B, s->v_b_B, state * R);
+    ADAMW_UPDATE(block->b_C, s->g_b_C, s->m_b_C, s->v_b_C, state * R);
     ADAMW_UPDATE(block->delta_proj.data,  s->g_delta_proj,  s->m_delta_proj,  s->v_delta_proj,  dim);
     ADAMW_UPDATE(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, s->v_lambda_proj, dim);
     { size_t ts = state/2; if (ts==0) ts=1;
@@ -661,7 +667,9 @@ static void adamw_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig
 
 static void sgd_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
     size_t dim = block->config.dim; size_t state = block->config.state_size;
-    size_t size_in = state * dim; size_t size_out = dim * state;
+    size_t R = _mimo_R(&block->config);
+    size_t size_in = R * dim; size_t size_out = dim * R;
+    size_t size_bc = state * R * dim;
     float lr = conf->lr; float mu = conf->mu; float wd = conf->weight_decay;
 
 #define SGD_UPDATE(param, grad, m, N) do { \
@@ -673,10 +681,10 @@ static void sgd_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *
     SGD_UPDATE(block->W_in.data, s->g_W_in, s->m_W_in, size_in);
     SGD_UPDATE(block->W_out.data, s->g_W_out, s->m_W_out, size_out);
     SGD_UPDATE(block->A_log.data, s->g_A_log, s->m_A_log, state);
-    SGD_UPDATE(block->W_B.data, s->g_W_B, s->m_W_B, size_in);
-    SGD_UPDATE(block->W_C.data, s->g_W_C, s->m_W_C, size_in);
-    SGD_UPDATE(block->b_B, s->g_b_B, s->m_b_B, state);
-    SGD_UPDATE(block->b_C, s->g_b_C, s->m_b_C, state);
+    SGD_UPDATE(block->W_B.data, s->g_W_B, s->m_W_B, size_bc);
+    SGD_UPDATE(block->W_C.data, s->g_W_C, s->m_W_C, size_bc);
+    SGD_UPDATE(block->b_B, s->g_b_B, s->m_b_B, state * R);
+    SGD_UPDATE(block->b_C, s->g_b_C, s->m_b_C, state * R);
     SGD_UPDATE(block->delta_proj.data,  s->g_delta_proj,  s->m_delta_proj,  dim);
     SGD_UPDATE(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, dim);
     { size_t ts = state/2; if (ts==0) ts=1;
@@ -688,6 +696,7 @@ static void sgd_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *
 /* MUON : matrices (W_in, W_out) — Newton-Schulz + momentum + clipping */
 static void muon_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig *conf) {
     size_t dim = block->config.dim; size_t state = block->config.state_size;
+    size_t R = _mimo_R(&block->config);
 
 #ifdef KMAMBA_BUILD_CUDA
     muon_update_mat_cuda(block->W_in.data,  s->g_W_in,  s->m_W_in,  state, dim,   conf);
@@ -720,13 +729,13 @@ static void muon_update(MambaBlock *block, MBOptimState *s, const MBOptimConfig 
     for (size_t _i = 0; _i < (N); _i++) param[_i] -= lr * m[_i]; \
     } while (0)
 
-    MUON_UPDATE_MAT(block->W_in.data,  s->g_W_in,  s->m_W_in,  state, dim);
-    MUON_UPDATE_MAT(block->W_out.data, s->g_W_out, s->m_W_out, dim,   state);
+    MUON_UPDATE_MAT(block->W_in.data,  s->g_W_in,  s->m_W_in,  R,         dim);
+    MUON_UPDATE_MAT(block->W_out.data, s->g_W_out, s->m_W_out, dim,       R);
     MUON_UPDATE_VEC(block->A_log.data,       s->g_A_log,       s->m_A_log,       state);
-    MUON_UPDATE_MAT(block->W_B.data,   s->g_W_B,   s->m_W_B,   state, dim);
-    MUON_UPDATE_MAT(block->W_C.data,   s->g_W_C,   s->m_W_C,   state, dim);
-    MUON_UPDATE_VEC(block->b_B,        s->g_b_B,   s->m_b_B,   state);
-    MUON_UPDATE_VEC(block->b_C,        s->g_b_C,   s->m_b_C,   state);
+    MUON_UPDATE_MAT(block->W_B.data,   s->g_W_B,   s->m_W_B,   state * R, dim);
+    MUON_UPDATE_MAT(block->W_C.data,   s->g_W_C,   s->m_W_C,   state * R, dim);
+    MUON_UPDATE_VEC(block->b_B,        s->g_b_B,   s->m_b_B,   state * R);
+    MUON_UPDATE_VEC(block->b_C,        s->g_b_C,   s->m_b_C,   state * R);
     MUON_UPDATE_VEC(block->delta_proj.data,  s->g_delta_proj,  s->m_delta_proj,  dim);
     MUON_UPDATE_VEC(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, dim);
     { size_t ts = state/2; if (ts==0) ts=1;
@@ -766,27 +775,31 @@ void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
  * Forward scan with storage for backward
  * ============================================================================ */
 
-/* B_seq: per-timestep B vectors [seq_len x state_size] (= W_B * x_t for each t)
+/* B_seq: per-timestep B vectors [seq_len x N*R] (BCNorm'd output of W_B)
+ * input_u: [seq_len x R] SiLU(W_in @ x_t) — MIMO input vectors
  * input_flat: [seq_len x dim] needed for lambda_proj computation
  * lambda_proj_param: MBMatrix [1 x dim]
+ * R_rank: MIMO rank (1 = SISO compat)
  */
 static void selective_scan_forward_store(ForwardStore *store, float *state,
-                    const float *input_u,     /* [seq_len x state_size] SiLU(W_in x) */
+                    const float *input_u,     /* [seq_len x R] SiLU(W_in x) */
                     const float *delta,
-                    const MBMatrix *A_bar, const float *B_seq,
+                    const MBMatrix *A_bar, const float *B_seq,  /* [seq_len x N*R] */
                     const MBMatrix *C, float D_unused,
                     const float *theta,
                     const float *input_flat,  /* [seq_len x dim] raw embeddings */
                     const MBMatrix *lambda_proj_param,
-                    size_t seq_len, size_t state_size, size_t dim) {
+                    size_t seq_len, size_t state_size, size_t dim, size_t R_rank) {
     if (!store || !state) return;
     (void)C; (void)D_unused;
 
     store->x      = (float *)calloc(seq_len * state_size, sizeof(float));
     store->A_diag = (float *)calloc(seq_len * state_size, sizeof(float));
     store->B_bar  = (float *)calloc(seq_len * state_size, sizeof(float));
-    store->u_seq  = (float *)calloc(seq_len * state_size, sizeof(float));
+    /* u_seq stored as [seq_len x R] */
+    store->u_seq  = (float *)calloc(seq_len * R_rank, sizeof(float));
     store->h_rot  = (float *)calloc(seq_len * state_size, sizeof(float));
+    /* Bu stored as [seq_len x N]: Bu_t[n] = sum_r B_t[n,r]*u_t[r] */
     store->Bu     = (float *)calloc(seq_len * state_size, sizeof(float));
     store->lambda = (float *)calloc(seq_len, sizeof(float));
     store->alpha  = (float *)calloc(seq_len * state_size, sizeof(float));
@@ -799,10 +812,11 @@ static void selective_scan_forward_store(ForwardStore *store, float *state,
     float *lam_buf   = (float *)malloc(sizeof(float));
 
     for (size_t t = 0; t < seq_len; t++) {
-        const float *u_t = &input_u[t * state_size];
+        const float *u_t = &input_u[t * R_rank];  /* u_t ∈ R^R */
         float dt_t = delta[t];
 
-        for (size_t i = 0; i < state_size; i++) store->u_seq[t * state_size + i] = u_t[i];
+        /* Store u_t in [seq_len x R] layout */
+        for (size_t r = 0; r < R_rank; r++) store->u_seq[t * R_rank + r] = u_t[r];
 
         /* Compute lambda_t = sigmoid(lambda_proj · x_t) */
         float lam_t = 0.5f;
@@ -812,17 +826,23 @@ static void selective_scan_forward_store(ForwardStore *store, float *state,
         }
         store->lambda[t] = lam_t;
 
-        /* Compute A_diag and store */
+        /* MIMO Bu_t[n] = sum_r B_t[n,r] * u_t[r]
+         * B_seq layout: [L x N*R] where B_seq[t*N*R + r*N + n] = B_t[n,r] */
+        const float *b_t = &B_seq[t * state_size * R_rank];
         for (size_t i = 0; i < state_size; i++) {
             float a_val = A_bar->data[i * state_size + i];
             if (a_val > -1e-5f) a_val = -1e-5f;
             float a_diag_t = expf(dt_t * a_val);
             store->A_diag[t * state_size + i] = a_diag_t;
             store->alpha[t * state_size + i]  = a_diag_t;
-            /* B_bar stored as dt * B (for backward compat indexing) */
-            store->B_bar[t * state_size + i]  = dt_t * B_seq[t * state_size + i];
-            /* Bu[t] = B_t * u_t */
-            store->Bu[t * state_size + i]     = B_seq[t * state_size + i] * u_t[i];
+            /* B_bar: first rank slice * dt (for backward compat; full MIMO uses Bu directly) */
+            store->B_bar[t * state_size + i]  = dt_t * b_t[i]; /* rank-0 slice */
+
+            /* Bu_t[i] = sum_r B_t[i,r] * u_t[r] */
+            float bu = 0.0f;
+            for (size_t r = 0; r < R_rank; r++)
+                bu += b_t[r * state_size + i] * u_t[r];
+            store->Bu[t * state_size + i] = bu;
         }
 
         /* Apply R(θ) to h_prev → h_rot_tmp */
@@ -868,51 +888,82 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                                     const float *dY, const float *input_flat,
                                     float *d_input_out,
                                     const float *theta,
-                                    size_t seq_len, size_t state_size) {
+                                    size_t seq_len, size_t state_size, size_t R_rank) {
     if (!store || !block) return;
     size_t dim = block->config.dim;
 
     MBOptimState *s = _find_opt(block);
     if (!s) return;
 
-    /* scan_out[t] = C_t * h_t  (elementwise), where C_t = W_C * x_t */
-    float *scan_out  = (float *)calloc(seq_len * state_size, sizeof(float));
+    /* MIMO: scan_out[t] ∈ R^R, adj_y ∈ R^R per timestep
+     * W_out: [dim x R], so:
+     *   g_W_out += dY^T @ scan_out_R   (dim x L) @ (L x R) → (dim x R) ✓
+     *   adj_y_R = dY @ W_out^T          (L x dim) @ (dim x R) → (L x R)
+     * Then dh_t = adj_y_R_t @ C_t      backprop through y_t = C_t^T h_t
+     */
+    /* scan_out_R: [L x R] — y_t vectors for W_out gradient */
+    float *scan_out  = (float *)calloc(seq_len * R_rank, sizeof(float));
     float *dY_T      = (float *)calloc(dim * seq_len, sizeof(float));
+    /* adj_y_R: [L x R] — gradient dL/dy_t before broadcasting to state */
+    float *adj_y_R   = (float *)calloc(seq_len * R_rank, sizeof(float));
+    /* adj_y: [L x N] — gradient dL/dh_t from C output side */
     float *adj_y     = (float *)calloc(seq_len * state_size, sizeof(float));
-    float *scan_du   = (float *)calloc(seq_len * state_size, sizeof(float));
+    float *scan_du   = (float *)calloc(seq_len * R_rank, sizeof(float));
     float *scan_dA   = (float *)calloc(state_size, sizeof(float));
     float *scan_ddelta = (float *)calloc(seq_len, sizeof(float));
-    float *contrib_T = (float *)calloc(state_size * seq_len, sizeof(float));
-    float *z         = (float *)malloc(state_size * sizeof(float));
-    float *C_t       = (float *)malloc(state_size * sizeof(float));
+    float *contrib_T = (float *)calloc(R_rank * seq_len, sizeof(float));
+    size_t z_size = (R_rank > state_size) ? R_rank : state_size;
+    float *z         = (float *)malloc(z_size * sizeof(float));
+    /* C_t_mat: [N*R] — per-timestep full C matrix */
+    float *C_t_mat   = (float *)malloc(state_size * R_rank * sizeof(float));
     float *adj_h     = (float *)calloc(state_size, sizeof(float));
-    /* Per-timestep B/C gradients: dB_t [seq_len x state_size], dC_t [seq_len x state_size] */
-    float *dB_seq    = (float *)calloc(seq_len * state_size, sizeof(float));
-    float *dC_seq    = (float *)calloc(seq_len * state_size, sizeof(float));
+    /* Per-timestep B/C gradients: dB_t [seq_len x N*R], dC_t [seq_len x N*R] */
+    float *dB_seq    = (float *)calloc(seq_len * state_size * R_rank, sizeof(float));
+    float *dC_seq    = (float *)calloc(seq_len * state_size * R_rank, sizeof(float));
 
-    if (!scan_out || !dY_T || !adj_y || !scan_du || !scan_dA ||
-        !scan_ddelta || !contrib_T || !z || !C_t || !adj_h || !dB_seq || !dC_seq) {
-        free(scan_out); free(dY_T); free(adj_y); free(scan_du); free(scan_dA);
-        free(scan_ddelta); free(contrib_T); free(z); free(C_t); free(adj_h);
+    if (!scan_out || !dY_T || !adj_y_R || !adj_y || !scan_du || !scan_dA ||
+        !scan_ddelta || !contrib_T || !z || !C_t_mat || !adj_h || !dB_seq || !dC_seq) {
+        free(scan_out); free(dY_T); free(adj_y_R); free(adj_y); free(scan_du); free(scan_dA);
+        free(scan_ddelta); free(contrib_T); free(z); free(C_t_mat); free(adj_h);
         free(dB_seq); free(dC_seq);
         return;
     }
 
-    /* Recompute scan_out[t] = C_t * h_t for W_out gradient */
+    /* Recompute scan_out_R[t,r] = sum_n C_t[n,r] * h_t[n] (MIMO: C^T @ h) for W_out grad */
     for (size_t t = 0; t < seq_len; t++) {
-        mb_matrix_vec_mult(C_t, &block->W_C, &input_flat[t * dim]);
-        hadamard_avx2(store->x + t * state_size, C_t,
-                      scan_out + t * state_size, (long)state_size);
+        mb_matrix_vec_mult(C_t_mat, &block->W_C, &input_flat[t * dim]);
+        /* C_t_mat is [N*R] with layout [r*N + n]; scan_out[t,r] = sum_n C_t_mat[r*N+n]*h[n] */
+        for (size_t r = 0; r < R_rank; r++) {
+            float yr = 0.0f;
+            for (size_t n = 0; n < state_size; n++)
+                yr += C_t_mat[r * state_size + n] * store->x[t * state_size + n];
+            scan_out[t * R_rank + r] = yr;
+        }
     }
     transpose_row_major(dY, dY_T, seq_len, dim);
 
-    /* g_W_out += dY^T @ scan_out */
+    /* g_W_out += dY^T @ scan_out_R  — (dim x L) @ (L x R) → (dim x R) */
     gemm_avx2(dY_T, scan_out, s->g_W_out,
-              (long)dim, (long)seq_len, (long)state_size);
+              (long)dim, (long)seq_len, (long)R_rank);
 
-    /* adj_y = dY @ W_out  [seq_len x state_size] */
-    gemm_avx2((float *)dY, block->W_out.data, adj_y,
-              (long)seq_len, (long)dim, (long)state_size);
+    /* adj_y_R = dY @ W_out^T  — (L x dim) @ (dim x R) = (L x R)
+     * W_out is [dim x R], W_out^T is [R x dim]. We need (L x dim) @ (dim x R).
+     * Using gemm_avx2(A, B, C, M, K, N): C[M,N] = A[M,K] @ B[K,N] */
+    gemm_avx2((float *)dY, block->W_out.data, adj_y_R,
+              (long)seq_len, (long)dim, (long)R_rank);
+
+    /* From adj_y_R [L x R] and C_t [N*R], compute adj_y [L x N] = C_t @ adj_y_R_t:
+     * adj_y[t,n] = sum_r C_t[n,r] * adj_y_R[t,r]    (adjoint of y_t = C_t^T @ h_t) */
+    for (size_t t = 0; t < seq_len; t++) {
+        mb_matrix_vec_mult(C_t_mat, &block->W_C, &input_flat[t * dim]);
+        /* C_t_mat[r*N + n] = C_t[n,r]; adj_y[t,n] = sum_r C_t[n,r] * adj_y_R[t,r] */
+        for (size_t n = 0; n < state_size; n++) {
+            float a = 0.0f;
+            for (size_t r = 0; r < R_rank; r++)
+                a += C_t_mat[r * state_size + n] * adj_y_R[t * R_rank + r];
+            adj_y[t * state_size + n] = a;
+        }
+    }
 
     /* ------------------------------------------------------------------ *
      * Inline backward through the SSM scan.                              *
@@ -940,7 +991,8 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
     for (long t = (long)seq_len - 1; t >= 0; t--) {
         float dt_t    = block->delta[t];
         float lam_t   = store->lambda ? store->lambda[t] : 0.5f;
-        mb_matrix_vec_mult(C_t, &block->W_C, &input_flat[t * dim]);
+        /* C_t_mat: [N*R] for MIMO C gradient */
+        mb_matrix_vec_mult(C_t_mat, &block->W_C, &input_flat[t * dim]);
 
         /* d_h_rot[d] holds intermediate: ah * alpha_t */
         float *d_h_rot = (float *)malloc(state_size * sizeof(float));
@@ -951,9 +1003,7 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
 
         for (size_t d = 0; d < state_size; d++) {
             size_t td = (size_t)t * state_size + d;
-            float c_t_d   = C_t[d];
             float h_t_d   = store->x[td];
-            float u_t_d   = store->u_seq[td];
             float a_diag  = store->alpha ? store->alpha[td] : store->A_diag[td];
             float h_rot_d = store->h_rot[td];
             float bu_t    = store->Bu ? store->Bu[td] : 0.0f;
@@ -964,35 +1014,31 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
             float beta_t  = (1.0f - lam_t) * dt_t * a_diag;
             float gamma_t = lam_t * dt_t;
 
-            /* Adjoint of h_t: from C output and from future steps carried in adj_h.
-             * 3-term recurrence: h_t = alpha_t*R(θ)*h_{t-1} + beta_t*Bu_{t-1} + gamma_t*Bu_t
-             * ah_actual combines: (a) future-state grads adj_h[d], (b) C output adj_y[td]*C_t[d]
-             * adj_prev_Bu carries the beta contribution across time steps.
-             */
-            float ah_actual = adj_h[d] + adj_y[td] * c_t_d;
+            /* adj_h[d] = future-state grad + C output grad (already accumulated in adj_y) */
+            float ah_actual = adj_h[d] + adj_y[td];
 
-            /* Gradient for C_t */
-            dC_seq[td] = adj_y[td] * h_t_d;
+            /* Gradient for C_t: MIMO dC_t[n,r] = adj_y_R[t,r] * h_t[n]
+             * stored in dC_seq[t * N*R + r*N + d] */
+            for (size_t r = 0; r < R_rank; r++)
+                dC_seq[t * state_size * R_rank + r * state_size + d] =
+                    adj_y_R[t * R_rank + r] * h_t_d;
 
             /* Gradient for Bu_t (through gamma_t * Bu_t term) */
             float d_bu_t = ah_actual * gamma_t;
-            /* dB_t[d] = d_bu_t * u_t[d]    (Bu_t = B_t * u_t) */
-            dB_seq[td] = d_bu_t * u_t_d;
-            /* d_u_t[d] = d_bu_t * B_t[d]  — but B_t after BCNorm; we use scan_du for u */
-            /* We use d_bu_t * B_t_norm here. B_seq is already normalized in the forward. */
-            /* B_t_norm * u_t = Bu_t; so d_u[d] = d_bu_t * B_t_norm[d] */
-            float b_norm_t = (u_t_d != 0.0f && bu_t != 0.0f) ? bu_t / u_t_d : 0.0f;
-            (void)b_norm_t;
-            /* Actually for scan_du: gradient w.r.t. u_seq = d_bu_t * scan_B[t,d] */
-            scan_du[td] = d_bu_t * block->scan_B[td];
+
+            /* MIMO dB_t[n,r] = d_bu_t * u_t[r],   scan_du[t,r] += d_bu_t * B_t[n,r]
+             * B_seq[t * N*R + r*N + d] = B_t[d,r] */
+            for (size_t r = 0; r < R_rank; r++) {
+                float b_nr = block->scan_B[t * state_size * R_rank + r * state_size + d];
+                float u_r  = store->u_seq[t * R_rank + r];
+                dB_seq[t * state_size * R_rank + r * state_size + d] = d_bu_t * u_r;
+                scan_du[t * R_rank + r] += d_bu_t * b_nr;
+            }
 
             /* Gradient for A_log[d] via alpha_t */
             scan_dA[d] += ah_actual * dt_t * a_diag * h_rot_d;
 
-            /* d_lambda_t: lambda affects both beta and gamma
-             * d_loss/d_lambda_t = sum_d [ ah_actual * (d_beta/d_lam * Bu_{t-1} + d_gamma/d_lam * Bu_t) ]
-             * d_beta/d_lam = -dt * alpha_t
-             * d_gamma/d_lam = dt */
+            /* d_lambda_t: lambda affects both beta and gamma */
             d_lambda_t += ah_actual * ((-dt_t * a_diag) * bu_prev + dt_t * bu_t);
 
             /* Gradient for delta_t (through alpha_t and beta_t and gamma_t) */
@@ -1064,82 +1110,93 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
     for (size_t i = 0; i < state_size; i++)
         s->g_A_log[i] += scan_dA[i];
 
-    /* ---- Backward BCNorm pour B et C ---------------------------------- *
-     * Forward:  z = W·x,  rms = 1/sqrt(mean(z²)+eps),  out = z*rms + bias *
-     * Backward: d_bias += d_out                                            *
-     *           d_z = d_out * rms - z * rms³ * mean(d_out * z)            *
+    /* ---- Backward BCNorm pour B et C (per rank-slice) -------------------- *
+     * MIMO: W_B is [N*R x dim]; BCNorm applied per rank-slice of N.          *
+     * dB_seq layout: [L x N*R] with dB_seq[t*N*R + r*N + n] = dB_t[n,r]     *
      * -------------------------------------------------------------------- */
     {
         const float eps = 1e-6f;
+        size_t NR = state_size * R_rank;
         for (size_t t = 0; t < seq_len; t++) {
-            /* Recompute z_B = W_B · x_t  and  z_C = W_C · x_t */
-            float *z_B = (float *)malloc(state_size * sizeof(float));
-            float *z_C = (float *)malloc(state_size * sizeof(float));
+            /* Recompute z_B = W_B · x_t  [N*R] and  z_C = W_C · x_t [N*R] */
+            float *z_B = (float *)malloc(NR * sizeof(float));
+            float *z_C = (float *)malloc(NR * sizeof(float));
             if (!z_B || !z_C) { free(z_B); free(z_C); continue; }
             mb_matrix_vec_mult(z_B, &block->W_B, &input_flat[t * dim]);
             mb_matrix_vec_mult(z_C, &block->W_C, &input_flat[t * dim]);
 
-            /* g_b_B += dB_t,  g_b_C += dC_t  (gradient du biais) */
-            for (size_t d = 0; d < state_size; d++) {
-                s->g_b_B[d] += dB_seq[t * state_size + d];
-                s->g_b_C[d] += dC_seq[t * state_size + d];
+            /* Per rank-slice BCNorm backward */
+            for (size_t r = 0; r < R_rank; r++) {
+                float *zb_r  = z_B + r * state_size;
+                float *dB_r  = dB_seq + t * NR + r * state_size;
+                float *zc_r  = z_C + r * state_size;
+                float *dC_r  = dC_seq + t * NR + r * state_size;
+
+                /* g_b_B[r*N..] += dB_r */
+                for (size_t d = 0; d < state_size; d++)
+                    s->g_b_B[r * state_size + d] += dB_r[d];
+
+                /* Backward RMSNorm pour B slice r */
+                float rms_b = 0.0f;
+                for (size_t d = 0; d < state_size; d++) rms_b += zb_r[d] * zb_r[d];
+                rms_b = 1.0f / sqrtf(rms_b / (float)state_size + eps);
+                float dot_b = 0.0f;
+                for (size_t d = 0; d < state_size; d++) dot_b += dB_r[d] * zb_r[d];
+                dot_b /= (float)state_size;
+                for (size_t d = 0; d < state_size; d++)
+                    dB_r[d] = dB_r[d] * rms_b - zb_r[d] * (rms_b*rms_b*rms_b) * dot_b;
+
+                /* g_b_C[r*N..] += dC_r */
+                for (size_t d = 0; d < state_size; d++)
+                    s->g_b_C[r * state_size + d] += dC_r[d];
+
+                /* Backward RMSNorm pour C slice r */
+                float rms_c = 0.0f;
+                for (size_t d = 0; d < state_size; d++) rms_c += zc_r[d] * zc_r[d];
+                rms_c = 1.0f / sqrtf(rms_c / (float)state_size + eps);
+                float dot_c = 0.0f;
+                for (size_t d = 0; d < state_size; d++) dot_c += dC_r[d] * zc_r[d];
+                dot_c /= (float)state_size;
+                for (size_t d = 0; d < state_size; d++)
+                    dC_r[d] = dC_r[d] * rms_c - zc_r[d] * (rms_c*rms_c*rms_c) * dot_c;
             }
-
-            /* Backward RMSNorm pour B */
-            float rms_b = 0.0f;
-            for (size_t d = 0; d < state_size; d++) rms_b += z_B[d] * z_B[d];
-            rms_b = 1.0f / sqrtf(rms_b / (float)state_size + eps);
-            float dot_b = 0.0f;
-            for (size_t d = 0; d < state_size; d++)
-                dot_b += dB_seq[t * state_size + d] * z_B[d];
-            dot_b /= (float)state_size;
-            for (size_t d = 0; d < state_size; d++)
-                dB_seq[t * state_size + d] = dB_seq[t * state_size + d] * rms_b
-                                            - z_B[d] * (rms_b * rms_b * rms_b) * dot_b;
-
-            /* Backward RMSNorm pour C */
-            float rms_c = 0.0f;
-            for (size_t d = 0; d < state_size; d++) rms_c += z_C[d] * z_C[d];
-            rms_c = 1.0f / sqrtf(rms_c / (float)state_size + eps);
-            float dot_c = 0.0f;
-            for (size_t d = 0; d < state_size; d++)
-                dot_c += dC_seq[t * state_size + d] * z_C[d];
-            dot_c /= (float)state_size;
-            for (size_t d = 0; d < state_size; d++)
-                dC_seq[t * state_size + d] = dC_seq[t * state_size + d] * rms_c
-                                            - z_C[d] * (rms_c * rms_c * rms_c) * dot_c;
-
             free(z_B); free(z_C);
         }
     }
 
-    /* g_W_C += sum_t dC_t @ x_t^T  (après backward BCNorm) */
+    /* g_W_C += sum_t dC_t @ x_t^T  — dC_seq [L x N*R]^T @ input [L x dim] → [N*R x dim] */
     {
-        float *dC_seq_T = (float *)malloc(state_size * seq_len * sizeof(float));
+        size_t NR = state_size * R_rank;
+        float *dC_seq_T = (float *)malloc(NR * seq_len * sizeof(float));
         if (dC_seq_T) {
-            transpose_row_major(dC_seq, dC_seq_T, seq_len, state_size);
+            transpose_row_major(dC_seq, dC_seq_T, seq_len, NR);
             gemm_avx2(dC_seq_T, (float *)input_flat, s->g_W_C,
-                      (long)state_size, (long)seq_len, (long)dim);
+                      (long)NR, (long)seq_len, (long)dim);
             free(dC_seq_T);
         }
     }
 
-    /* g_W_B += sum_t dB_t @ x_t^T */
+    /* g_W_B += sum_t dB_t @ x_t^T — dB_seq [L x N*R]^T @ input [L x dim] → [N*R x dim] */
     {
-        float *dB_seq_T = (float *)malloc(state_size * seq_len * sizeof(float));
+        size_t NR = state_size * R_rank;
+        float *dB_seq_T = (float *)malloc(NR * seq_len * sizeof(float));
         if (dB_seq_T) {
-            transpose_row_major(dB_seq, dB_seq_T, seq_len, state_size);
+            transpose_row_major(dB_seq, dB_seq_T, seq_len, NR);
             gemm_avx2(dB_seq_T, (float *)input_flat, s->g_W_B,
-                      (long)state_size, (long)seq_len, (long)dim);
+                      (long)NR, (long)seq_len, (long)dim);
             free(dB_seq_T);
         }
     }
 
-    /* Delta and W_in gradients (unchanged from static-BC version) */
+    /* Delta and W_in gradients
+     * scan_du: [L x R] — grad w.r.t. u_t ∈ R^R
+     * W_in: [R x dim], W_in grad: scan_du_silu^T @ input [R x dim]
+     */
     for (size_t t = 0; t < seq_len; t++) {
         const float *x_input_t = &input_flat[t * dim];
         float ddt_t = scan_ddelta[t];
 
+        /* delta_proj gradient */
         {
             float raw_t = 0.0f;
             for (size_t k = 0; k < dim; k++)
@@ -1149,28 +1206,32 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                 s->g_delta_proj[k] += draw * x_input_t[k];
         }
 
+        /* W_in gradient: z = W_in @ x_t, u_t = SiLU(z), du = scan_du[t] ∈ R^R
+         * dz[r] = scan_du[t,r] * SiLU'(z[r])
+         * scan_out reused as [L x R] buffer for dz */
         mb_matrix_vec_mult(z, &block->W_in, x_input_t);
-        for (size_t j = 0; j < state_size; j++) {
-            float sig = scalar_sigmoid(z[j]);
-            float dz = sig * (1.0f + z[j] * (1.0f - sig));
-            scan_out[t * state_size + j] = scan_du[t * state_size + j] * dz;
+        for (size_t r = 0; r < R_rank; r++) {
+            float sig = scalar_sigmoid(z[r]);
+            float dz = sig * (1.0f + z[r] * (1.0f - sig));
+            scan_out[t * R_rank + r] = scan_du[t * R_rank + r] * dz;
         }
     }
 
-    transpose_row_major(scan_out, contrib_T, seq_len, state_size);
+    /* g_W_in += scan_out^T @ input  — [R x L] @ [L x dim] → [R x dim] */
+    transpose_row_major(scan_out, contrib_T, seq_len, R_rank);
     gemm_avx2(contrib_T, (float *)input_flat, s->g_W_in,
-              (long)state_size, (long)seq_len, (long)dim);
+              (long)R_rank, (long)seq_len, (long)dim);
 
-    /* d_input = d_z @ W_in  (seq_len x state_size) @ (state_size x dim) */
+    /* d_input = scan_out @ W_in  — [L x R] @ [R x dim] → [L x dim] */
     if (d_input_out) {
         gemm_avx2(scan_out, block->W_in.data, d_input_out,
-                  (long)seq_len, (long)state_size, (long)dim);
+                  (long)seq_len, (long)R_rank, (long)dim);
         /* Residual gradient: d_input += dY (identity path) */
         for (size_t i = 0; i < seq_len * dim; i++)
             d_input_out[i] += dY[i];
     }
 
-    free(scan_out); free(dY_T); free(z); free(C_t); free(adj_y);
+    free(scan_out); free(dY_T); free(z); free(C_t_mat); free(adj_y_R); free(adj_y);
     free(scan_du); free(scan_dA); free(scan_ddelta); free(contrib_T);
     free(adj_h); free(dB_seq); free(dC_seq);
 }
@@ -1191,15 +1252,19 @@ void mamba_backward(MambaBlock *block, const float *dY, const float *input,
     ForwardStore store;
     memset(&store, 0, sizeof(store));
 
-    size_t dim = block->config.dim;
-    float *u_seq  = (float *)calloc(seq_len * state_size, sizeof(float));
-    /* Per-timestep B: B_seq[t] = W_B * x_t */
-    float *B_seq  = (float *)malloc(seq_len * state_size * sizeof(float));
+    size_t dim    = block->config.dim;
+    size_t R_rank = _mimo_R(&block->config);
+
+    /* u_seq: [L x R] — MIMO input from W_in */
+    float *u_seq  = (float *)calloc(seq_len * R_rank, sizeof(float));
+    /* B_seq: [L x N*R] — BCNorm'd B matrix per timestep */
+    float *B_seq  = (float *)malloc(seq_len * state_size * R_rank * sizeof(float));
     if (!u_seq || !B_seq) { free(u_seq); free(B_seq); mb_matrix_free(A_bar); return; }
 
     float *tmp_delta = (float *)calloc(block->delta_proj.rows ? block->delta_proj.rows : 1,
                                         sizeof(float));
-    float *z = (float *)malloc(state_size * sizeof(float));
+    size_t z_size = (R_rank > state_size) ? R_rank : state_size;
+    float *z = (float *)malloc(z_size * sizeof(float));
     if (!tmp_delta || !z) {
         free(z); free(tmp_delta); free(u_seq); free(B_seq);
         mb_matrix_free(A_bar);
@@ -1208,18 +1273,23 @@ void mamba_backward(MambaBlock *block, const float *dY, const float *input,
 
     {
         const float eps = 1e-6f;
+        size_t NR = state_size * R_rank;
         for (size_t t = 0; t < seq_len; t++) {
             const float *x_t = &input[t * dim];
-            project_controller(block, x_t, z, &u_seq[t * state_size]);
+            project_controller(block, x_t, z, &u_seq[t * R_rank]);
             block->delta[t] = project_delta_value(block, x_t, tmp_delta, t, seq_len);
 
-            /* B_seq[t] = RMSNorm(W_B · x_t)  (biais non inclus : annulé dans le scan backward) */
-            float *b_t = &B_seq[t * state_size];
+            /* B_seq[t] = BCNorm(W_B · x_t) per rank-slice [N*R] */
+            float *b_t = &B_seq[t * NR];
             mb_matrix_vec_mult(b_t, &block->W_B, x_t);
-            float rms = 0.0f;
-            for (size_t d = 0; d < state_size; d++) rms += b_t[d] * b_t[d];
-            rms = 1.0f / sqrtf(rms / (float)state_size + eps);
-            for (size_t d = 0; d < state_size; d++) b_t[d] = b_t[d] * rms + block->b_B[d];
+            for (size_t r = 0; r < R_rank; r++) {
+                float *b_r = b_t + r * state_size;
+                float rms = 0.0f;
+                for (size_t d = 0; d < state_size; d++) rms += b_r[d] * b_r[d];
+                rms = 1.0f / sqrtf(rms / (float)state_size + eps);
+                for (size_t d = 0; d < state_size; d++)
+                    b_r[d] = b_r[d] * rms + block->b_B[r * state_size + d];
+            }
         }
     }
     free(z);
@@ -1229,10 +1299,10 @@ void mamba_backward(MambaBlock *block, const float *dY, const float *input,
                                 A_bar, B_seq, &block->W_C, 0.0f,
                                 block->theta,
                                 input, &block->lambda_proj,
-                                seq_len, state_size, dim);
+                                seq_len, state_size, dim, R_rank);
 
     selective_scan_backward(&store, block, dY, input, d_input,
-                            block->theta, seq_len, state_size);
+                            block->theta, seq_len, state_size, R_rank);
 
     free(store.x); free(store.A_diag); free(store.B_bar); free(store.u_seq);
     if (store.h_rot)  free(store.h_rot);
@@ -1259,8 +1329,11 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
         const float *batch_input = &input[b * seq_len * dim];
         float *batch_output = &output[b * seq_len * dim];
 
-        float *u_seq = (float *)calloc(seq_len * state_size, sizeof(float));
-        float *z = (float *)malloc(state_size * sizeof(float));
+        size_t R_rank = _mimo_R(&block->config);
+        /* u_seq: [L x R] — MIMO input vectors (SiLU(W_in @ x_t) ∈ R^R) */
+        float *u_seq = (float *)calloc(seq_len * R_rank, sizeof(float));
+        /* z: scratch buffer of size max(state_size, R) for project_controller */
+        float *z = (float *)malloc((R_rank > state_size ? R_rank : state_size) * sizeof(float));
         if (!u_seq || !z) {
             free(z); free(u_seq);
             continue;
@@ -1275,39 +1348,51 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
 
         for (size_t t = 0; t < seq_len; t++) {
             const float *x_t = &batch_input[t * dim];
-            project_controller(block, x_t, z, &u_seq[t * state_size]);
+            /* W_in is [R x dim] → output is R-dimensional */
+            project_controller(block, x_t, z, &u_seq[t * R_rank]);
             block->delta[t] = project_delta_value(block, x_t, tmp_delta, t, seq_len);
         }
         free(z);
         free(tmp_delta);
-
-        float *scan_out = (float *)malloc(seq_len * state_size * sizeof(float));
+        /* scan_out: [L x R] — MIMO output (y_t ∈ R^R per timestep) */
+        float *scan_out = (float *)malloc(seq_len * R_rank * sizeof(float));
         if (!scan_out) { free(u_seq); continue; }
 
         long L = (long)seq_len, D = (long)state_size;
 
-        /* Data-dependent B/C with BCNorm + biases (Mamba-3) */
+        /* Data-dependent B/C with BCNorm + biases (Mamba-3)
+         * MIMO: scan_B[t] ∈ R^{N*R}, scan_C[t] ∈ R^{N*R}
+         * u_seq[t] ∈ R^R  (from W_in: [R x dim])
+         * The BCNorm is applied independently to each rank-slice of B/C.
+         */
         {
             const float eps = 1e-6f;
+            long NR = (long)(state_size * R_rank);
             for (long t = 0; t < L; t++) {
                 const float *x_t = &batch_input[t * dim];
-                float *b_out = &block->scan_B[t*D];
-                float *c_out = &block->scan_C[t*D];
+                float *b_out = &block->scan_B[t * NR];
+                float *c_out = &block->scan_C[t * NR];
 
+                /* B_flat[N*R] = W_B[N*R x dim] @ x_t */
                 mb_matrix_vec_mult(b_out, &block->W_B, x_t);
                 mb_matrix_vec_mult(c_out, &block->W_C, x_t);
 
-                /* RMSNorm(B_t) */
-                float rms_b = 0.0f;
-                for (long d = 0; d < D; d++) rms_b += b_out[d] * b_out[d];
-                rms_b = 1.0f / sqrtf(rms_b / (float)D + eps);
-                for (long d = 0; d < D; d++) b_out[d] = b_out[d] * rms_b + block->b_B[d];
-
-                /* RMSNorm(C_t) */
-                float rms_c = 0.0f;
-                for (long d = 0; d < D; d++) rms_c += c_out[d] * c_out[d];
-                rms_c = 1.0f / sqrtf(rms_c / (float)D + eps);
-                for (long d = 0; d < D; d++) c_out[d] = c_out[d] * rms_c + block->b_C[d];
+                /* RMSNorm + bias per rank-slice of B */
+                for (size_t r = 0; r < R_rank; r++) {
+                    float *b_r = b_out + r * state_size;
+                    float rms_b = 0.0f;
+                    for (long d = 0; d < D; d++) rms_b += b_r[d] * b_r[d];
+                    rms_b = 1.0f / sqrtf(rms_b / (float)state_size + eps);
+                    for (long d = 0; d < D; d++) b_r[d] = b_r[d] * rms_b + block->b_B[r * state_size + d];
+                }
+                /* RMSNorm + bias per rank-slice of C */
+                for (size_t r = 0; r < R_rank; r++) {
+                    float *c_r = c_out + r * state_size;
+                    float rms_c = 0.0f;
+                    for (long d = 0; d < D; d++) rms_c += c_r[d] * c_r[d];
+                    rms_c = 1.0f / sqrtf(rms_c / (float)state_size + eps);
+                    for (long d = 0; d < D; d++) c_r[d] = c_r[d] * rms_c + block->b_C[r * state_size + d];
+                }
 
                 for (long d = 0; d < D; d++)
                     block->scan_delta[t*D + d] = block->delta[t];
@@ -1316,26 +1401,32 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
         memset(block->scan_h, 0, (size_t)D * sizeof(float));
 
         /* Complex SSM scan with R(θ) rotation + exp-trapezoidal discretization
-         * (Mamba-3 §3.1 + §3.2)
-         * h_t = alpha_t * R(θ) * h_{t-1} + beta_t * B_{t-1} * u_{t-1} + gamma_t * B_t * u_t
-         * where: alpha_t  = exp(dt * A)
-         *        lambda_t = sigmoid(lambda_proj · x_t)
-         *        beta_t   = (1 - lambda_t) * dt * alpha_t
-         *        gamma_t  = lambda_t * dt
+         * (Mamba-3 §3.1 + §3.2) with MIMO (rank R)
+         * h_t = alpha_t * R(θ) * h_{t-1} + beta_t * Bu_{t-1} + gamma_t * Bu_t
+         * Bu_t[n] = sum_r B_t[n,r] * u_t[r]     (MIMO: reduce over rank)
+         * y_t[r]  = sum_n C_t[n,r] * h_t[n]     (MIMO: project to rank space)
+         * output  = W_out[dim x R] @ y_t         (project back to dim)
          */
         {
+            long NR = (long)(state_size * R_rank);
             float *h_cur    = block->scan_h;
             float *h_rot    = (float *)malloc((size_t)D * sizeof(float));
-            float *prev_Bu  = (float *)calloc((size_t)D, sizeof(float)); /* B_{t-1} * u_{t-1} */
-            float *lam_buf  = (float *)malloc(1 * sizeof(float)); /* tmp for lambda_proj dot */
-            if (!h_rot || !prev_Bu || !lam_buf) {
-                free(h_rot); free(prev_Bu); free(lam_buf);
+            float *prev_Bu  = (float *)calloc((size_t)D, sizeof(float));
+            float *Bu_cur   = (float *)malloc((size_t)D * sizeof(float));
+            float *lam_buf  = (float *)malloc(sizeof(float));
+            /* scan_out: [L x R] — y_t vectors before W_out projection */
+            float *y_rank   = (float *)malloc(seq_len * R_rank * sizeof(float));
+            if (!h_rot || !prev_Bu || !lam_buf || !Bu_cur || !y_rank) {
+                free(h_rot); free(prev_Bu); free(lam_buf); free(Bu_cur); free(y_rank);
                 free(u_seq); free(scan_out); continue;
             }
 
             for (long t = 0; t < L; t++) {
                 float dt_t = block->delta[t];
                 const float *x_t = &batch_input[t * dim];
+                const float *u_t = &u_seq[t * R_rank];     /* u_t ∈ R^R */
+                const float *b_t = &block->scan_B[t * NR]; /* B_t[N*R] */
+                const float *c_t = &block->scan_C[t * NR]; /* C_t[N*R] */
 
                 /* lambda_t = sigmoid(lambda_proj · x_t) */
                 mb_matrix_vec_mult(lam_buf, &block->lambda_proj, x_t);
@@ -1351,6 +1442,15 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
                 }
                 if (D & 1) h_rot[D-1] = h_cur[D-1];
 
+                /* MIMO Bu_t[n] = sum_r B_t[n,r] * u_t[r]
+                 * b_t layout: [R slices of N] i.e. b_t[r*N + n] = B_t[n,r] */
+                for (long n = 0; n < D; n++) {
+                    float bu = 0.0f;
+                    for (size_t r = 0; r < R_rank; r++)
+                        bu += b_t[r * state_size + n] * u_t[r];
+                    Bu_cur[n] = bu;
+                }
+
                 /* 3-term recurrence */
                 for (long d = 0; d < D; d++) {
                     float a = block->A_log.data[d];
@@ -1358,24 +1458,32 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input,
                     float alpha  = expf(dt_t * a);
                     float beta   = (1.0f - lam_t) * dt_t * alpha;
                     float gamma_ = lam_t * dt_t;
-                    float Bu_t   = block->scan_B[t*D+d] * u_seq[t*D+d];
-                    h_cur[d] = alpha * h_rot[d] + beta * prev_Bu[d] + gamma_ * Bu_t;
-                    prev_Bu[d] = Bu_t;
+                    h_cur[d] = alpha * h_rot[d] + beta * prev_Bu[d] + gamma_ * Bu_cur[d];
+                    prev_Bu[d] = Bu_cur[d];
                 }
 
-                /* scan_out[t] = C_t * h_t */
-                for (long d = 0; d < D; d++)
-                    scan_out[t*D+d] = block->scan_C[t*D+d] * h_cur[d];
+                /* MIMO y_t[r] = sum_n C_t[n,r] * h_t[n]
+                 * c_t layout: [R slices of N] i.e. c_t[r*N + n] = C_t[n,r] */
+                for (size_t r = 0; r < R_rank; r++) {
+                    float yr = 0.0f;
+                    for (long n = 0; n < D; n++)
+                        yr += c_t[r * state_size + n] * h_cur[n];
+                    y_rank[t * R_rank + r] = yr;
+                }
+                /* Also store in scan_out (first-R) for backward compat with W_out gradient */
+                for (size_t r = 0; r < R_rank; r++)
+                    scan_out[t * R_rank + r] = y_rank[t * R_rank + r];
             }
-            free(h_rot); free(prev_Bu); free(lam_buf);
+            free(h_rot); free(prev_Bu); free(lam_buf); free(Bu_cur); free(y_rank);
         }
         memcpy(block->hidden, block->scan_h, (size_t)D * sizeof(float));
 
         float *ybuf = (float *)malloc(dim * sizeof(float));
         if (ybuf) {
             for (size_t t = 0; t < seq_len; t++) {
-                const float *state_t = &scan_out[t * state_size];
-                mb_matrix_vec_mult(ybuf, &block->W_out, state_t);
+                /* y_t ∈ R^R, project to dim via W_out[dim x R] */
+                const float *y_t = &scan_out[t * R_rank];
+                mb_matrix_vec_mult(ybuf, &block->W_out, y_t);
                 /* Residual connection: output = input + mamba(input) */
                 for (size_t j = 0; j < dim; j++)
                     batch_output[t * dim + j] = batch_input[t * dim + j] + ybuf[j];

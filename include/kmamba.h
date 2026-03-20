@@ -20,9 +20,10 @@ typedef struct {
  * ============================================================================ */
 typedef struct {
     size_t dim;         /* model dimension */
-    size_t state_size;  /* mamba state size */
+    size_t state_size;  /* mamba state size (N) */
     size_t seq_len;     /* context length */
-    
+    size_t mimo_rank;   /* MIMO rank R (default 1 = SISO, B∈R^{NxR}, C∈R^{NxR}, u∈R^R) */
+
     float dt_scale;
     float dt_min;
     float dt_max;
@@ -40,11 +41,11 @@ typedef struct {
     MBConfig config;
     
     /* Parameters */
-    MBMatrix W_in;        /* [state_size x dim] */
-    MBMatrix W_out;       /* [dim x state_size] */
-    MBMatrix A_log;       /* [state_size] diagonal */
-    MBMatrix W_B;         /* [state_size x dim] — data-dependent B projection */
-    MBMatrix W_C;         /* [state_size x dim] — data-dependent C projection */
+    MBMatrix W_in;        /* [R x dim]     — projects x_t → u_t ∈ R^R  (MIMO input) */
+    MBMatrix W_out;       /* [dim x R]     — projects y_t ∈ R^R → output ∈ R^dim */
+    MBMatrix A_log;       /* [state_size]  — diagonal log(-A), always negative */
+    MBMatrix W_B;         /* [N*R x dim]   — data-dependent B∈R^{NxR} projection */
+    MBMatrix W_C;         /* [N*R x dim]   — data-dependent C∈R^{NxR} projection */
     MBMatrix delta_proj;  /* [1 x dim] */
 
     /* BCNorm biases (Mamba-3) */
@@ -63,10 +64,10 @@ typedef struct {
     ConvNDWorkspace *convnd_ws;
     
     /* Runtime buffers */
-    float *hidden;         /* [dim] */
+    float *hidden;         /* [state_size] — SSM state at last timestep */
     float *delta;          /* [seq_len] */
-    float *scan_B;         /* [seq_len x state_size] */
-    float *scan_C;         /* [seq_len x state_size] */
+    float *scan_B;         /* [seq_len x N*R] — normalized B_t columns, R=mimo_rank */
+    float *scan_C;         /* [seq_len x N*R] — normalized C_t columns, R=mimo_rank */
     float *scan_delta;     /* [seq_len x state_size] */
     float *scan_h;         /* [state_size] */
 } MambaBlock;
@@ -131,14 +132,15 @@ typedef struct {
 typedef struct {
     size_t vocab_size;   /* default: 256 (byte-level) */
     size_t dim;          /* model dimension */
-    size_t state_size;   /* mamba state size */
+    size_t state_size;   /* mamba state size (N) */
     size_t seq_len;      /* context length */
     size_t n_layers;     /* number of stacked MambaBlocks */
+    size_t mimo_rank;    /* MIMO rank R (0 or 1 = SISO; otherwise full MIMO) */
 
     float dt_scale;
     float dt_min;
     float dt_max;
-    
+
     /* ConvND parameters (optionnel) */
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND avant scan */
     long   convnd_K;       /* Taille du noyau ConvND (K>=1) */

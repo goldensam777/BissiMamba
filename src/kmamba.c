@@ -90,6 +90,7 @@ KMamba* kmamba_create(const KMambaConfig *cfg) {
             .dim        = cfg->dim,
             .state_size = cfg->state_size,
             .seq_len    = cfg->seq_len,
+            .mimo_rank  = cfg->mimo_rank > 0 ? cfg->mimo_rank : 1,
             .dt_scale   = cfg->dt_scale,
             .dt_min     = cfg->dt_min,
             .dt_max     = cfg->dt_max
@@ -168,6 +169,7 @@ typedef struct {
     uint64_t state_size;
     uint64_t seq_len;
     uint64_t n_layers;
+    uint64_t mimo_rank;  /* v4: MIMO rank R (0/1 = SISO) */
     float dt_scale;
     float dt_min;
     float dt_max;
@@ -188,12 +190,13 @@ int kmamba_save(const KMamba *m, const char *path) {
 
     CheckpointHeader h = {0};
     memcpy(h.magic, "KMAMBA", 6);
-    h.version    = 3; /* v3: adds theta (complex SSM) + lambda_proj (exp-trapezoidal) */
+    h.version    = 4; /* v4: adds mimo_rank (MIMO B/C rank) */
     h.vocab_size = (uint64_t)m->cfg.vocab_size;
     h.dim        = (uint64_t)m->cfg.dim;
     h.state_size = (uint64_t)m->cfg.state_size;
     h.seq_len    = (uint64_t)m->cfg.seq_len;
     h.n_layers   = (uint64_t)m->cfg.n_layers;
+    h.mimo_rank  = (uint64_t)(m->cfg.mimo_rank > 0 ? m->cfg.mimo_rank : 1);
     h.dt_scale   = m->cfg.dt_scale;
     h.dt_min     = m->cfg.dt_min;
     h.dt_max     = m->cfg.dt_max;
@@ -204,7 +207,7 @@ int kmamba_save(const KMamba *m, const char *path) {
 
     for (size_t i = 0; i < m->cfg.n_layers; i++) {
         const MambaBlock *b = m->layers[i];
-        size_t theta_size = b->W_in.rows / 2; if (theta_size == 0) theta_size = 1;
+        size_t theta_size = b->config.state_size / 2; if (theta_size == 0) theta_size = 1;
         if (write_floats(f, b->W_in.data,       b->W_in.rows * b->W_in.cols)            ||
             write_floats(f, b->W_out.data,      b->W_out.rows * b->W_out.cols)           ||
             write_floats(f, b->A_log.data,      b->A_log.rows * b->A_log.cols)           ||
@@ -232,7 +235,7 @@ KMamba* kmamba_load(const char *path, int for_training,
 
     CheckpointHeader h;
     if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return NULL; }
-    if (memcmp(h.magic, "KMAMBA", 6) != 0 || h.version > 3) { fclose(f); return NULL; }
+    if (memcmp(h.magic, "KMAMBA", 6) != 0 || h.version > 4) { fclose(f); return NULL; }
 
     KMambaConfig cfg = {
         .vocab_size  = (size_t)h.vocab_size,
@@ -240,6 +243,7 @@ KMamba* kmamba_load(const char *path, int for_training,
         .state_size  = (size_t)h.state_size,
         .seq_len     = (size_t)h.seq_len,
         .n_layers    = (size_t)h.n_layers,
+        .mimo_rank   = (h.version >= 4 && h.mimo_rank > 0) ? (size_t)h.mimo_rank : 1,
         .dt_scale    = h.dt_scale,
         .dt_min      = h.dt_min,
         .dt_max      = h.dt_max
@@ -261,7 +265,7 @@ KMamba* kmamba_load(const char *path, int for_training,
 
     for (size_t i = 0; i < cfg.n_layers; i++) {
         MambaBlock *b = m->layers[i];
-        size_t theta_size = b->W_in.rows / 2; if (theta_size == 0) theta_size = 1;
+        size_t theta_size = b->config.state_size / 2; if (theta_size == 0) theta_size = 1;
         if (read_floats(f, b->W_in.data,       b->W_in.rows * b->W_in.cols)            ||
             read_floats(f, b->W_out.data,      b->W_out.rows * b->W_out.cols)           ||
             read_floats(f, b->A_log.data,      b->A_log.rows * b->A_log.cols)           ||
