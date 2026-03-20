@@ -209,6 +209,8 @@ int kmamba_save(const KMamba *m, const char *path) {
             write_floats(f, b->A_log.data,     b->A_log.rows * b->A_log.cols)          ||
             write_floats(f, b->W_B.data,       b->W_B.rows * b->W_B.cols)              ||
             write_floats(f, b->W_C.data,       b->W_C.rows * b->W_C.cols)              ||
+            write_floats(f, b->b_B,            b->W_B.rows)                             ||
+            write_floats(f, b->b_C,            b->W_C.rows)                             ||
             write_floats(f, b->delta_proj.data, b->delta_proj.rows * b->delta_proj.cols)) {
             fclose(f); return -1;
         }
@@ -261,6 +263,8 @@ KMamba* kmamba_load(const char *path, int for_training,
             read_floats(f, b->A_log.data,     b->A_log.rows * b->A_log.cols)          ||
             read_floats(f, b->W_B.data,       b->W_B.rows * b->W_B.cols)              ||
             read_floats(f, b->W_C.data,       b->W_C.rows * b->W_C.cols)              ||
+            read_floats(f, b->b_B,            b->W_B.rows)                             ||
+            read_floats(f, b->b_C,            b->W_C.rows)                             ||
             read_floats(f, b->delta_proj.data, b->delta_proj.rows * b->delta_proj.cols)) {
             kmamba_free(m); fclose(f); return NULL;
         }
