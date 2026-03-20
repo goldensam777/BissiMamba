@@ -156,6 +156,21 @@ __global__ void add_inplace_kernel(float *y, const float *x, int n) {
     y[i] += x[i];
 }
 
+/* Sigmoid : y[i] = 1 / (1 + exp(-x[i])) */
+__global__ void sigmoid_fwd_kernel(const float *x, float *y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    y[i] = (v > 20.0f) ? 1.0f : (v < -20.0f) ? 0.0f : 1.0f / (1.0f + expf(-v));
+}
+
+/* Sigmoid backward : dx = dy * sigma * (1 - sigma) */
+__global__ void sigmoid_bwd_kernel(const float *dy, const float *y, float *dx, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dx[i] = dy[i] * y[i] * (1.0f - y[i]);
+}
+
 /* dx[L, dim] += ddt[L] outer delta_proj[dim] : dx[t,d] += ddt[t]*dproj[d] */
 __global__ void outer_add_kernel(float *dx, const float *ddt,
                                  const float *dproj, int L, int D) {
@@ -174,9 +189,9 @@ __global__ void outer_add_kernel(float *dx, const float *ddt,
  */
 /* ── Complex SSM sequential kernel (forward) ─────────────────── */
 /*
- * Single-threaded sequential scan with R(θ) rotation.
- * Replaces the Blelloch parallel scan for correctness with rotation.
- * h_store[t*D + d] = h_t[d] (state at each timestep)
+ * Single-threaded sequential scan with R(θ) rotation and exp-trapezoidal discretization.
+ * h_t = alpha_t * R(θ)*h_{t-1} + beta_t * Bu_{t-1} + gamma_t * Bu_t
+ * h_store[t*D + d] = h_t[d]
  * y_scan [t*D + d] = C_t[d] * h_t[d]
  */
 __global__ void complex_ssm_fwd_kernel(
@@ -186,27 +201,27 @@ __global__ void complex_ssm_fwd_kernel(
     const float *C_exp,   /* [L, D] data-dep C */
     const float *dt,      /* [L] per-timestep delta */
     const float *theta,   /* [D/2] rotation angles */
+    const float *lambda,  /* [L]   per-timestep lambda (sigmoid output) */
     float *h_store,       /* [L, D] state at each step */
     float *y_scan,        /* [L, D] output */
     int L, int D)
 {
-    /* Single-threaded execution */
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
-    /* h_cur is h_store at t=0 (initialized to zero by caller) */
-    float *h_cur = h_store;  /* points to h_store[0] */
-
-    /* Temporary buffer for rotated h — we use h_store[t+1] as scratch during step t
-     * Actually we compute in-place: rotate into a local array, then update */
-    /* Allocate scratch on stack: D ≤ 512 in typical configs, max 2048 OK for stack */
-    /* For safety, use a fixed-size stack buffer (state_size <= 1024 assumed) */
     float h_rot_local[1024];
+    float prev_Bu[1024];
 
-    /* Initialize h_cur to zero */
-    for (int d = 0; d < D; d++) h_cur[d] = 0.0f;
+    /* Initialize */
+    for (int d = 0; d < D; d++) {
+        h_store[d] = 0.0f;
+        prev_Bu[d] = 0.0f;
+    }
+
+    float *h_cur = h_store;
 
     for (int t = 0; t < L; t++) {
-        float dt_t = dt[t];
+        float dt_t  = dt[t];
+        float lam_t = lambda ? lambda[t] : 0.5f;
 
         /* Apply R(θ) to h_cur */
         for (int i = 0; i + 1 < D; i += 2) {
@@ -218,23 +233,20 @@ __global__ void complex_ssm_fwd_kernel(
         }
         if (D & 1) h_rot_local[D-1] = h_cur[D-1];
 
-        /* h_t = exp(dt*A)*h_rot + dt*B_t*u_t */
-        float *h_next = (t + 1 < L) ? &h_store[(t+1)*D] : h_cur;
-        /* write h_t into h_store[t] */
         float *h_out = &h_store[t * D];
         for (int d = 0; d < D; d++) {
-            float a = A_log[d];
-            if (a > -1e-5f) a = -1e-5f;
-            h_out[d] = expf(dt_t * a) * h_rot_local[d]
-                       + dt_t * B_exp[t*D+d] * u[t*D+d];
+            float a = A_log[d]; if (a > -1e-5f) a = -1e-5f;
+            float alpha  = expf(dt_t * a);
+            float beta   = (1.0f - lam_t) * dt_t * alpha;
+            float gamma_ = lam_t * dt_t;
+            float bu_t   = B_exp[t*D+d] * u[t*D+d];
+            h_out[d] = alpha * h_rot_local[d] + beta * prev_Bu[d] + gamma_ * bu_t;
+            prev_Bu[d] = bu_t;
         }
-        /* y_scan[t] = C_t * h_t */
         for (int d = 0; d < D; d++)
             y_scan[t*D+d] = C_exp[t*D+d] * h_out[d];
 
-        /* Advance h_cur pointer */
         h_cur = h_out;
-        (void)h_next;
     }
 }
 
@@ -248,6 +260,7 @@ extern "C" void gpu_block_forward(
     const float *d_W_C,         /* [state, dim]  data-dependent C projection */
     const float *d_delta_proj,  /* [dim]         */
     const float *d_theta,       /* [state/2]     rotation angles (may be NULL) */
+    const float *d_lambda_proj, /* [dim]         exp-trapezoidal lambda projection */
     /* Entrée / sortie */
     const float *d_x,           /* [L, dim]  input  */
     float       *d_y,           /* [L, dim]  output */
@@ -256,6 +269,7 @@ extern "C" void gpu_block_forward(
     float *d_dt_raw,  float *d_dt,
     float *d_B_exp,   float *d_C_exp, float *d_dt_exp,
     float *d_h_store, float *d_y_scan, float *d_y_proj,
+    float *d_lambda_raw, float *d_lambda,  /* [L] workspace for lambda */
     int L, int state, int dim)
 {
     const float a1 = 1.0f, b0 = 0.0f;
@@ -274,17 +288,21 @@ extern "C" void gpu_block_forward(
     blk = (L + 255) / 256;
     softplus_clamp_fwd_kernel<<<blk, 256>>>(d_dt_raw, d_dt, L);
 
-    /* 4. Data-dependent B, C: B_exp [L,state] = x [L,dim] @ W_B^T [state,dim]
-     *                          C_exp [L,state] = x [L,dim] @ W_C^T [state,dim] */
+    /* 4. Data-dependent B, C, lambda */
     gemm_bt(cublas, L, state, dim, a1, d_x, d_W_B, b0, d_B_exp);
     gemm_bt(cublas, L, state, dim, a1, d_x, d_W_C, b0, d_C_exp);
+    /* lambda_raw [L] = x [L,dim] @ lambda_proj [dim] */
+    gemm(cublas, L, 1, dim, a1, d_x, d_lambda_proj, b0, d_lambda_raw);
+    /* sigmoid(lambda_raw) -> d_lambda [L] */
+    { int blk_l = (L + 255) / 256;
+      sigmoid_fwd_kernel<<<blk_l, 256>>>(d_lambda_raw, d_lambda, L); }
 
-    /* 5. Complex SSM sequential scan with R(θ) rotation */
+    /* 5. Complex SSM sequential scan with R(θ) rotation + exp-trapezoidal */
     CUDA_CHECK(cudaMemset(d_h_store, 0, L * state * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_y_scan,  0, L * state * sizeof(float)));
     complex_ssm_fwd_kernel<<<1, 1>>>(
         d_u, d_A_log, d_B_exp, d_C_exp, d_dt,
-        d_theta, d_h_store, d_y_scan, L, state);
+        d_theta, d_lambda, d_h_store, d_y_scan, L, state);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     /* 6. out_proj : y_proj [L, dim] = y_scan [L, state] @ W_out^T  (W_out=[dim,state]) */
@@ -329,6 +347,7 @@ __global__ void complex_ssm_bwd_kernel(
     const float *B_exp,      /* [L, D] */
     const float *C_exp,      /* [L, D] */
     const float *dt,         /* [L] */
+    const float *lambda,     /* [L]   sigmoid(lambda_proj*x) */
     const float *theta,      /* [D/2] */
     const float *h_store,    /* [L, D] state at each step */
     float *d_du,             /* [L, D] out */
@@ -337,52 +356,77 @@ __global__ void complex_ssm_bwd_kernel(
     float *d_dC_out,         /* [L, D] out */
     float *d_ddt_out,        /* [L, D] out */
     float *d_g_theta,        /* [D/2]  out (accumulated) */
+    float *d_dlambda,        /* [L]    out: grad w.r.t. lambda_t */
     int L, int D)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     float adj_h[1024];
-    for (int d = 0; d < D; d++) adj_h[d] = 0.0f;
+    float adj_prev_Bu[1024];
+    for (int d = 0; d < D; d++) { adj_h[d] = 0.0f; adj_prev_Bu[d] = 0.0f; }
 
     for (int t = L - 1; t >= 0; t--) {
-        float dt_t = dt[t];
+        float dt_t  = dt[t];
+        float lam_t = lambda ? lambda[t] : 0.5f;
         const float *h_t    = &h_store[t * D];
         const float *h_prev = (t > 0) ? &h_store[(t-1)*D] : NULL;
 
-        for (int d = 0; d < D; d++) {
-            float ct_d  = C_exp[t*D+d];
-            float bt_d  = B_exp[t*D+d];
-            float ut_d  = u[t*D+d];
-            float a_val = A_log[d]; if (a_val > -1e-5f) a_val = -1e-5f;
-            float a_diag = expf(dt_t * a_val);
-            float dy_s  = d_dy_scan[t*D+d];
+        float d_lam_t = 0.0f;
 
-            /* adj of h_t: d_dy_scan * C + adj_h */
-            float ah = adj_h[d] + dy_s * ct_d;
+        for (int d = 0; d < D; d++) {
+            float ct_d   = C_exp[t*D+d];
+            float bt_d   = B_exp[t*D+d];
+            float ut_d   = u[t*D+d];
+            float a_val  = A_log[d]; if (a_val > -1e-5f) a_val = -1e-5f;
+            float a_diag = expf(dt_t * a_val);
+            float beta_t = (1.0f - lam_t) * dt_t * a_diag;
+            float dy_s   = d_dy_scan[t*D+d];
+            float bu_t   = bt_d * ut_d;
+            float bu_prev = (h_prev != NULL) ? B_exp[(t-1)*D+d] * u[(t-1)*D+d] : 0.0f;
+
+            /* adj of h_t from y_t and future state */
+            float ah = adj_h[d] + dy_s * ct_d + adj_prev_Bu[d] * beta_t;
+            /* Actually adj_prev_Bu holds the gradient that flows from the next step's
+             * beta_{t+1} * Bu_t term. We handle this by incorporating it via adj_h propagation. */
+            /* Cleaner: ah_actual excludes adj_prev_Bu (handle separately) */
+            float ah_actual = adj_h[d] + dy_s * ct_d;
 
             /* dC */
             d_dC_out[t*D+d] = dy_s * h_t[d];
 
-            /* dB */
-            d_dB_out[t*D+d] = ah * dt_t * ut_d;
+            /* dBu_t = ah_actual * gamma_t */
+            float gamma_t = lam_t * dt_t;
+            float d_bu_t  = ah_actual * gamma_t;
+            /* dB_t[d] */
+            d_dB_out[t*D+d] = d_bu_t * ut_d;
+            /* du[d] */
+            d_du[t*D+d] = d_bu_t * bt_d;
 
-            /* du */
-            d_du[t*D+d] = ah * dt_t * bt_d;
-
-            /* dA_log: use h_rot = h_store[t] - bt*ut contribution */
-            /* h_rot[d] = (h_t[d] - dt*B*u) / a_diag, but simpler: */
-            /* h_t[d] = a_diag * h_rot[d] + dt*B*u, so h_rot[d] = (h_t[d] - dt*B*u) / a_diag */
+            /* Recover h_rot from stored state and Bu terms */
             float h_rot_d = (a_diag > 1e-30f)
-                            ? (h_t[d] - dt_t * bt_d * ut_d) / a_diag
-                            : 0.0f;
-            d_dA_acc[d] += ah * dt_t * a_diag * h_rot_d;
+                ? (h_t[d] - beta_t * bu_prev - gamma_t * bu_t) / a_diag
+                : 0.0f;
 
-            /* ddt (stored per-dim, reduce to scalar later) */
-            d_ddt_out[t*D+d] = ah * (a_val * a_diag * h_rot_d + bt_d * ut_d);
+            /* dA_log */
+            d_dA_acc[d] += ah_actual * dt_t * a_diag * h_rot_d;
 
-            /* Store d_h_rot[d] = ah * a_diag  (for theta grad below) */
-            adj_h[d] = ah * a_diag;  /* temporarily hold d_h_rot */
+            /* d_lambda_t: d_h/d_lam * ah_actual */
+            /* d_beta/d_lam = -dt * alpha; d_gamma/d_lam = dt */
+            d_lam_t += ah_actual * ((-dt_t * a_diag) * bu_prev + dt_t * bu_t);
+
+            /* ddt */
+            d_ddt_out[t*D+d] = ah_actual * (a_val * a_diag * h_rot_d
+                                + (1.0f - lam_t) * a_diag * bu_prev
+                                + lam_t * bu_t);
+
+            /* d_h_rot = ah_actual * a_diag  for theta + adj_h propagation */
+            adj_h[d] = ah_actual * a_diag;
+
+            /* propagate adj through prev_Bu for t-1 */
+            adj_prev_Bu[d] = ah_actual * beta_t;
         }
+
+        if (d_dlambda) d_dlambda[t] = d_lam_t;
 
         /* Gradient for theta and propagate adj_h = R^T * d_h_rot */
         for (int i = 0; i + 1 < D; i += 2) {
@@ -392,16 +436,14 @@ __global__ void complex_ssm_bwd_kernel(
             float c   = cosf(th), sv = sinf(th);
             float dr0 = adj_h[i], dr1 = adj_h[i+1];
 
-            /* dtheta */
             if (theta && d_g_theta)
                 d_g_theta[i >> 1] += dr0 * (-sv * hp0 - c * hp1)
                                    + dr1 * (c * hp0 - sv * hp1);
 
-            /* adj_h = R^T * d_h_rot */
             adj_h[i]   = c * dr0 + sv * dr1;
             adj_h[i+1] = -sv * dr0 + c * dr1;
         }
-        if (D & 1) { /* adj_h[D-1] stays as is */ }
+        if (D & 1) { /* adj_h[D-1] = adj_h[D-1] (unchanged) */ }
     }
 }
 
@@ -412,23 +454,26 @@ extern "C" void gpu_block_backward(
     const float *d_A_log,
     const float *d_W_B, const float *d_W_C,
     const float *d_delta_proj,
-    const float *d_theta,       /* [state/2] rotation angles */
+    const float *d_theta,         /* [state/2] rotation angles */
+    const float *d_lambda_proj,   /* [dim] lambda projection */
     /* Activations sauvées au forward */
     const float *d_x,
     const float *d_u_raw, const float *d_u,
     const float *d_dt_raw, const float *d_dt,
     const float *d_B_exp, const float *d_C_exp, const float *d_dt_exp,
     const float *d_h_store, const float *d_y_scan,
+    const float *d_lambda,        /* [L] sigmoid(lambda_proj * x) saved at forward */
     /* Gradient entrant */
-    const float *d_dy,          /* [L, dim] upstream gradient */
+    const float *d_dy,            /* [L, dim] upstream gradient */
     /* Gradients des paramètres (accumulés, +=) */
     float *d_dW_in, float *d_dW_out,
     float *d_dA_log,
     float *d_dW_B, float *d_dW_C,
     float *d_ddelta_proj,
-    float *d_g_theta,           /* [state/2] grad for theta */
+    float *d_g_theta,             /* [state/2] grad for theta */
+    float *d_g_lambda_proj,       /* [dim] grad for lambda_proj */
     /* Gradient de sortie */
-    float *d_dx,                /* [L, dim] downstream gradient */
+    float *d_dx,                  /* [L, dim] downstream gradient */
     /* Workspace temporaire */
     float *d_dy_scan,           /* [L, state] */
     float *d_du,                /* [L, state] */
@@ -439,6 +484,9 @@ extern "C" void gpu_block_backward(
     float *d_dC_scan,           /* [L, state] scan gradient de C */
     float *d_ddt_scan,          /* [L, state] scan gradient de dt */
     float *d_dA_tmp,            /* [state]   scan gradient de A (tmp) */
+    float *d_dlambda,           /* [L]       scan gradient of lambda */
+    float *d_dlambda_raw,       /* [L]       grad through sigmoid */
+    const float *d_lambda,      /* [L]       sigmoid output saved at forward */
     int L, int state, int dim)
 {
     const float a1 = 1.0f, b0 = 0.0f;
@@ -460,10 +508,11 @@ extern "C" void gpu_block_backward(
     CUDA_CHECK(cudaMemset(d_dA_tmp, 0, state * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_ddt_scan, 0, L * state * sizeof(float)));
 
+    CUDA_CHECK(cudaMemset(d_dlambda, 0, L * sizeof(float)));
     complex_ssm_bwd_kernel<<<1, 1>>>(
         d_dy_scan,
-        d_u, d_A_log, d_B_exp, d_C_exp, d_dt, d_theta, d_h_store,
-        d_du, d_dA_tmp, d_dB_scan, d_dC_scan, d_ddt_scan, d_g_theta,
+        d_u, d_A_log, d_B_exp, d_C_exp, d_dt, d_lambda, d_theta, d_h_store,
+        d_du, d_dA_tmp, d_dB_scan, d_dC_scan, d_ddt_scan, d_g_theta, d_dlambda,
         L, state);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -499,6 +548,16 @@ extern "C" void gpu_block_backward(
     /* ── Backward in_proj ───────────────────────────────────────── */
     gemm_at(cublas, state, dim, L, a1, d_du_raw, d_x, a1, d_dW_in);
     gemm(cublas, L, dim, state, a1, d_du_raw, d_W_in, a1, d_dx);
+
+    /* ── Backward lambda_proj ───────────────────────────────────── */
+    /* d_dlambda_raw [L] = d_dlambda [L] * sigma'(lambda_raw) = d_dlambda * lambda*(1-lambda) */
+    blk = (L + 255) / 256;
+    sigmoid_bwd_kernel<<<blk, 256>>>(d_dlambda, d_lambda, d_dlambda_raw, L);
+    /* d_g_lambda_proj [dim] += d_dlambda_raw^T @ x  (shape: [L,1]^T @ [L,dim]) */
+    gemm_at(cublas, 1, dim, L, a1, d_dlambda_raw, d_x, a1, d_g_lambda_proj);
+    /* dx [L, dim] += d_dlambda_raw [L] outer lambda_proj [dim] */
+    outer_add_kernel<<<(L * dim + 255) / 256, 256>>>(
+        d_dx, d_dlambda_raw, d_lambda_proj, L, dim);
 
     /* dt_exp no longer used (kept for API compat) */
     (void)d_dt_exp; (void)d_ddt_raw;

@@ -53,6 +53,9 @@ typedef struct {
 
     /* Complex SSM / RoPE angles (Mamba-3 §3.2) */
     float *theta;         /* [state_size/2] — learned rotation angles per pair */
+
+    /* Exp-Trapezoidal discretization (Mamba-3 §3.1) */
+    MBMatrix lambda_proj; /* [1 x dim] — projects x_t -> scalar lambda_t (sigmoid -> [0,1]) */
     
     /* ConvND parameters */
     float *convnd_kernel;  /* [convnd_ndims * convnd_K * dim] */
@@ -97,6 +100,7 @@ typedef struct {
     float *g_b_C;
     float *g_delta_proj;
     float *g_theta;       /* [state_size/2] */
+    float *g_lambda_proj; /* [dim] */
 
     /* Moments (used by ADAM-based optimizers) */
     float *m_W_in;
@@ -117,6 +121,8 @@ typedef struct {
     float *v_delta_proj;
     float *m_theta;       /* [state_size/2] */
     float *v_theta;       /* [state_size/2] — only for Adam-based */
+    float *m_lambda_proj; /* [dim] */
+    float *v_lambda_proj; /* [dim] — only for Adam-based */
 } MBOptimState;
 
 /* ============================================================================
