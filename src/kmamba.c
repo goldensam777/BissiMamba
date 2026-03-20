@@ -440,6 +440,9 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
     float *g_embed = (float *)xcalloc(V * D, sizeof(float));
     float *head_T  = (float *)xcalloc(V * D, sizeof(float));
     MambaBlockWorkspace ***thread_ws = NULL;
+    MBOptimState ***thread_local_grads = NULL;
+    float **thread_g_head  = NULL;
+    float **thread_g_embed = NULL;
     int n_threads = 1;
 
     if (!g_head || !g_embed || !head_T) {
@@ -455,8 +458,17 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
     n_threads = omp_get_max_threads();
 #endif
     thread_ws = (MambaBlockWorkspace ***)xcalloc((size_t)n_threads, sizeof(*thread_ws));
+    thread_local_grads = (MBOptimState ***)xcalloc((size_t)n_threads, sizeof(*thread_local_grads));
+    thread_g_head  = (float **)xcalloc((size_t)n_threads, sizeof(float *));
+    thread_g_embed = (float **)xcalloc((size_t)n_threads, sizeof(float *));
     for (int t = 0; t < n_threads; t++) {
         thread_ws[t] = (MambaBlockWorkspace **)xcalloc(n_layers, sizeof(*thread_ws[t]));
+        thread_local_grads[t] = (MBOptimState **)xcalloc(n_layers, sizeof(*thread_local_grads[t]));
+        thread_g_head[t]  = (float *)xcalloc(D * V, sizeof(float));
+        thread_g_embed[t] = (float *)xcalloc(V * D, sizeof(float));
+        for (size_t li = 0; li < n_layers; li++) {
+            thread_local_grads[t][li] = mamba_local_grad_alloc(m->layers[li]);
+        }
         for (size_t li = 0; li < n_layers; li++) {
             thread_ws[t][li] = mamba_block_workspace_create(m->layers[li]);
             if (!thread_ws[t][li]) {
@@ -479,12 +491,14 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
         float *d_hidden = (float *)xcalloc(L * D, sizeof(float));
         float *d_buf    = (float *)xcalloc(L * D, sizeof(float));
         float *hidden_T = (float *)xcalloc(D * L, sizeof(float));
-        float *g_head_b = (float *)xcalloc(D * V, sizeof(float));
 
 #ifdef _OPENMP
         tid = omp_get_thread_num();
 #endif
         layer_ws = thread_ws[tid];
+        float *my_g_head  = thread_g_head[tid];
+        float *my_g_embed = thread_g_embed[tid];
+        MBOptimState **my_local_grads = thread_local_grads[tid];
 
 #pragma omp for schedule(dynamic)
         for (size_t b = 0; b < batch_size; b++) {
@@ -520,33 +534,45 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
             gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
 
             transpose(hidden, hidden_T, L, D);
-            memset(g_head_b, 0, D * V * sizeof(float));
-            gemm_avx2(hidden_T, dlogits, g_head_b, (long)D, (long)L, (long)V);
+            gemm_avx2(hidden_T, dlogits, my_g_head, (long)D, (long)L, (long)V);
 
-#pragma omp critical
-            {
-                for (size_t i = 0; i < D * V; i++) g_head[i] += g_head_b[i];
+            /* Backward — fully parallel, each thread writes to its own grad buffers */
+            float *dcur  = d_hidden;
+            float *dnext = d_buf;
+            for (size_t li = n_layers; li-- > 0;) {
+                memset(dnext, 0, L * D * sizeof(float));
+                mamba_backward_ws_local(m->layers[li], layer_ws[li],
+                                        dcur, &acts[li * L * D], dnext, b,
+                                        my_local_grads[li]);
+                float *tmp = dcur; dcur = dnext; dnext = tmp;
+            }
 
-                float *dcur  = d_hidden;
-                float *dnext = d_buf;
-                for (size_t li = n_layers; li-- > 0;) {
-                    memset(dnext, 0, L * D * sizeof(float));
-                    mamba_backward_ws(m->layers[li], layer_ws[li],
-                                      dcur, &acts[li * L * D], dnext, b);
-                    float *tmp = dcur; dcur = dnext; dnext = tmp;
-                }
-
-                for (size_t t = 0; t < L; t++) {
-                    float *g = &g_embed[(size_t)tok_in[t] * D];
-                    const float *d = &dcur[t * D];
-                    for (size_t j = 0; j < D; j++) g[j] += d[j];
-                }
+            for (size_t t = 0; t < L; t++) {
+                float *g = &my_g_embed[(size_t)tok_in[t] * D];
+                const float *d = &dcur[t * D];
+                for (size_t j = 0; j < D; j++) g[j] += d[j];
             }
         }
 
         free(acts); free(logits); free(probs); free(dlogits);
-        free(d_hidden); free(d_buf); free(hidden_T); free(g_head_b);
+        free(d_hidden); free(d_buf); free(hidden_T);
     }
+
+    /* Serial reduction: accumulate per-thread gradients into shared buffers */
+    for (int t = 0; t < n_threads; t++) {
+        for (size_t i = 0; i < D * V; i++) g_head[i]  += thread_g_head[t][i];
+        for (size_t i = 0; i < V * D; i++) g_embed[i] += thread_g_embed[t][i];
+        for (size_t li = 0; li < n_layers; li++) {
+            mamba_local_grad_reduce(m->layers[li], thread_local_grads[t][li]);
+            mamba_local_grad_free(thread_local_grads[t][li]);
+        }
+        free(thread_local_grads[t]);
+        free(thread_g_head[t]);
+        free(thread_g_embed[t]);
+    }
+    free(thread_local_grads);
+    free(thread_g_head);
+    free(thread_g_embed);
 
     {
         double grad_sq = sum_squares_f32(g_head, D * V)

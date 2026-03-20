@@ -211,6 +211,15 @@ void mamba_backward(MambaBlock *block, const float *dY, const float *input,
 void mamba_backward_ws(MambaBlock *block, MambaBlockWorkspace *ws,
                        const float *dY, const float *input,
                        float *d_input, size_t batch_index);
+void mamba_backward_ws_local(MambaBlock *block, MambaBlockWorkspace *ws,
+                              const float *dY, const float *input,
+                              float *d_input, size_t batch_index,
+                              MBOptimState *local_grad);
+
+/* Per-thread local gradient helpers for lock-free parallel backward */
+MBOptimState* mamba_local_grad_alloc(const MambaBlock *block);
+void          mamba_local_grad_reduce(MambaBlock *block, const MBOptimState *local);
+void          mamba_local_grad_free(MBOptimState *local);
 
 /* ============================================================================
  * Matrix Operations

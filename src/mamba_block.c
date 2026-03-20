@@ -904,6 +904,71 @@ void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
 }
 
 /* ============================================================================
+ * Per-thread local gradient helpers (for lock-free parallel backward)
+ * ============================================================================ */
+
+MBOptimState* mamba_local_grad_alloc(const MambaBlock *block) {
+    if (!block) return NULL;
+    MBOptimState *s = (MBOptimState *)calloc(1, sizeof(MBOptimState));
+    if (!s) return NULL;
+    size_t dim   = block->config.dim;
+    size_t state = block->config.state_size;
+    size_t R     = _mimo_R(&block->config);
+    size_t NR    = state * R;
+    size_t theta_size = state / 2; if (theta_size == 0) theta_size = 1;
+
+    s->g_W_in        = (float *)calloc(R * dim,    sizeof(float));
+    s->g_W_out       = (float *)calloc(dim * R,    sizeof(float));
+    s->g_A_log       = (float *)calloc(state,      sizeof(float));
+    s->g_W_B         = (float *)calloc(NR * dim,   sizeof(float));
+    s->g_W_C         = (float *)calloc(NR * dim,   sizeof(float));
+    s->g_b_B         = (float *)calloc(state * R,  sizeof(float));
+    s->g_b_C         = (float *)calloc(state * R,  sizeof(float));
+    s->g_delta_proj  = (float *)calloc(dim,        sizeof(float));
+    s->g_lambda_proj = (float *)calloc(dim,        sizeof(float));
+    s->g_theta       = (float *)calloc(theta_size, sizeof(float));
+    s->type = OPTIMIZER_SGD; /* sentinel: not used for stepping */
+    return s;
+}
+
+void mamba_local_grad_reduce(MambaBlock *block, const MBOptimState *local) {
+    if (!local) return;
+    MBOptimState *s = _find_opt(block);
+    if (!s) return;
+    size_t dim   = block->config.dim;
+    size_t state = block->config.state_size;
+    size_t R     = _mimo_R(&block->config);
+    size_t NR    = state * R;
+    size_t theta_size = state / 2; if (theta_size == 0) theta_size = 1;
+#define REDUCE(field, n) do { \
+    if (s->field && local->field) \
+        for (size_t _i = 0; _i < (n); _i++) s->field[_i] += local->field[_i]; \
+} while(0)
+    REDUCE(g_W_in,        R * dim);
+    REDUCE(g_W_out,       dim * R);
+    REDUCE(g_A_log,       state);
+    REDUCE(g_W_B,         NR * dim);
+    REDUCE(g_W_C,         NR * dim);
+    REDUCE(g_b_B,         state * R);
+    REDUCE(g_b_C,         state * R);
+    REDUCE(g_delta_proj,  dim);
+    REDUCE(g_lambda_proj, dim);
+    REDUCE(g_theta,       theta_size);
+#undef REDUCE
+}
+
+void mamba_local_grad_free(MBOptimState *local) {
+    if (!local) return;
+    free(local->g_W_in); free(local->g_W_out); free(local->g_A_log);
+    free(local->g_W_B);  free(local->g_W_C);
+    free(local->g_b_B);  free(local->g_b_C);
+    free(local->g_delta_proj);
+    free(local->g_lambda_proj);
+    free(local->g_theta);
+    free(local);
+}
+
+/* ============================================================================
  * Forward scan with storage for backward
  * ============================================================================ */
 
@@ -1028,11 +1093,12 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                                     const float *dY, const float *input_flat,
                                     float *d_input_out,
                                     const float *theta,
-                                    size_t seq_len, size_t state_size, size_t R_rank) {
+                                    size_t seq_len, size_t state_size, size_t R_rank,
+                                    MBOptimState *s_ext) {
     if (!store || !block || !ws) return;
     size_t dim = block->config.dim;
 
-    MBOptimState *s = _find_opt(block);
+    MBOptimState *s = s_ext ? s_ext : _find_opt(block);
     if (!s) return;
 
     /* MIMO: scan_out[t] ∈ R^R, adj_y ∈ R^R per timestep
@@ -1198,7 +1264,6 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
 
         /* Gradient for theta and adj_h through R(θ) */
         {
-            MBOptimState *s_opt = _find_opt(block);
             float *h_prev_vec = (t > 0) ? &store->x[((size_t)t - 1) * state_size] : NULL;
 
             for (size_t i = 0; i + 1 < state_size; i += 2) {
@@ -1208,9 +1273,9 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                 float hp1 = h_prev_vec ? h_prev_vec[i+1] : 0.0f;
                 float dr0 = d_h_rot[i], dr1 = d_h_rot[i+1];
 
-                if (theta && s_opt && s_opt->g_theta)
-                    s_opt->g_theta[i >> 1] += dr0 * (-s_val * hp0 - c * hp1)
-                                            + dr1 * (c * hp0 - s_val * hp1);
+                if (theta && s && s->g_theta)
+                    s->g_theta[i >> 1] += dr0 * (-s_val * hp0 - c * hp1)
+                                        + dr1 * (c * hp0 - s_val * hp1);
 
                 /* adj_h = R^T * d_h_rot */
                 adj_h[i]   = c * dr0 + s_val * dr1;
@@ -1223,8 +1288,7 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
 
     /* Gradient for lambda_proj: g_lambda_proj += sum_t d_lambda_t * sigmoid'(raw_t) * x_t^T */
     {
-        MBOptimState *s_opt = _find_opt(block);
-        if (s_opt && s_opt->g_lambda_proj && block->lambda_proj.data) {
+        if (s && s->g_lambda_proj && block->lambda_proj.data) {
             float lam_raw_val;
             float *lam_raw = &lam_raw_val;
             for (size_t t = 0; t < seq_len; t++) {
@@ -1234,7 +1298,7 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
                 float dsig = sig * (1.0f - sig);
                 float d_raw = scan_dlambda[t] * dsig;
                 for (size_t k = 0; k < dim; k++)
-                    s_opt->g_lambda_proj[k] += d_raw * x_t[k];
+                    s->g_lambda_proj[k] += d_raw * x_t[k];
                 /* d_input[t] += d_raw * lambda_proj  (gradient through lambda path) */
                 if (d_input_out)
                     for (size_t k = 0; k < dim; k++)
@@ -1398,10 +1462,28 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
  * Backward entrypoint
  * ============================================================================ */
 
+static void mamba_backward_ws_impl(MambaBlock *block, MambaBlockWorkspace *ws,
+                                   const float *dY, const float *input,
+                                   float *d_input, MBOptimState *s_ext);
+
 void mamba_backward_ws(MambaBlock *block, MambaBlockWorkspace *ws,
                        const float *dY, const float *input,
                        float *d_input, size_t batch_index) {
     (void)batch_index;
+    mamba_backward_ws_impl(block, ws, dY, input, d_input, NULL);
+}
+
+void mamba_backward_ws_local(MambaBlock *block, MambaBlockWorkspace *ws,
+                              const float *dY, const float *input,
+                              float *d_input, size_t batch_index,
+                              MBOptimState *local_grad) {
+    (void)batch_index;
+    mamba_backward_ws_impl(block, ws, dY, input, d_input, local_grad);
+}
+
+static void mamba_backward_ws_impl(MambaBlock *block, MambaBlockWorkspace *ws,
+                                   const float *dY, const float *input,
+                                   float *d_input, MBOptimState *s_ext) {
     size_t seq_len = block->config.seq_len;
     size_t state_size = block->config.state_size;
 
@@ -1476,7 +1558,7 @@ void mamba_backward_ws(MambaBlock *block, MambaBlockWorkspace *ws,
                                 seq_len, state_size, dim, R_rank);
 
     selective_scan_backward(&store, block, ws, dY, input, d_input,
-                            block->theta, seq_len, state_size, R_rank);
+                            block->theta, seq_len, state_size, R_rank, s_ext);
 
     free(store.x); free(store.A_diag); free(store.B_bar); free(store.u_seq);
     if (store.h_rot)  free(store.h_rot);
