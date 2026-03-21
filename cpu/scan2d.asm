@@ -33,6 +33,8 @@
 ;   [rbp-96] : h_prev2  (float, sauvegarde xmm6)
 ; ============================================================
 
+BITS 64
+
 %include "types.inc"
 %include "scan.inc"
 

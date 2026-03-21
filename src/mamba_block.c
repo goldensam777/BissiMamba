@@ -4,11 +4,11 @@
  * Core Mamba implementation: diagonal A, shared B/C vectors,
  * input-dependent delta, W_in/W_out projections, scan1d/scan2d ASM kernels.
  *
- * Part of k-mamba — uses optimatrix for compute kernels.
+ * Part of k-mamba — uses OpenBLAS for compute kernels.
  */
 
 #include "kmamba.h"
-#include "optimatrix.h"
+#include "openblas_utils.h"
 #include "mamba_scan.h"
 #ifdef KMAMBA_BUILD_CUDA
 #include "mamba_scan_cuda.h"
@@ -151,7 +151,7 @@ void mb_matrix_print(const MBMatrix *m) {
 
 void mb_matrix_vec_mult(float *out, const MBMatrix *m, const float *v) {
     if (!out || !m || !v || !m->data) return;
-    gemv_avx2(m->data, (float *)v, out, (long)m->rows, (long)m->cols);
+    gemv_rowmajor(m->data, v, out, (int)m->rows, (int)m->cols);
 }
 
 void mb_vec_add(float *y, const float *x, size_t n) {
@@ -312,8 +312,8 @@ void mb_selective_scan(float *output, float *state,
             }
         }
 
-        hadamard_avx2(A_diag_t, state, temp_state, (long)state_size);
-        hadamard_avx2(B_bar_t, (float *)u_t, state, (long)state_size);
+        hadamard(A_diag_t, state, temp_state, (long)state_size);
+        hadamard(B_bar_t, (float *)u_t, state, (long)state_size);
         mb_vec_add(state, temp_state, state_size);
 
         memcpy(&output[t * state_size], state, state_size * sizeof(float));
@@ -1150,14 +1150,14 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
     transpose_row_major(dY, dY_T, seq_len, dim);
 
     /* g_W_out += dY^T @ scan_out_R  — (dim x L) @ (L x R) → (dim x R) */
-    gemm_avx2(dY_T, scan_out, s->g_W_out,
-              (long)dim, (long)seq_len, (long)R_rank);
+    gemm_rowmajor(dY_T, scan_out, s->g_W_out,
+                  (int)dim, (int)seq_len, (int)R_rank);
 
     /* adj_y_R = dY @ W_out^T  — (L x dim) @ (dim x R) = (L x R)
      * W_out is [dim x R], W_out^T is [R x dim]. We need (L x dim) @ (dim x R).
-     * Using gemm_avx2(A, B, C, M, K, N): C[M,N] = A[M,K] @ B[K,N] */
-    gemm_avx2((float *)dY, block->W_out.data, adj_y_R,
-              (long)seq_len, (long)dim, (long)R_rank);
+     * Using gemm_rowmajor(A, B, C, M, K, N): C[M,N] = A[M,K] @ B[K,N] */
+    gemm_rowmajor((float *)dY, block->W_out.data, adj_y_R,
+                  (int)seq_len, (int)dim, (int)R_rank);
 
     /* From adj_y_R [L x R] and BCNorm'd C_t [N*R], compute adj_y [L x N] = C_t @ adj_y_R_t:
      * adj_y[t,n] = sum_r C_t[n,r] * adj_y_R[t,r]    (adjoint of y_t = C_t^T @ h_t) */
@@ -1375,8 +1375,8 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
         float *dC_seq_T = (float *)malloc(NR * seq_len * sizeof(float));
         if (dC_seq_T) {
             transpose_row_major(dC_seq, dC_seq_T, seq_len, NR);
-            gemm_avx2(dC_seq_T, (float *)input_flat, s->g_W_C,
-                      (long)NR, (long)seq_len, (long)dim);
+            gemm_rowmajor(dC_seq_T, (float *)input_flat, s->g_W_C,
+                          (int)NR, (int)seq_len, (int)dim);
             free(dC_seq_T);
         }
     }
@@ -1387,8 +1387,8 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
         float *dB_seq_T = (float *)malloc(NR * seq_len * sizeof(float));
         if (dB_seq_T) {
             transpose_row_major(dB_seq, dB_seq_T, seq_len, NR);
-            gemm_avx2(dB_seq_T, (float *)input_flat, s->g_W_B,
-                      (long)NR, (long)seq_len, (long)dim);
+            gemm_rowmajor(dB_seq_T, (float *)input_flat, s->g_W_B,
+                          (int)NR, (int)seq_len, (int)dim);
             free(dB_seq_T);
         }
     }
@@ -1400,10 +1400,10 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
      * dC_seq [L x N*R] @ W_C [N*R x dim] → [L x dim]  (+=) */
     if (d_input_out) {
         size_t NR = state_size * R_rank;
-        gemm_avx2(dB_seq, block->W_B.data, d_input_out,
-                  (long)seq_len, (long)NR, (long)dim);
-        gemm_avx2(dC_seq, block->W_C.data, d_input_out,
-                  (long)seq_len, (long)NR, (long)dim);
+        gemm_rowmajor(dB_seq, block->W_B.data, d_input_out,
+                      (int)seq_len, (int)NR, (int)dim);
+        gemm_rowmajor(dC_seq, block->W_C.data, d_input_out,
+                      (int)seq_len, (int)NR, (int)dim);
     }
 
     /* Delta and W_in gradients
@@ -1441,13 +1441,13 @@ static void selective_scan_backward(ForwardStore *store, MambaBlock *block,
 
     /* g_W_in += scan_out^T @ input  — [R x L] @ [L x dim] → [R x dim] */
     transpose_row_major(scan_out, contrib_T, seq_len, R_rank);
-    gemm_avx2(contrib_T, (float *)input_flat, s->g_W_in,
-              (long)R_rank, (long)seq_len, (long)dim);
+    gemm_rowmajor(contrib_T, (float *)input_flat, s->g_W_in,
+                  (int)R_rank, (int)seq_len, (int)dim);
 
     /* d_input = scan_out @ W_in  — [L x R] @ [R x dim] → [L x dim] */
     if (d_input_out) {
-        gemm_avx2(scan_out, block->W_in.data, d_input_out,
-                  (long)seq_len, (long)R_rank, (long)dim);
+        gemm_rowmajor(scan_out, block->W_in.data, d_input_out,
+                      (int)seq_len, (int)R_rank, (int)dim);
         /* Residual gradient: d_input += dY (identity path) */
         for (size_t i = 0; i < seq_len * dim; i++)
             d_input_out[i] += dY[i];

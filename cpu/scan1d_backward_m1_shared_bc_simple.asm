@@ -23,6 +23,8 @@
 ;   [p+48]  h0      [D]/NULL    [p+112] L
 ;   [p+56]  h       [L*D]       [p+120] D
 
+BITS 64
+
 %include "types.inc"
 
 extern calloc

@@ -3,10 +3,56 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "optimatrix.h"
 #include "scan.h"
 #include "scan_nd.h"
 #include "wavefront_nd.h"
+
+/* ============================================================================
+ * Optimizer Config (previously from optimatrix.h)
+ * ============================================================================ */
+typedef struct {
+    float lr;
+    float mu;
+    float beta2;
+    float eps;
+    float clip_norm;
+    float weight_decay;
+} MBOptimConfig;
+
+/* ============================================================================
+ * ConvND Types (previously from optimatrix.h)
+ * ============================================================================ */
+typedef struct {
+    long ndims;
+    long total_floats;
+    float **inter;       /* [ndims+1][total_floats] intermediates */
+} ConvNDWorkspace;
+
+typedef struct {
+    float *input;        /* Input tensor (read/write for backward) */
+    const float *kernel; /* Kernel [ndims * K * D] */
+    const float *bias;   /* Bias [D] or NULL */
+    float *output;       /* Output tensor */
+    float *dy;           /* Gradient w.r.t. output (for backward) */
+    float *dinput;       /* Gradient w.r.t. input (output) */
+    float *dkernel;      /* Gradient w.r.t. kernel [ndims * K * D] */
+    float *dbias;        /* Gradient w.r.t. bias [D] or NULL */
+    const long *dims;    /* Shape [ndims] */
+    long ndims;          /* Number of dimensions */
+    long D;              /* Depth/channels */
+    long K;              /* Kernel size */
+} ConvNDParams;
+
+typedef enum {
+    CONVND_FORWARD = 1,   /* Forward pass only */
+    CONVND_BACKWARD = 2,  /* Backward pass only */
+    CONVND_COMPLETE = 3   /* Forward + Backward */
+} ConvNDMode;
+
+/* ConvND API */
+ConvNDWorkspace* convnd_workspace_create(const ConvNDParams *p);
+void convnd_workspace_free(ConvNDWorkspace *ws);
+void convnd(ConvNDParams *p, ConvNDMode mode, ConvNDWorkspace *ws);
 
 /* ============================================================================
  * Basic Matrix type

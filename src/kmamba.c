@@ -1,4 +1,5 @@
 #include "../include/kmamba.h"
+#include "openblas_utils.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -323,8 +324,8 @@ int kmamba_forward(KMamba *m, const uint8_t *tokens, float *logits_out) {
         const float *tmp = cur; cur = next; next = (float *)tmp;
     }
 
-    gemm_avx2((float *)cur, m->head, logits_out,
-              (long)L, (long)D, (long)m->cfg.vocab_size);
+    gemm_rowmajor((float *)cur, m->head, logits_out,
+                  (int)L, (int)D, (int)m->cfg.vocab_size);
 
     free(buf0);
     free(buf1);
@@ -358,7 +359,7 @@ float kmamba_train_step(KMamba *m, const uint8_t *tokens_plus1) {
         mamba_block_forward(m->layers[i], &acts[(i + 1) * L * D], &acts[i * L * D], 1);
 
     const float *hidden = &acts[m->cfg.n_layers * L * D];
-    gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
+    gemm_rowmajor((float *)hidden, m->head, logits, (int)L, (int)D, (int)V);
 
     float loss = 0.0f;
     float invL = 1.0f / (float)L;
@@ -375,10 +376,10 @@ float kmamba_train_step(KMamba *m, const uint8_t *tokens_plus1) {
     loss *= invL;
 
     transpose(m->head, head_T, D, V);
-    gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
+    gemm_rowmajor(dlogits, head_T, d_hidden, (int)L, (int)V, (int)D);
 
     transpose(hidden, hidden_T, L, D);
-    gemm_avx2(hidden_T, dlogits, g_head, (long)D, (long)L, (long)V);
+    gemm_rowmajor(hidden_T, dlogits, g_head, (int)D, (int)L, (int)V);
 
     for (size_t i = 0; i < m->cfg.n_layers; i++) mamba_zero_grads(m->layers[i]);
 
@@ -516,7 +517,7 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
             const float *hidden = &acts[n_layers * L * D];
             memset(logits, 0, L * V * sizeof(float));
             memset(dlogits, 0, L * V * sizeof(float));
-            gemm_avx2((float *)hidden, m->head, logits, (long)L, (long)D, (long)V);
+            gemm_rowmajor((float *)hidden, m->head, logits, (int)L, (int)D, (int)V);
 
             float sample_loss = 0.0f;
             for (size_t t = 0; t < L; t++) {
@@ -531,10 +532,10 @@ float kmamba_train_batch(KMamba *m, const uint8_t *batch_tokens, size_t batch_si
             total_loss += sample_loss * invL;
 
             memset(d_hidden, 0, L * D * sizeof(float));
-            gemm_avx2(dlogits, head_T, d_hidden, (long)L, (long)V, (long)D);
+            gemm_rowmajor(dlogits, head_T, d_hidden, (int)L, (int)V, (int)D);
 
             transpose(hidden, hidden_T, L, D);
-            gemm_avx2(hidden_T, dlogits, my_g_head, (long)D, (long)L, (long)V);
+            gemm_rowmajor(hidden_T, dlogits, my_g_head, (int)D, (int)L, (int)V);
 
             /* Backward — fully parallel, each thread writes to its own grad buffers */
             float *dcur  = d_hidden;

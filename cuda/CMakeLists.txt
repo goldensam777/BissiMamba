@@ -18,7 +18,6 @@ add_library(k-mamba-cuda STATIC ${CUDA_SRCS})
 target_include_directories(k-mamba-cuda
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../optimatrix/include>
 )
 
 target_compile_options(k-mamba-cuda PRIVATE
@@ -29,6 +28,5 @@ target_compile_options(k-mamba-cuda PRIVATE
 
 # Link CUDA libraries
 target_link_libraries(k-mamba-cuda
-    PUBLIC  optimatrix-cuda
-    PRIVATE cuda cudart cublas
+    PRIVATE cuda cudart cublas optimatrix-cuda
 )

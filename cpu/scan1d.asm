@@ -24,6 +24,8 @@
 ;   [rbp-64] : dm_base (long, d*M)
 ; ============================================================
 
+BITS 64
+
 %include "types.inc"
 %include "scan.inc"
 

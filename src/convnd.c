@@ -2,12 +2,12 @@
  * convnd.c — Convolution ND separable depthwise : Forward + Backward
  *
  * Architecture :
- *   Le calcul vectorise est dans conv1d_avx2.asm (noyau AVX2).
+ *   Uses manual C implementation for depthwise conv1d (replaces optimatrix).
  *   Ici, on orchestre la chaine de Conv1D axe par axe.
  *
  *   Forward  : Conv1D du dernier axe au premier, puis biais.
  *   Backward : backprop a travers chaque axe en ordre inverse,
- *              avec intermediaires sauvegardes (workspace) ou recomputes.
+ *              avec intermediaires sauvegardees (workspace) ou recomputees.
  *
  * API unifiee :
  *   convnd(p, CONVND_FORWARD,  ws)  — forward, sauvegarde inter dans ws
@@ -22,7 +22,46 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include "optimatrix.h"
+#include <stddef.h>
+
+/* ============================================================
+ * Type Definitions (previously from optimatrix.h)
+ * ============================================================ */
+
+typedef struct {
+    const float *input;   /* [L, D] */
+    const float *kernel;  /* [K, D] */
+    const float *bias;    /* [D] or NULL */
+    float *output;        /* [L, D] */
+    long L, D, K;
+} Conv1DParams;
+
+typedef struct {
+    float *input;        /* Input tensor (read/write for backward) */
+    const float *kernel; /* Kernel [ndims * K * D] */
+    const float *bias;   /* Bias [D] or NULL */
+    float *output;       /* Output tensor */
+    float *dy;           /* Gradient w.r.t. output (for backward) */
+    float *dinput;       /* Gradient w.r.t. input (output) */
+    float *dkernel;      /* Gradient w.r.t. kernel [ndims * K * D] */
+    float *dbias;        /* Gradient w.r.t. bias [D] or NULL */
+    const long *dims;    /* Shape [ndims] */
+    long ndims;          /* Number of dimensions */
+    long D;              /* Depth/channels */
+    long K;              /* Kernel size */
+} ConvNDParams;
+
+typedef struct {
+    long ndims;
+    long total_floats;
+    float **inter;       /* [ndims+1][total_floats] intermediates */
+} ConvNDWorkspace;
+
+typedef enum {
+    CONVND_FORWARD = 1,   /* Forward pass only */
+    CONVND_BACKWARD = 2,  /* Backward pass only */
+    CONVND_COMPLETE = 3   /* Forward + Backward */
+} ConvNDMode;
 
 /* ============================================================
  * Helpers
@@ -33,6 +72,38 @@ static long product(const long *arr, long n) {
     long p = 1;
     for (long i = 0; i < n; i++) p *= arr[i];
     return p;
+}
+
+/* ============================================================
+ * Manual Conv1D Implementation (replaces optimatrix conv1d_depthwise_avx2)
+ * ============================================================
+ *
+ * Depthwise causal convolution: each channel convolved independently.
+ * output[t,d] = sum_{k=0}^{K-1} input[t-K+1+k, d] * kernel[k,d]
+ * with zero padding for t-K+1+k < 0.
+ */
+
+static void conv1d_depthwise_manual(const Conv1DParams *p) {
+    if (!p || !p->input || !p->kernel || !p->output || p->L <= 0 || p->D <= 0 || p->K <= 0)
+        return;
+
+    long L = p->L, D = p->D, K = p->K;
+    const float *in = p->input;
+    const float *kern = p->kernel;
+    float *out = p->output;
+
+    for (long t = 0; t < L; t++) {
+        for (long d = 0; d < D; d++) {
+            float sum = 0.0f;
+            for (long k = 0; k < K; k++) {
+                long src_t = t - K + 1 + k;
+                if (src_t >= 0) {
+                    sum += in[src_t * D + d] * kern[k * D + d];
+                }
+            }
+            out[t * D + d] = sum + (p->bias ? p->bias[d] : 0.0f);
+        }
+    }
 }
 
 /* ============================================================
@@ -58,7 +129,7 @@ static void apply_conv1d_axis(const float *src, float *dst, const float *kernel,
                 dst + b * L * D,
                 L, D, K
             };
-            conv1d_depthwise_avx2(&cp);
+            conv1d_depthwise_manual(&cp);
         }
     } else {
         /* Axe stride : gather, conv1d, scatter */
@@ -77,7 +148,7 @@ static void apply_conv1d_axis(const float *src, float *dst, const float *kernel,
                     line_in, (float *)kernel, NULL, line_out,
                     L, D, K
                 };
-                conv1d_depthwise_avx2(&cp);
+                conv1d_depthwise_manual(&cp);
 
                 /* Scatter : remettre en place */
                 for (long t = 0; t < L; t++) {
@@ -241,13 +312,13 @@ static void convnd_do_forward(ConvNDParams *p, ConvNDWorkspace *ws) {
     long tf = product(p->dims, n) * p->D;  /* total floats */
     size_t tf_bytes = (size_t)tf * sizeof(float);
 
-    /* 1D : appel direct au noyau ASM */
+    /* 1D : appel direct au noyau C */
     if (n == 1) {
         Conv1DParams cp = {
             p->input, p->kernel, p->bias, p->output,
             p->dims[0], p->D, p->K
         };
-        conv1d_depthwise_avx2(&cp);
+        conv1d_depthwise_manual(&cp);
 
         /* Sauvegarder dans ws pour un eventuel backward */
         if (ws) {
