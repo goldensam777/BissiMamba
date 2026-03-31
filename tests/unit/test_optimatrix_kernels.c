@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <time.h>
 #include "optimatrix.h"
+#include "cpu_kernels.h"
 
 /* ============================================================
  * Utilitaires de test

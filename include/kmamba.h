@@ -7,55 +7,13 @@
 #include "scan_nd.h"
 #include "wavefront_plan.h"
 #include "wavefront_nd.h"
+#include "../optimatrix/include/optimatrix.h"
 
 #define KMAMBA_MAX_NDIMS 8
 
 /* ============================================================================
- * Optimizer Config (previously from optimatrix.h)
+ * ConvND Types (Extended API for k-mamba)
  * ============================================================================ */
-typedef struct {
-    float lr;
-    float mu;
-    float beta2;
-    float eps;
-    float clip_norm;
-    float weight_decay;
-} MBOptimConfig;
-
-/* ============================================================================
- * ConvND Types (previously from optimatrix.h)
- * ============================================================================ */
-typedef struct {
-    long ndims;
-    long total_floats;
-    float **inter;       /* [ndims+1][total_floats] intermediates */
-} ConvNDWorkspace;
-
-typedef struct {
-    float *input;        /* Input tensor (read/write for backward) */
-    const float *kernel; /* Kernel [ndims * K * D] */
-    const float *bias;   /* Bias [D] or NULL */
-    float *output;       /* Output tensor */
-    float *dy;           /* Gradient w.r.t. output (for backward) */
-    float *dinput;       /* Gradient w.r.t. input (output) */
-    float *dkernel;      /* Gradient w.r.t. kernel [ndims * K * D] */
-    float *dbias;        /* Gradient w.r.t. bias [D] or NULL */
-    const long *dims;    /* Shape [ndims] */
-    long ndims;          /* Number of dimensions */
-    long D;              /* Depth/channels */
-    long K;              /* Kernel size */
-} ConvNDParams;
-
-typedef enum {
-    CONVND_FORWARD = 1,   /* Forward pass only */
-    CONVND_BACKWARD = 2,  /* Backward pass only */
-    CONVND_COMPLETE = 3   /* Forward + Backward */
-} ConvNDMode;
-
-/* ConvND API */
-ConvNDWorkspace* convnd_workspace_create(const ConvNDParams *p);
-void convnd_workspace_free(ConvNDWorkspace *ws);
-void convnd(ConvNDParams *p, ConvNDMode mode, ConvNDWorkspace *ws);
 
 /* Full ConvND depthwise reference API.
  * Kernel layout is [K^ndims, D] with the last axis varying fastest.
@@ -115,56 +73,6 @@ typedef struct {
 } MBConfig;
 
 /* ============================================================================
- * MambaBlock - Single SSM layer
- * ============================================================================ */
-typedef struct {
-    MBConfig config;
-    
-    /* Parameters */
-    MBMatrix W_in;        /* [R x dim]     — projects x_t → u_t ∈ R^R  (MIMO input) */
-    MBMatrix W_out;       /* [dim x R]     — projects y_t ∈ R^R → output ∈ R^dim */
-    MBMatrix A_log;       /* [state_size]  — diagonal log(-A), always negative */
-    MBMatrix W_B;         /* [N*R x dim]   — data-dependent B∈R^{NxR} projection */
-    MBMatrix W_C;         /* [N*R x dim]   — data-dependent C∈R^{NxR} projection */
-    MBMatrix delta_proj;  /* [1 x dim] */
-
-    /* BCNorm biases (Mamba-3) */
-    float *b_B;           /* [state_size] — bias after RMSNorm(W_B·x) */
-    float *b_C;           /* [state_size] — bias after RMSNorm(W_C·x) */
-
-    /* Complex SSM / RoPE angles (Mamba-3 §3.2) */
-    float *theta;         /* [state_size/2] — learned rotation angles per pair */
-
-    /* Exp-Trapezoidal discretization (Mamba-3 §3.1) */
-    MBMatrix lambda_proj; /* [1 x dim] — projects x_t -> scalar lambda_t (sigmoid -> [0,1]) */
-
-    /* Shared ND execution topology reused by scanND / convND. */
-    KMWavefrontPlan *wavefront_plan;
-    
-    /* ConvND parameters */
-    float *convnd_kernel;  /* [convnd_ndims * convnd_K * dim] */
-    float *convnd_bias;    /* [dim] */
-    ConvNDWorkspace *convnd_ws;
-    
-    /* Runtime buffers */
-    float *hidden;         /* [state_size] — SSM state at last timestep */
-    float *delta;          /* [seq_len] */
-    float *scan_B;         /* [seq_len x N*R] — normalized B_t columns, R=mimo_rank */
-    float *scan_C;         /* [seq_len x N*R] — normalized C_t columns, R=mimo_rank */
-    float *scan_delta;     /* [seq_len x state_size] */
-    float *scan_h;         /* [state_size] */
-} MambaBlock;
-
-typedef struct {
-    float *hidden;         /* [state_size] */
-    float *delta;          /* [seq_len] */
-    float *scan_B;         /* [seq_len x N*R] */
-    float *scan_C;         /* [seq_len x N*R] */
-    float *scan_delta;     /* [seq_len x state_size] */
-    float *scan_h;         /* [state_size] */
-} MambaBlockWorkspace;
-
-/* ============================================================================
  * Optimizer Types
  * ============================================================================ */
 typedef enum {
@@ -173,8 +81,6 @@ typedef enum {
     OPTIMIZER_SGD,           /* Vanilla SGD with momentum */
     OPTIMIZER_ADAMW          /* Standard AdamW */
 } OptimizerType;
-
-/* MBOptimConfig est défini dans optimatrix.h */
 
 /* ============================================================================
  * Optimizer State (modular)
@@ -217,6 +123,58 @@ typedef struct {
     float *m_lambda_proj; /* [dim] */
     float *v_lambda_proj; /* [dim] — only for Adam-based */
 } MBOptimState;
+
+typedef struct {
+    float *hidden;         /* [state_size] */
+    float *delta;          /* [seq_len] */
+    float *scan_B;         /* [seq_len x N*R] */
+    float *scan_C;         /* [seq_len x N*R] */
+    float *scan_delta;     /* [seq_len x state_size] */
+    float *scan_h;         /* [state_size] */
+} MambaBlockWorkspace;
+
+/* ============================================================================
+ * MambaBlock - Single SSM layer
+ * ============================================================================ */
+typedef struct {
+    MBConfig config;
+    
+    /* Parameters */
+    MBMatrix W_in;        /* [R x dim]     — projects x_t → u_t ∈ R^R  (MIMO input) */
+    MBMatrix W_out;       /* [dim x R]     — projects y_t ∈ R^R → output ∈ R^dim */
+    MBMatrix A_log;       /* [state_size]  — diagonal log(-A), always negative */
+    MBMatrix W_B;         /* [N*R x dim]   — data-dependent B∈R^{NxR} projection */
+    MBMatrix W_C;         /* [N*R x dim]   — data-dependent C∈R^{NxR} projection */
+    MBMatrix delta_proj;  /* [1 x dim] */
+
+    /* BCNorm biases (Mamba-3) */
+    float *b_B;           /* [state_size] — bias after RMSNorm(W_B·x) */
+    float *b_C;           /* [state_size] — bias after RMSNorm(W_C·x) */
+
+    /* Complex SSM / RoPE angles (Mamba-3 §3.2) */
+    float *theta;         /* [state_size/2] — learned rotation angles per pair */
+
+    /* Exp-Trapezoidal discretization (Mamba-3 §3.1) */
+    MBMatrix lambda_proj; /* [1 x dim] — projects x_t -> scalar lambda_t (sigmoid -> [0,1]) */
+
+    /* Shared ND execution topology reused by scanND / convND. */
+    KMWavefrontPlan *wavefront_plan;
+    
+    /* ConvND parameters */
+    float *convnd_kernel;  /* [convnd_ndims * convnd_K * dim] */
+    float *convnd_bias;    /* [dim] */
+    ConvNDWorkspace *convnd_ws;
+    
+    /* Runtime buffers */
+    float *hidden;         /* [state_size] — SSM state at last timestep */
+    float *delta;          /* [seq_len] */
+    float *scan_B;         /* [seq_len x N*R] — normalized B_t columns, R=mimo_rank */
+    float *scan_C;         /* [seq_len x N*R] — normalized C_t columns, R=mimo_rank */
+    float *scan_delta;     /* [seq_len x state_size] */
+    float *scan_h;         /* [state_size] */
+
+    MBOptimState *opt_state; /* Optimizer state (Adam, Muon, etc.) */
+} MambaBlock;
 
 /* ============================================================================
  * KMamba Configuration

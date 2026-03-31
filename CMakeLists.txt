@@ -10,10 +10,12 @@ option(KMAMBA_BUILD_EXAMPLES "Build examples" OFF)
 option(KMAMBA_BUILD_CPU "Build CPU backend" ON)
 option(KMAMBA_BUILD_CUDA "Build CUDA backend" OFF)
 
-# Add optimatrix when CUDA or tests need its exported targets
-if(KMAMBA_BUILD_CUDA OR KMAMBA_BUILD_TESTS)
-    add_subdirectory(optimatrix)
+if(NOT KMAMBA_BUILD_CUDA)
+    set(OM_BACKEND "cpu" CACHE STRING "Backend CPU only" FORCE)
 endif()
+
+# Add optimatrix
+add_subdirectory(optimatrix)
 
 # NASM flags
 set(CMAKE_ASM_NASM_COMPILE_OBJECT "<CMAKE_ASM_NASM_COMPILER> <INCLUDES> <FLAGS> -o <OBJECT> <SOURCE>")
@@ -52,6 +54,7 @@ target_include_directories(k-mamba
 
 target_link_libraries(k-mamba
     PUBLIC ${OpenBLAS_LIBRARIES}
+    PUBLIC optimatrix::optimatrix
 )
 
 target_include_directories(k-mamba
