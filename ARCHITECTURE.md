@@ -107,7 +107,7 @@ void convnd(ConvNDParams *p, ConvNDMode mode);
 
 ---
 
-## Dualité ScanND/ConvND (même squelette)
+## Unification ScanND/ConvND (même squelette)
 
 | Aspect | ScanND | ConvND |
 |--------|--------|--------|
@@ -117,7 +117,7 @@ void convnd(ConvNDParams *p, ConvNDMode mode);
 | **Parallélisme** | Intra-niveau OpenMP | Intra-niveau OpenMP |
 | **Plan** | `KMWavefrontPlan` | `KMWavefrontPlan` (partagé) |
 
-**Thèse** : Même squelette topologique, deux opérateurs complémentaires.
+**Thèse** : Même squelette topologique unifié, deux opérateurs complémentaires.
 
 ---
 
