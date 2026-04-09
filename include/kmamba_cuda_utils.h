@@ -52,6 +52,16 @@ KMambaBackend kmamba_backend_select(void);
 #define KMAMBA_IF_CUDA(expr) ((void)0)
 #endif
 
+/* Auto-initialize backend and get selection in one call.
+ * Usage: KMAMBA_AUTO_BACKEND(); then use kmamba_backend_select() */
+#define KMAMBA_AUTO_BACKEND() \
+    static int _kmamba_backend_init_done = 0; \
+    if (!_kmamba_backend_init_done) { \
+        kmamba_backend_init(); \
+        _kmamba_backend_init_done = 1; \
+    } \
+    KMambaBackend backend = kmamba_backend_select()
+
 #ifdef __cplusplus
 }
 #endif

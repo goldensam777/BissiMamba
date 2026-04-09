@@ -477,15 +477,8 @@ static int _mamba_block_forward_gpu(MambaBlock *block, float *output, const floa
 #endif
 
 void mamba_block_forward(MambaBlock *block, float *output, const float *input, size_t batch_size) {
-    /* Initialize backend on first call */
-    static int backend_initialized = 0;
-    if (!backend_initialized) {
-        kmamba_backend_init();
-        backend_initialized = 1;
-    }
-    
     /* Automatic GPU dispatch if available */
-    KMambaBackend backend = kmamba_backend_select();
+    KMAMBA_AUTO_BACKEND();
     
 #ifdef KMAMBA_BUILD_CUDA
     if (backend == KMAMBA_BACKEND_GPU) {

@@ -123,15 +123,8 @@ int scannd_ref(ScanNDParams *p) {
 int scannd(ScanNDParams *p) {
     if (!scannd_validate(p)) return -1;
 
-    /* Initialize backend on first call */
-    static int backend_initialized = 0;
-    if (!backend_initialized) {
-        kmamba_backend_init();
-        backend_initialized = 1;
-    }
-
     /* Automatic GPU dispatch if available */
-    KMambaBackend backend = kmamba_backend_select();
+    KMAMBA_AUTO_BACKEND();
 
 #ifdef KMAMBA_BUILD_CUDA
     if (backend == KMAMBA_BACKEND_GPU) {
