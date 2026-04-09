@@ -70,7 +70,7 @@ static void convnd_make_row_major_strides(const long *dims, long ndims, long *st
 /* ── Device helpers ────────────────────────────────────────── */
 
 __device__ static void d_unravel_index(long linear, const long *dims, long ndims,
-                                        long *strides, long *coords) {
+                                        const long *strides, long *coords) {
     for (long axis = ndims; axis-- > 0;) {
         coords[axis] = linear / strides[axis];
         linear %= strides[axis];
@@ -261,6 +261,7 @@ int om_convnd_forward(ConvNDParams *p) {
     long *d_dims = NULL;
     long *d_strides = NULL;
     long *h_strides = NULL;
+    long kernel_volume = 0;
     int rc = -1;
 
     if (!convnd_validate_params(p)) return -1;
@@ -296,9 +297,8 @@ int om_convnd_forward(ConvNDParams *p) {
                                  (size_t)p->ndims * sizeof(long),
                                  cudaMemcpyHostToDevice));
 
-    long kernel_volume = convnd_power_long(p->K, p->ndims);
-
     /* Process each level */
+    kernel_volume = convnd_power_long(p->K, p->ndims);
     for (long level = 0; level <= plan->max_level; level++) {
         long level_size = km_wavefront_plan_level_size(plan, level);
         if (level_size <= 0) continue;

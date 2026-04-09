@@ -32,7 +32,8 @@ CUDA_SRCS = cuda/scan1d.cu \
             cuda/scan_nd.cu \
             cuda/convnd.cu \
             cuda/mamba_scan.cu \
-            cuda/mamba_block.cu
+            cuda/mamba_block.cu \
+            cuda/kmamba_cuda_utils.cu
 
 CUDA_OBJS = $(CUDA_SRCS:.cu=.cu.o)
 CUDA_TARGET = libkmamba_cuda.a

@@ -459,18 +459,11 @@ void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *o
     free(z); free(u_seq); free(y_rank); free(y_proj);
 }
 
-/* Internal GPU forward implementation */
+/* Internal GPU forward implementation - stub for now */
 #ifdef KMAMBA_BUILD_CUDA
 static int _mamba_block_forward_gpu(MambaBlock *block, float *output, const float *input, size_t batch_size) {
-    /* GPU implementation using cuda/mamba_block.cu functions */
-    extern void gpu_block_forward_auto(cublasHandle_t handle,
-        const float *W_in, const float *W_out, const float *A_log,
-        const float *W_B, const float *W_C, const float *delta_proj,
-        const float *theta, const float *lambda_proj,
-        const float *x, float *y,
-        int L, int state, int dim, int R);
-    
     /* TODO: Full GPU implementation with device memory management */
+    /* This will call cuda/mamba_block.cu functions once fully implemented */
     (void)block; (void)output; (void)input; (void)batch_size;
     return -1; /* Not yet fully implemented, fall back to CPU */
 }

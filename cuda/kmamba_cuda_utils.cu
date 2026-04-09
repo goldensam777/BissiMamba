@@ -1,29 +1,64 @@
-/* kmamba_cuda_utils.c — CUDA runtime detection and automatic dispatch */
+/* kmamba_cuda_utils.cu — CUDA runtime implementation */
 
-#include <stdlib.h>
-#include <string.h>
+#include <cuda_runtime.h>
 #include <stdio.h>
 #include "kmamba_cuda_utils.h"
 
-/* Global backend preference */
+/* Global backend preference (defined here for CUDA compilation) */
 KMambaBackend kmamba_backend_preference = KMAMBA_BACKEND_AUTO;
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Runtime GPU Detection
  * ═══════════════════════════════════════════════════════════════════════ */
 
-#ifdef KMAMBA_BUILD_CUDA
+int kmamba_cuda_available(void) {
+    cudaError_t err;
+    int device_count = 0;
+    
+    /* Try to initialize CUDA runtime */
+    err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0) {
+        return 0;
+    }
+    
+    /* Check if we can set a device */
+    err = cudaSetDevice(0);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+    
+    /* Verify device properties */
+    cudaDeviceProp prop;
+    err = cudaGetDeviceProperties(&prop, 0);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+    
+    /* Minimum compute capability check (sm_50 = Maxwell) */
+    if (prop.major < 5) {
+        fprintf(stderr, "[k-mamba] Warning: GPU compute capability %d.%d too old (need >= 5.0)\n",
+                prop.major, prop.minor);
+        return 0;
+    }
+    
+    return 1;
+}
 
-/* CUDA implementation is in cuda/kmamba_cuda_utils.cu */
-/* This prevents gcc from trying to compile CUDA code */
+int kmamba_cuda_device_count(void) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+        return 0;
+    }
+    return count;
+}
 
-#else /* !KMAMBA_BUILD_CUDA */
-
-int kmamba_cuda_available(void) { return 0; }
-int kmamba_cuda_device_count(void) { return 0; }
-int kmamba_cuda_current_device(void) { return -1; }
-
-#endif /* KMAMBA_BUILD_CUDA */
+int kmamba_cuda_current_device(void) {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return -1;
+    }
+    return device;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Backend Configuration
