@@ -34,6 +34,11 @@ typedef struct {
     float dt_min;
     float dt_max;
 
+    /* Mixed precision configuration for 1B+ models */
+    int use_fp16;       /* 1 = use FP16 (Tensor Cores), 0 = FP32 (default) */
+    int use_bf16;       /* 1 = use BF16 (better stability than FP16), 0 = FP32 */
+    float loss_scale;   /* Loss scaling for FP16 gradient stability (default 65536.0f) */
+
     /* Shared ND topology for scanND / convND.
      * spatial_ndims == 0 means the implicit 1D shape [seq_len]. */
     long   spatial_ndims;
@@ -199,6 +204,19 @@ typedef struct {
     float   last_grad_norm;
     float   last_grad_over_clip;
     int     last_grad_would_clip;
+
+#ifdef KMAMBA_BUILD_CUDA
+    /* GPU memory for fully-GPU training */
+    struct {
+        float *d_embedding;  /* [vocab_size, dim] device */
+        float *d_head;       /* [dim, vocab_size] device */
+        float *d_m_embed;    /* Adam momentum device */
+        float *d_v_embed;
+        float *d_m_head;
+        float *d_v_head;
+        int gpu_ready;       /* 1 if GPU buffers allocated */
+    } gpu;
+#endif
 } KMamba;
 
 /* ============================================================================

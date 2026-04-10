@@ -49,6 +49,9 @@ typedef struct {
     const float *delta;
     float       *h;
     float       *y;
+    /* Mamba-3 extensions: rotation angles and exp-trapezoidal lambda */
+    const float *theta;   /* [D/2] rotation angles per channel pair (may be NULL) */
+    const float *lambda;  /* [prod(dims)] per-point lambda for exp-trapezoidal (may be NULL) */
 } ScanNDParams;
 
 /* Vérifie que les pointeurs / tailles sont valides. */

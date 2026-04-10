@@ -501,9 +501,76 @@ en cause la théorie du scan ND simultané.
 
 ---
 
+## 7. Optimisations GPU — Fondements algorithmiques
+
+### 7.1 Scan parallèle (Algorithme de Blelloch)
+
+Le scan séquentiel SSM présente une dépendance temporelle stricte : $h_t = A h_{t-1} + B x_t$. L'approche naïve `<<<1,1>>>` exécute cette récurrence sur un seul thread.
+
+**Théorème (Scan parallèle work-efficient).** Il existe un algorithme parallèle pour le scan préfixe avec :
+- **Work** : $O(n \log n)$ (au lieu de $O(n)$ séquentiel)
+- **Depth** : $O(\log n)$ (au lieu de $O(n)$)
+- **Parallélisme** : exploitable sur $\Theta(n/\log n)$ processeurs
+
+**Implémentation GPU.** Chaque thread traite un bloc de séquence, avec synchronisation hiérarchique :
+1. **Up-sweep** (réduction parallèle) : calcul des sommes partielles
+2. **Down-sweep** (distribution parallèle) : propagation des préfixes
+
+Cette structure permet d'exploiter les $10^4$+ cores des GPU modernes (A100, H100).
+
+### 7.2 Précision mixte et stabilité numérique
+
+**Théorème (Loss scaling pour FP16).** Soit $g \in \mathbb{R}$ un gradient avec $|g| \ll 1$. En arithmétique FP16 (5 bits d'exposant), $g$ peut underflower à 0. Il existe un facteur de scaling $s = 2^{16} = 65536$ tel que :
+- $sg$ est représentable en FP16 sans underflow
+- La mise à jour $w \leftarrow w - \eta \cdot sg$ préservée si on rescale après
+
+**Proposition (BF16 sans scaling).** BF16 partage le même exposant 8-bit que FP32. Pour toute valeur $x$ représentable en FP32 avec $|x| \geq 2^{-126}$, $x$ est représentable en BF16 sans perte de range.
+
+*Conséquence* : BF16 ne nécessite pas de loss scaling, mais sacrifie la précision de la mantisse (7 vs 23 bits).
+
+**Trade-off computationnel.**
+| Format | Range | Précision | Loss Scaling | Tensor Cores |
+|--------|-------|-----------|--------------|--------------|
+| FP32 | $\pm 3.4 \times 10^{38}$ | 23 bits | Non | Non |
+| FP16 | $\pm 65504$ | 10 bits | **Obligatoire** | Oui (16× faster) |
+| BF16 | $\pm 3.4 \times 10^{38}$ | 7 bits | Non | Oui |
+
+### 7.3 Gradient checkpointing — Trade-off mémoire/computation
+
+**Théorème (Checkpoint optimal).** Soit un modèle avec $L$ couches, chacune produisant des activations de taille $M$. Soit $C \subseteq \{1, ..., L\}$ l'ensemble des couches checkpointées.
+
+- **Mémoire forward** : $O(|C| \cdot M)$ au lieu de $O(L \cdot M)$
+- **Computation backward** : $O(L + |C|)$ (une passe forward supplémentaire par checkpoint)
+
+**Proposition (Checkpoint uniforme optimal).** Pour un budget mémoire $B$ et $L$ couches, le placement uniforme des checkpoints avec fréquence $k = \lceil LM/B \rceil$ minimise le surcoût computationnel.
+
+**Implémentation.** Les checkpoints sauvegardent uniquement les **inputs** de chaque couche. Pendant le backward, la passe forward est **recomputée** à partir du checkpoint pour restaurer les activations intermédiaires.
+
+### 7.4 Multi-GPU scaling — Modèles de parallélisme
+
+**Data Parallelism.** Réplication des paramètres sur $G$ GPUs, partition du batch $B$ en $B/G$ sous-batchs par GPU.
+- Communication : All-reduce des gradients $O(|\theta|)$ après chaque backward
+- Scaling efficace si $B \gg G$ et computation domine communication
+
+**Pipeline Parallelism.** Partition des $L$ couches sur $G$ GPUs. GPU $g$ traite les couches $[L_g, L_{g+1})$.
+- **Bubble time** : période où certain GPUs sont idle (dépendance séquentielle)
+- **Micro-batching** : découpe du batch en $M$ micro-batchs pour réduire les bulles
+- Communication : point-to-point entre GPUs adjacents
+
+**Théorème (Optimalité pipeline).** Pour $L$ couches, $G$ GPUs, et batch size $B$, le micro-batching avec $M \geq G-1$ minimise le temps de bubble à $O((G-1)/M \cdot T_{forward})$.
+
+**Zero Dependency.** k-mamba maintient la philosophie zero-dependency : NCCL n'est pas requis. En l'absence de NCCL, la communication utilise :
+1. Peer-to-peer memory access (si disponible)
+2. cudaMemcpy device-to-device
+3. Host staging (fallback le plus lent)
+
+---
+
 ## Références
 
 - Gu and Dao (2023). Mamba: Linear-Time Sequence Modeling with Selective State Spaces.
 - Liu et al. (2024). VMamba: Visual State Space Models.
 - Li et al. (2024). Mamba-ND: Selective State Space Modeling for Multi-Dimensional Data.
 - Blelloch (1990). Prefix Sums and Their Applications.
+- Micikevicius et al. (2018). Mixed Precision Training.
+- Chen et al. (2016). Training Deep Nets with Sublinear Memory Cost (Checkpointing).

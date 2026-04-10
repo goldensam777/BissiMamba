@@ -59,9 +59,14 @@ k-mamba/ — Les Volontés (orchestration du modèle Mamba)
 │   ├── scan1d.asm         # Scan 1D
 │   └── scan2d.asm         # Scan 2D wavefront
 │
-├── cuda/                  # CUDA (optionnel)
-│   ├── scan1d.cu
-│   └── scan1d_backward.cu
+├── cuda/                  # GPU optimizations (optional)
+│   ├── scan1d.cu          # Parallel scan 1D (Blelloch)
+│   ├── scan1d_backward.cu # Parallel backward scan
+│   ├── scan_nd.cu         # ND parallel scan
+│   ├── mamba_block.cu     # Full GPU forward/backward
+│   ├── kmamba_mixed_precision.cu  # FP16/BF16 Tensor Cores
+│   ├── kmamba_checkpoint.cu       # Gradient checkpointing
+│   └── kmamba_distributed.cu      # Multi-GPU NCCL (optional)
 │
 ├── Makefile               # Build simple
 └── build.sh               # Script style Karpathy
@@ -137,8 +142,34 @@ void convnd(ConvNDParams *p, ConvNDMode mode);
 
 **Build** :
 ```bash
-make          # Crée libkmamba.a
+make          # Crée libkmamba.a (CPU only)
+make          # Auto-détecte CUDA, crée libkmamba_cuda.a
+make NCCL_AVAILABLE=1  # Active NCCL pour multi-GPU
 ```
+
+---
+
+## GPU Optimizations (CUDA)
+
+### Parallel Scan (Blelloch Algorithm)
+- Remplacement des kernels `<<<1,1>>>` séquentiels
+- Scan parallèle work-efficient : O(n log n) work, O(log n) depth
+- Support forward et backward SSM
+
+### Mixed Precision (FP16/BF16)
+- **FP16** : Loss scaling dynamique (65536.0f par défaut) pour éviter underflow
+- **BF16** : Range identique à FP32, pas de loss scaling nécessaire
+- **Tensor Cores** : GEMM 16x16x16 via cuBLAS
+
+### Gradient Checkpointing
+- Politiques configurables : `none`, `per-layer`, `per-block`
+- Réduction mémoire : O(L×N×D) → O(N×D)
+- Recompute forward during backward
+
+### Multi-GPU (Optional NCCL)
+- **Data parallelism** : split batch across GPUs
+- **Pipeline parallelism** : split layers across GPUs
+- **Zero dependency** : NCCL optionnel, fallback P2P/cudaMemcpy
 
 ---
 

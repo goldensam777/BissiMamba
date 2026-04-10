@@ -23,7 +23,7 @@ endif
 # CUDA settings if available
 ifeq ($(CUDA_AVAILABLE),1)
 CUDA_HOME ?= $(dir $(NVCC))..
-CUDA_FLAGS = -O3 -arch=sm_70 -I./include -I$(CUDA_HOME)/include
+CUDA_FLAGS = -O3 -arch=sm_70 -I./include -I$(CUDA_HOME)/include -DKMAMBA_BUILD_CUDA
 CUDA_LDFLAGS = -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 CFLAGS += -DKMAMBA_BUILD_CUDA
 
@@ -33,7 +33,10 @@ CUDA_SRCS = cuda/scan1d.cu \
             cuda/convnd.cu \
             cuda/mamba_scan.cu \
             cuda/mamba_block.cu \
-            cuda/kmamba_cuda_utils.cu
+            cuda/kmamba_cuda_utils.cu \
+            cuda/kmamba_mixed_precision.cu \
+            cuda/kmamba_checkpoint.cu \
+            cuda/kmamba_distributed.cu
 
 CUDA_OBJS = $(CUDA_SRCS:.cu=.cu.o)
 CUDA_TARGET = libkmamba_cuda.a
@@ -48,6 +51,9 @@ endif
 SRCS = src/kmamba.c \
        src/mamba_block.c \
        src/kmamba_cuda_utils.c \
+       src/kmamba_mixed_precision.c \
+       src/kmamba_checkpoint.c \
+       src/kmamba_distributed.c \
        src/km_topology.c \
        src/wavefront_nd.c \
        src/wavefront_plan.c \
@@ -133,4 +139,22 @@ ifeq ($(CUDA_AVAILABLE),1)
 	ar -t $(TARGET) | grep '\.cu\.o' || true
 endif
 
-.PHONY: all clean test check_cuda
+# Test Mamba-3 forward
+test-mamba3: $(TARGET) tests/unit/test_mamba3_forward.c
+ifeq ($(CUDA_AVAILABLE),1)
+	$(CC) $(CFLAGS) -o test_mamba3 tests/unit/test_mamba3_forward.c $(TARGET) $(LDFLAGS) $(CUDA_LDFLAGS)
+else
+	$(CC) $(CFLAGS) -o test_mamba3 tests/unit/test_mamba3_forward.c $(TARGET) $(LDFLAGS)
+endif
+	./test_mamba3
+
+# Test Mamba-3 GPU (CUDA required)
+test-mamba3-gpu: $(TARGET) tests/unit/test_mamba3_gpu.cu
+ifeq ($(CUDA_AVAILABLE),1)
+	$(NVCC) -O3 -arch=sm_70 -I./include -I$(CUDA_HOME)/include -o test_mamba3_gpu tests/unit/test_mamba3_gpu.cu $(TARGET) -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+	./test_mamba3_gpu
+else
+	@echo "SKIP: CUDA not available, cannot run GPU test"
+endif
+
+.PHONY: all clean test check_cuda test-mamba3 test-mamba3-gpu

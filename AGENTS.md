@@ -48,9 +48,13 @@ k-mamba/
 │   ├── scan1d.asm            # Scan 1D AVX2
 │   ├── scan2d.asm            # Scan 2D wavefront
 │   └── mamba_scan.c          # Dispatch CPU
-├── cuda/                     # Scan SSM CUDA (optionnel)
-│   ├── scan1d.cu
-│   └── mamba_scan.cu
+├── cuda/                     # GPU optimizations (optionnel)
+│   ├── scan1d.cu             # Parallel scan (Blelloch)
+│   ├── scan1d_backward.cu    # Backward parallel scan
+│   ├── mamba_block.cu        # Full GPU forward/backward
+│   ├── kmamba_mixed_precision.cu   # FP16/BF16 Tensor Cores
+│   ├── kmamba_checkpoint.cu        # Gradient checkpointing
+│   └── kmamba_distributed.cu       # Multi-GPU NCCL (optional)
 ├── Makefile                  # Build simple (pas de CMake)
 └── build.sh                  # Script build style Karpathy
 ```

@@ -5,8 +5,10 @@
 #include <stdio.h>
 #include "kmamba_cuda_utils.h"
 
-/* Global backend preference */
+/* Global backend preference - defined in cuda/kmamba_cuda_utils.cu when CUDA available */
+#ifndef KMAMBA_BUILD_CUDA
 KMambaBackend kmamba_backend_preference = KMAMBA_BACKEND_AUTO;
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Runtime GPU Detection
@@ -28,6 +30,9 @@ int kmamba_cuda_current_device(void) { return -1; }
 /* ═══════════════════════════════════════════════════════════════════════
  * Backend Configuration
  * ═══════════════════════════════════════════════════════════════════════ */
+
+#ifndef KMAMBA_BUILD_CUDA
+/* When CUDA is available, these functions are implemented in cuda/kmamba_cuda_utils.cu */
 
 void kmamba_backend_init(void) {
     const char *env = getenv("KMAMBA_BACKEND");
@@ -51,6 +56,7 @@ void kmamba_backend_init(void) {
     }
 }
 
+/* kmamba_backend_select is defined above */
 KMambaBackend kmamba_backend_select(void) {
     switch (kmamba_backend_preference) {
         case KMAMBA_BACKEND_CPU:
@@ -73,3 +79,4 @@ KMambaBackend kmamba_backend_select(void) {
             return KMAMBA_BACKEND_CPU;
     }
 }
+#endif /* !KMAMBA_BUILD_CUDA */

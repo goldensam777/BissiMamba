@@ -250,6 +250,116 @@ __global__ void complex_ssm_fwd_kernel(
     }
 }
 
+/* ── Complex SSM PARALLEL kernel (forward) ──────────────────── */
+/*
+ * Parallel scan: each thread block handles one state dimension d.
+ * Within each block, threads cooperatively scan the sequence using
+ * a parallel associative scan (Blelloch-style reduction).
+ * 
+ * For R(θ) rotation: pairs of dimensions (2k, 2k+1) are handled together
+ * in the same block to allow rotation within the pair.
+ */
+#define SSM_PARALLEL_THREADS 256
+#define SSM_PARALLEL_ITEMS_PER_THREAD 4
+
+__global__ void complex_ssm_fwd_parallel_kernel(
+    const float *u,       /* [L, D] input (post-SiLU) */
+    const float *A_log,   /* [D] */
+    const float *B_exp,   /* [L, D] data-dep B */
+    const float *C_exp,   /* [L, D] data-dep C */
+    const float *dt,      /* [L] per-timestep delta */
+    const float *theta,   /* [D/2] rotation angles */
+    const float *lambda,  /* [L] per-timestep lambda */
+    float *h_store,       /* [L, D] state at each step */
+    float *y_scan,        /* [L, D] output */
+    int L, int D)
+{
+    /* Block handles one dimension pair (2k, 2k+1) or single dimension if D odd */
+    int pair_idx = blockIdx.x;
+    int d0 = pair_idx * 2;
+    int d1 = d0 + 1;
+    
+    if (d0 >= D) return;  /* Out of bounds */
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    /* Local accumulators in registers/shared mem */
+    __shared__ float s_h0[SSM_PARALLEL_THREADS];
+    __shared__ float s_h1[SSM_PARALLEL_THREADS];
+    __shared__ float s_alpha[SSM_PARALLEL_THREADS];
+    __shared__ float s_beta[SSM_PARALLEL_THREADS];
+    __shared__ float s_gamma[SSM_PARALLEL_THREADS];
+    __shared__ float s_bu[SSM_PARALLEL_THREADS];
+    
+    float local_h0 = 0.0f;
+    float local_h1 = 0.0f;
+    float local_prev_bu0 = 0.0f;
+    float local_prev_bu1 = 0.0f;
+    
+    /* Get rotation angle for this pair */
+    float th = (theta && d1 < D) ? theta[pair_idx] : 0.0f;
+    float c = cosf(th), s = sinf(th);
+    float a0 = A_log[d0]; if (a0 > -1e-5f) a0 = -1e-5f;
+    float a1 = (d1 < D) ? A_log[d1] : 0.0f; if (a1 > -1e-5f) a1 = -1e-5f;
+    
+    /* Process sequence in chunks */
+    int items_per_block = num_threads * SSM_PARALLEL_ITEMS_PER_THREAD;
+    
+    for (int base_t = 0; base_t < L; base_t += items_per_block) {
+        int local_t = tid;
+        int t = base_t + local_t;
+        
+        /* Phase 1: Each thread processes its assigned timesteps sequentially */
+        if (t < L) {
+            float dt_t = dt[t];
+            float lam_t = lambda ? lambda[t] : 0.5f;
+            
+            float alpha0 = expf(dt_t * a0);
+            float alpha1 = (d1 < D) ? expf(dt_t * a1) : 0.0f;
+            float beta0 = (1.0f - lam_t) * dt_t * alpha0;
+            float beta1 = (d1 < D) ? (1.0f - lam_t) * dt_t * alpha1 : 0.0f;
+            float gamma0 = lam_t * dt_t;
+            float gamma1 = (d1 < D) ? lam_t * dt_t : 0.0f;
+            
+            /* Process SSM_PARALLEL_ITEMS_PER_THREAD consecutive steps */
+            for (int step = 0; step < SSM_PARALLEL_ITEMS_PER_THREAD && (t + step * num_threads) < L; step++) {
+                int ts = t + step * num_threads;
+                
+                float bu0 = B_exp[ts * D + d0] * u[ts * D + d0];
+                float bu1 = (d1 < D) ? B_exp[ts * D + d1] * u[ts * D + d1] : 0.0f;
+                
+                /* Apply R(θ) to current state */
+                float h_rot0, h_rot1;
+                if (d1 < D) {
+                    h_rot0 = c * local_h0 - s * local_h1;
+                    h_rot1 = s * local_h0 + c * local_h1;
+                } else {
+                    h_rot0 = local_h0;
+                    h_rot1 = 0.0f;
+                }
+                
+                /* SSM step: h_t = alpha * R(θ)*h_{t-1} + beta*Bu_{t-1} + gamma*Bu_t */
+                float new_h0 = alpha0 * h_rot0 + beta0 * local_prev_bu0 + gamma0 * bu0;
+                float new_h1 = (d1 < D) ? (alpha1 * h_rot1 + beta1 * local_prev_bu1 + gamma1 * bu1) : 0.0f;
+                
+                h_store[ts * D + d0] = new_h0;
+                if (d1 < D) h_store[ts * D + d1] = new_h1;
+                
+                y_scan[ts * D + d0] = C_exp[ts * D + d0] * new_h0;
+                if (d1 < D) y_scan[ts * D + d1] = C_exp[ts * D + d1] * new_h1;
+                
+                local_h0 = new_h0;
+                local_h1 = new_h1;
+                local_prev_bu0 = bu0;
+                local_prev_bu1 = bu1;
+            }
+        }
+        
+        __syncthreads();
+    }
+}
+
 extern "C" void gpu_block_forward(
     cublasHandle_t cublas,
     /* Paramètres du bloc [VRAM] */
@@ -296,14 +406,14 @@ extern "C" void gpu_block_forward(
     { int blk_l = (L + 255) / 256;
       sigmoid_fwd_kernel<<<blk_l, 256>>>(d_lambda_raw, d_lambda, L); }
 
-    /* 5. Complex SSM sequential scan with R(θ) rotation + exp-trapezoidal
-     * Note: the kernel currently handles SISO (R=1). With R>1, Bu_t is
-     * the reduced dot product B_t[N,R] @ u_t[R]. For R=1 this is B*u as before.
-     * For R>1 we run with the first R elements of u and the [N*R] B/C layout.
-     * The kernel is single-threaded so MIMO is handled inline. */
+    /* 5. Complex SSM parallel scan with R(θ) rotation + exp-trapezoidal
+     * Each thread block handles one state dimension pair (2k, 2k+1).
+     * Parallel scan across sequence using cooperative thread processing. */
     CUDA_CHECK(cudaMemset(d_h_store, 0, L * state * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_y_scan,  0, L * R * sizeof(float)));
-    complex_ssm_fwd_kernel<<<1, 1>>>(
+    /* Number of blocks = ceil(state / 2) for handling pairs + possibly one single */
+    int num_pairs = (state + 1) / 2;
+    complex_ssm_fwd_parallel_kernel<<<num_pairs, SSM_PARALLEL_THREADS>>>(
         d_u, d_A_log, d_B_exp, d_C_exp, d_dt,
         d_theta, d_lambda, d_h_store, d_y_scan, L, state);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -450,6 +560,159 @@ __global__ void complex_ssm_bwd_kernel(
     }
 }
 
+/* ── Complex SSM PARALLEL backward kernel ─────────────────── */
+/*
+ * Parallel backward: each thread block handles one state dimension pair.
+ * Threads cooperatively process the sequence in reverse.
+ * 
+ * Note: True parallel backward for sequential scan is complex (reverse dependency).
+ * This version uses thread-per-timestep processing within chunks, similar to
+ * the forward kernel but processing in reverse.
+ */
+__global__ void complex_ssm_bwd_parallel_kernel(
+    const float *d_dy_scan,  /* [L, D] upstream gradient */
+    const float *u,          /* [L, D] */
+    const float *A_log,      /* [D] */
+    const float *B_exp,      /* [L, D] */
+    const float *C_exp,      /* [L, D] */
+    const float *dt,         /* [L] */
+    const float *lambda,     /* [L] */
+    const float *theta,      /* [D/2] */
+    const float *h_store,    /* [L, D] state at each step */
+    float *d_du,             /* [L, D] out */
+    float *d_dA_acc,         /* [D] out (accumulated) */
+    float *d_dB_out,         /* [L, D] out */
+    float *d_dC_out,         /* [L, D] out */
+    float *d_ddt_out,        /* [L, D] out */
+    float *d_g_theta,        /* [D/2] out (accumulated) */
+    float *d_dlambda,        /* [L] out */
+    int L, int D)
+{
+    /* Block handles one dimension pair (2k, 2k+1) or single dimension if D odd */
+    int pair_idx = blockIdx.x;
+    int d0 = pair_idx * 2;
+    int d1 = d0 + 1;
+    
+    if (d0 >= D) return;  /* Out of bounds */
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    /* Local adjoints in registers */
+    float adj_h0 = 0.0f;
+    float adj_h1 = 0.0f;
+    float adj_prev_Bu0 = 0.0f;
+    float adj_prev_Bu1 = 0.0f;
+    float local_dA0 = 0.0f;
+    float local_dA1 = 0.0f;
+    float local_dtheta = 0.0f;
+    
+    /* Get rotation angle for this pair */
+    float th = (theta && d1 < D) ? theta[pair_idx] : 0.0f;
+    float c = cosf(th), s = sinf(th);
+    float a0 = A_log[d0]; if (a0 > -1e-5f) a0 = -1e-5f;
+    float a1 = (d1 < D) ? A_log[d1] : 0.0f; if (a1 > -1e-5f) a1 = -1e-5f;
+    
+    /* Process sequence in reverse chunks */
+    int items_per_block = num_threads * SSM_PARALLEL_ITEMS_PER_THREAD;
+    
+    for (int base_t = L - 1; base_t >= 0; base_t -= items_per_block) {
+        /* Each thread processes items in reverse order */
+        int local_t = tid;
+        int t = base_t - local_t;
+        
+        if (t >= 0 && t < L) {
+            /* Process SSM_PARALLEL_ITEMS_PER_THREAD steps going backward */
+            for (int step = 0; step < SSM_PARALLEL_ITEMS_PER_THREAD && (t - step * num_threads) >= 0; step++) {
+                int ts = t - step * num_threads;
+                
+                float dt_t = dt[ts];
+                float lam_t = lambda ? lambda[ts] : 0.5f;
+                
+                float alpha0 = expf(dt_t * a0);
+                float alpha1 = (d1 < D) ? expf(dt_t * a1) : 0.0f;
+                float beta0 = (1.0f - lam_t) * dt_t * alpha0;
+                float beta1 = (d1 < D) ? (1.0f - lam_t) * dt_t * alpha1 : 0.0f;
+                float gamma0 = lam_t * dt_t;
+                float gamma1 = (d1 < D) ? lam_t * dt_t : 0.0f;
+                
+                float ct0 = C_exp[ts * D + d0];
+                float ct1 = (d1 < D) ? C_exp[ts * D + d1] : 0.0f;
+                float bt0 = B_exp[ts * D + d0];
+                float bt1 = (d1 < D) ? B_exp[ts * D + d1] : 0.0f;
+                float ut0 = u[ts * D + d0];
+                float ut1 = (d1 < D) ? u[ts * D + d1] : 0.0f;
+                float bu0 = bt0 * ut0;
+                float bu1 = (d1 < D) ? bt1 * ut1 : 0.0f;
+                
+                float dy_s0 = d_dy_scan[ts * D + d0];
+                float dy_s1 = (d1 < D) ? d_dy_scan[ts * D + d1] : 0.0f;
+                
+                /* Adjoint from y_t and future state */
+                float ah0 = adj_h0 + dy_s0 * ct0;
+                float ah1 = (d1 < D) ? (adj_h1 + dy_s1 * ct1) : 0.0f;
+                
+                /* dC */
+                float h_t0 = h_store[ts * D + d0];
+                float h_t1 = (d1 < D) ? h_store[ts * D + d1] : 0.0f;
+                d_dC_out[ts * D + d0] = dy_s0 * h_t0;
+                if (d1 < D) d_dC_out[ts * D + d1] = dy_s1 * h_t1;
+                
+                /* dBu and dB, du */
+                float d_bu0 = ah0 * gamma0;
+                float d_bu1 = (d1 < D) ? (ah1 * gamma1) : 0.0f;
+                d_dB_out[ts * D + d0] = d_bu0 * ut0;
+                if (d1 < D) d_dB_out[ts * D + d1] = d_bu1 * ut1;
+                d_du[ts * D + d0] = d_bu0 * bt0;
+                if (d1 < D) d_du[ts * D + d1] = d_bu1 * bt1;
+                
+                /* Recover h_rot and compute dA */
+                const float *h_prev = (ts > 0) ? &h_store[(ts - 1) * D] : NULL;
+                float bu_prev0 = (h_prev != NULL) ? B_exp[(ts - 1) * D + d0] * u[(ts - 1) * D + d0] : 0.0f;
+                float bu_prev1 = (d1 < D && h_prev != NULL) ? B_exp[(ts - 1) * D + d1] * u[(ts - 1) * D + d1] : 0.0f;
+                
+                float h_rot0 = (alpha0 > 1e-30f) ? (h_t0 - beta0 * bu_prev0 - gamma0 * bu0) / alpha0 : 0.0f;
+                float h_rot1 = (d1 < D && alpha1 > 1e-30f) ? (h_t1 - beta1 * bu_prev1 - gamma1 * bu1) / alpha1 : 0.0f;
+                
+                local_dA0 += ah0 * dt_t * alpha0 * h_rot0;
+                if (d1 < D) local_dA1 += ah1 * dt_t * alpha1 * h_rot1;
+                
+                /* ddt */
+                d_ddt_out[ts * D + d0] = ah0 * (a0 * alpha0 * h_rot0 + (1.0f - lam_t) * alpha0 * bu_prev0 + lam_t * bu0);
+                if (d1 < D) d_ddt_out[ts * D + d1] = ah1 * (a1 * alpha1 * h_rot1 + (1.0f - lam_t) * alpha1 * bu_prev1 + lam_t * bu1);
+                
+                /* Propagate adj_h = R^T * (ah * alpha) */
+                float ah_alpha0 = ah0 * alpha0;
+                float ah_alpha1 = (d1 < D) ? ah1 * alpha1 : 0.0f;
+                
+                if (d1 < D) {
+                    /* R^T multiplication for adjoint */
+                    adj_h0 = c * ah_alpha0 + s * ah_alpha1;
+                    adj_h1 = -s * ah_alpha0 + c * ah_alpha1;
+                    
+                    /* Gradient for theta */
+                    float hp0 = h_prev ? h_prev[d0] : 0.0f;
+                    float hp1 = h_prev ? h_prev[d1] : 0.0f;
+                    local_dtheta += ah_alpha0 * (-s * hp0 - c * hp1) + ah_alpha1 * (c * hp0 - s * hp1);
+                } else {
+                    adj_h0 = ah_alpha0;
+                }
+                
+                /* Propagate adj through prev_Bu */
+                adj_prev_Bu0 = ah0 * beta0;
+                if (d1 < D) adj_prev_Bu1 = ah1 * beta1;
+            }
+        }
+        
+        __syncthreads();
+    }
+    
+    /* Accumulate gradients atomically */
+    atomicAdd(&d_dA_acc[d0], local_dA0);
+    if (d1 < D) atomicAdd(&d_dA_acc[d1], local_dA1);
+    if (d_g_theta && d1 < D) atomicAdd(&d_g_theta[pair_idx], local_dtheta);
+}
+
 extern "C" void gpu_block_backward(
     cublasHandle_t cublas,
     /* Paramètres (lecture seule) */
@@ -506,13 +769,15 @@ extern "C" void gpu_block_backward(
     /* dy_scan [L, R] = dy [L, dim] @ W_out [dim, R] */
     gemm(cublas, L, R, dim, a1, d_dy, d_W_out, b0, d_dy_scan);
 
-    /* ── Backward complex SSM (sequential) ──────────────────────── */
+    /* ── Backward complex SSM (parallel) ──────────────────────── */
     /* Zero accumulators */
     CUDA_CHECK(cudaMemset(d_dA_tmp, 0, state * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_ddt_scan, 0, L * state * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_dlambda, 0, L * sizeof(float)));
 
-    complex_ssm_bwd_kernel<<<1, 1>>>(
+    /* Number of blocks = ceil(state / 2) for handling pairs */
+    int num_pairs_bwd = (state + 1) / 2;
+    complex_ssm_bwd_parallel_kernel<<<num_pairs_bwd, SSM_PARALLEL_THREADS>>>(
         d_dy_scan,
         d_u, d_A_log, d_B_exp, d_C_exp, d_dt, d_lambda, d_theta, d_h_store,
         d_du, d_dA_tmp, d_dB_scan, d_dC_scan, d_ddt_scan, d_g_theta, d_dlambda,

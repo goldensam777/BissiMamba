@@ -54,12 +54,12 @@ MambaBlockWorkspace* mamba_block_workspace_create(const MambaBlock *block) {
     size_t N = block->config.state_size;
     size_t L = block->config.seq_len;
     size_t R = _mimo_R(&block->config);
-    ws->hidden = malloc(N);
-    ws->delta = malloc(L);
-    ws->scan_B = malloc(L * N * R);
-    ws->scan_C = malloc(L * N * R);
-    ws->scan_delta = malloc(L * N);
-    ws->scan_h = malloc(N);
+    ws->hidden = malloc(N * sizeof(float));
+    ws->delta = malloc(L * sizeof(float));
+    ws->scan_B = malloc(L * N * R * sizeof(float));
+    ws->scan_C = malloc(L * N * R * sizeof(float));
+    ws->scan_delta = malloc(L * N * sizeof(float));
+    ws->scan_h = malloc(N * sizeof(float));
     if (!ws->hidden || !ws->delta || !ws->scan_B || !ws->scan_C || !ws->scan_delta || !ws->scan_h) {
         mamba_block_workspace_free(ws);
         return NULL;
@@ -81,12 +81,42 @@ void mamba_block_workspace_free(MambaBlockWorkspace *ws) {
     free(ws);
 }
 
-static void project_controller(const MambaBlock *block, const float *x_t,
-                                float *z_buf, float *u_out) {
-    if (!block || !x_t || !z_buf || !u_out) return;
+typedef struct {
+    float delta;   /* dt_t après softplus + clamp */
+    float lambda;  /* lambda_t après sigmoid */
+} Mamba3Control;
+
+static void project_controller_full(const MambaBlock *block, const float *x_t,
+                                     float *z_buf, float *u_out,
+                                     Mamba3Control *ctrl) {
+    if (!block || !x_t || !z_buf || !u_out || !ctrl) return;
     size_t R = _mimo_R(&block->config);
-    gemv_f32(block->W_in.data, x_t, z_buf, (int)R, (int)block->config.dim);
+    size_t D = block->config.dim;
+
+    /* 1. W_in @ x_t → z_buf, SiLU → u_out (MIMO: u_t ∈ R^R) */
+    gemv_f32(block->W_in.data, x_t, z_buf, (int)R, (int)D);
     silu_f32(z_buf, u_out, (int)R);
+
+    /* 2. delta_proj @ x_t → delta, softplus + clamp */
+    if (block->delta_proj.rows > 0 && block->delta_proj.data) {
+        float dval;
+        gemv_f32(block->delta_proj.data, x_t, &dval, 1, (int)D);
+        softplus_f32(&dval, &dval, 1);
+        if (dval < block->config.dt_min) dval = block->config.dt_min;
+        if (dval > block->config.dt_max) dval = block->config.dt_max;
+        ctrl->delta = dval;
+    } else {
+        ctrl->delta = block->config.dt_scale;
+    }
+
+    /* 3. lambda_proj @ x_t → lambda_raw, sigmoid → lambda */
+    if (block->lambda_proj.rows > 0 && block->lambda_proj.data) {
+        float lambda_raw;
+        gemv_f32(block->lambda_proj.data, x_t, &lambda_raw, 1, (int)D);
+        ctrl->lambda = 1.0f / (1.0f + expf(-lambda_raw));  /* sigmoid */
+    } else {
+        ctrl->lambda = 0.5f;  /* default: trapezoidal symétrique */
+    }
 }
 
 static float project_delta_value(const MambaBlock *block, const float *x_t,
@@ -112,7 +142,7 @@ MBMatrix* mb_matrix_create(size_t rows, size_t cols) {
     if (!m) return NULL;
     m->rows = rows;
     m->cols = cols;
-    m->data = malloc(rows * cols);
+    m->data = malloc(rows * cols * sizeof(float));
     if (!m->data) { free(m); return NULL; }
     memset(m->data, 0, rows * cols * sizeof(float));
     return m;
@@ -122,7 +152,7 @@ static int matrix_init_owned(MBMatrix *dst, size_t rows, size_t cols) {
     if (!dst) return -1;
     dst->rows = rows;
     dst->cols = cols;
-    dst->data = malloc(rows * cols);
+    dst->data = malloc(rows * cols * sizeof(float));
     if (!dst->data) return -1;
     memset(dst->data, 0, rows * cols * sizeof(float));
     return 0;
@@ -174,15 +204,15 @@ MambaBlock* mamba_block_create(const MBConfig *config) {
         mamba_block_free(block); return NULL;
     }
 
-    block->b_B = malloc(N * R);
-    block->b_C = malloc(N * R);
-    block->theta = malloc(N / 2 > 0 ? N / 2 : 1);
-    block->hidden = malloc(N);
-    block->delta = malloc(block->config.seq_len);
-    block->scan_B = malloc(block->config.seq_len * N * R);
-    block->scan_C = malloc(block->config.seq_len * N * R);
-    block->scan_delta = malloc(block->config.seq_len * N);
-    block->scan_h = malloc(N);
+    block->b_B = malloc(N * R * sizeof(float));
+    block->b_C = malloc(N * R * sizeof(float));
+    block->theta = malloc((N / 2 > 0 ? N / 2 : 1) * sizeof(float));
+    block->hidden = malloc(N * sizeof(float));
+    block->delta = malloc(block->config.seq_len * sizeof(float));
+    block->scan_B = malloc(block->config.seq_len * N * R * sizeof(float));
+    block->scan_C = malloc(block->config.seq_len * N * R * sizeof(float));
+    block->scan_delta = malloc(block->config.seq_len * N * sizeof(float));
+    block->scan_h = malloc(N * sizeof(float));
     block->wavefront_plan = km_wavefront_plan_create(block->config.spatial_dims, block->config.spatial_ndims);
 
     if (!block->b_B || !block->b_C || !block->theta || !block->hidden || !block->delta ||
@@ -380,8 +410,8 @@ void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
  * Selective Scan (Internal)
  * ============================================================================ */
 
-static void _ssm_scan_forward(MambaBlock *block, MambaBlockWorkspace *ws, 
-                             const float *u_seq, float *y_rank) {
+static void _ssm_scan_forward(MambaBlock *block, MambaBlockWorkspace *ws,
+                             const float *u_seq, const float *lambda_seq, float *y_rank) {
     size_t L = block->config.seq_len, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R;
     float *h_cur = ws->scan_h;
     float *h_rot = (float *)malloc(N * sizeof(float));
@@ -391,36 +421,45 @@ static void _ssm_scan_forward(MambaBlock *block, MambaBlockWorkspace *ws,
     memset(h_cur, 0, N * sizeof(float));
     for (size_t t = 0; t < L; t++) {
         float dt_t = ws->delta[t];
+        float lam_t = lambda_seq ? lambda_seq[t] : 0.5f;
         const float *b_t = &ws->scan_B[t * NR];
         const float *c_t = &ws->scan_C[t * NR];
         const float *u_t = &u_seq[t * R];
 
+        /* 1. Appliquer R(θ) à h_cur → h_rot */
         for (size_t i = 0; i + 1 < N; i += 2) {
             float th = block->theta[i >> 1];
             float cv = cosf(th), sv = sinf(th);
             float h0 = h_cur[i], h1 = h_cur[i+1];
-            h_rot[i] = cv * h0 - sv * h1;
+            h_rot[i]   = cv * h0 - sv * h1;
             h_rot[i+1] = sv * h0 + cv * h1;
         }
         if (N & 1) h_rot[N-1] = h_cur[N-1];
 
+        /* 2. Calculer Bu_t = sum_r B_t[n,r] * u_t[r] pour chaque n */
         memset(Bu_cur, 0, N * sizeof(float));
         for (size_t r = 0; r < R; r++) {
             for (size_t n = 0; n < N; n++) Bu_cur[n] += b_t[r * N + n] * u_t[r];
         }
 
+        /* 3. Mamba-3 exp-trapezoidal: h_t = alpha*R(θ)*h_{t-1} + beta*Bu_{t-1} + gamma*Bu_t */
         for (size_t n = 0; n < N; n++) {
             float a = block->A_log.data[n];
             float alpha = expf(dt_t * a);
-            h_cur[n] = alpha * h_rot[n] + 0.5f * dt_t * alpha * prev_Bu[n] + 0.5f * dt_t * Bu_cur[n];
-            prev_Bu[n] = Bu_cur[n];
+            float beta  = (1.0f - lam_t) * dt_t * alpha;  /* ← terme Bu_{t-1} */
+            float gamma = lam_t * dt_t;                    /* ← terme Bu_t */
+            h_cur[n] = alpha * h_rot[n] + beta * prev_Bu[n] + gamma * Bu_cur[n];
         }
 
+        /* 4. Output: y_t[r] = sum_n C_t[n,r] * h_t[n] */
         for (size_t r = 0; r < R; r++) {
             float yr = 0.0f;
             for (size_t n = 0; n < N; n++) yr += c_t[r * N + n] * h_cur[n];
             y_rank[t * R + r] = yr;
         }
+
+        /* 5. Stocker Bu_cur pour le prochain timestep */
+        memcpy(prev_Bu, Bu_cur, N * sizeof(float));
     }
     free(h_rot); free(Bu_cur); free(prev_Bu);
 }
@@ -434,6 +473,7 @@ void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *o
     size_t L = block->config.seq_len, D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R;
     float *z = (float *)malloc(D * sizeof(float));
     float *u_seq = (float *)malloc(L * R * sizeof(float));
+    float *lambda_seq = (float *)malloc(L * sizeof(float));
     float *y_rank = (float *)malloc(L * R * sizeof(float));
     float *y_proj = (float *)malloc(D * sizeof(float));
 
@@ -441,8 +481,10 @@ void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *o
         const float *in = &input[b * L * D];
         float *out = &output[b * L * D];
         for (size_t t = 0; t < L; t++) {
-            project_controller(block, &in[t * D], z, &u_seq[t * R]);
-            ws->delta[t] = project_delta_value(block, &in[t * D], z);
+            Mamba3Control ctrl;
+            project_controller_full(block, &in[t * D], z, &u_seq[t * R], &ctrl);
+            ws->delta[t] = ctrl.delta;
+            lambda_seq[t] = ctrl.lambda;
             gemv_f32(block->W_B.data, &in[t * D], &ws->scan_B[t * NR], (int)NR, (int)D);
             gemv_f32(block->W_C.data, &in[t * D], &ws->scan_C[t * NR], (int)NR, (int)D);
             for (size_t i = 0; i < NR; i++) {
@@ -450,22 +492,322 @@ void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *o
                 ws->scan_C[t * NR + i] += block->b_C[i];
             }
         }
-        _ssm_scan_forward(block, ws, u_seq, y_rank);
+        _ssm_scan_forward(block, ws, u_seq, lambda_seq, y_rank);
         for (size_t t = 0; t < L; t++) {
             gemv_f32(block->W_out.data, &y_rank[t * R], y_proj, (int)D, (int)R);
             for (size_t d = 0; d < D; d++) out[t * D + d] = in[t * D + d] + y_proj[d];
         }
     }
-    free(z); free(u_seq); free(y_rank); free(y_proj);
+    free(z); free(u_seq); free(lambda_seq); free(y_rank); free(y_proj);
 }
 
-/* Internal GPU forward implementation - stub for now */
+/* Internal GPU forward implementation - connects to cuda/mamba_block.cu */
 #ifdef KMAMBA_BUILD_CUDA
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+/* External declaration of gpu_block_forward from cuda/mamba_block.cu */
+extern void gpu_block_forward(
+    cublasHandle_t cublas,
+    const float *d_W_in, const float *d_W_out, const float *d_A_log,
+    const float *d_W_B, const float *d_W_C, const float *d_delta_proj,
+    const float *d_theta, const float *d_lambda_proj,
+    const float *d_x, float *d_y,
+    float *d_u_raw, float *d_u, float *d_dt_raw, float *d_dt,
+    float *d_B_exp, float *d_C_exp, float *d_dt_exp,
+    float *d_h_store, float *d_y_scan, float *d_y_proj,
+    float *d_lambda_raw, float *d_lambda,
+    int L, int state, int dim, int R);
+
 static int _mamba_block_forward_gpu(MambaBlock *block, float *output, const float *input, size_t batch_size) {
-    /* TODO: Full GPU implementation with device memory management */
-    /* This will call cuda/mamba_block.cu functions once fully implemented */
-    (void)block; (void)output; (void)input; (void)batch_size;
-    return -1; /* Not yet fully implemented, fall back to CPU */
+    if (!block || !output || !input || batch_size == 0) return -1;
+
+    /* Lazy initialization of cuBLAS handle */
+    static cublasHandle_t cublas_handle = NULL;
+    static int cuda_init_done = 0;
+    if (!cuda_init_done) {
+        cudaError_t cuda_err = cudaFree(0);  /* Init CUDA runtime */
+        if (cuda_err != cudaSuccess) return -1;
+        cublasStatus_t status = cublasCreate(&cublas_handle);
+        if (status != CUBLAS_STATUS_SUCCESS) return -1;
+        cuda_init_done = 1;
+    }
+
+    size_t L = block->config.seq_len;
+    size_t D = block->config.dim;
+    size_t N = block->config.state_size;
+    size_t R = _mimo_R(&block->config);
+    size_t NR = N * R;
+
+    size_t bytes_L_D = L * D * sizeof(float);
+    size_t bytes_L_R = L * R * sizeof(float);
+    size_t bytes_L_NR = L * NR * sizeof(float);
+    size_t bytes_L_N = L * N * sizeof(float);
+
+    /* Device memory allocations */
+    float *d_input = NULL, *d_output = NULL;
+    float *d_W_in = NULL, *d_W_out = NULL, *d_A_log = NULL;
+    float *d_W_B = NULL, *d_W_C = NULL, *d_delta_proj = NULL;
+    float *d_theta = NULL, *d_lambda_proj = NULL;
+    float *d_u_raw = NULL, *d_u = NULL, *d_dt_raw = NULL, *d_dt = NULL;
+    float *d_B_exp = NULL, *d_C_exp = NULL, *d_dt_exp = NULL;
+    float *d_h_store = NULL, *d_y_scan = NULL, *d_y_proj = NULL;
+    float *d_lambda_raw = NULL, *d_lambda = NULL;
+
+#define CUDA_CHECK_ALLOC(ptr, size) do { \
+    cudaError_t err = cudaMalloc((void **)&(ptr), (size)); \
+    if (err != cudaSuccess) { goto gpu_cleanup; } \
+} while(0)
+
+    CUDA_CHECK_ALLOC(d_input, bytes_L_D);
+    CUDA_CHECK_ALLOC(d_output, bytes_L_D);
+    CUDA_CHECK_ALLOC(d_W_in, R * D * sizeof(float));
+    CUDA_CHECK_ALLOC(d_W_out, D * R * sizeof(float));
+    CUDA_CHECK_ALLOC(d_A_log, N * sizeof(float));
+    CUDA_CHECK_ALLOC(d_W_B, NR * D * sizeof(float));
+    CUDA_CHECK_ALLOC(d_W_C, NR * D * sizeof(float));
+    CUDA_CHECK_ALLOC(d_delta_proj, D * sizeof(float));
+    CUDA_CHECK_ALLOC(d_theta, (N/2) * sizeof(float));
+    CUDA_CHECK_ALLOC(d_lambda_proj, D * sizeof(float));
+    CUDA_CHECK_ALLOC(d_u_raw, bytes_L_R);
+    CUDA_CHECK_ALLOC(d_u, bytes_L_R);
+    CUDA_CHECK_ALLOC(d_dt_raw, L * sizeof(float));
+    CUDA_CHECK_ALLOC(d_dt, L * sizeof(float));
+    CUDA_CHECK_ALLOC(d_B_exp, bytes_L_NR);
+    CUDA_CHECK_ALLOC(d_C_exp, bytes_L_NR);
+    CUDA_CHECK_ALLOC(d_dt_exp, bytes_L_N);  /* API compat, unused */
+    CUDA_CHECK_ALLOC(d_h_store, bytes_L_N);
+    CUDA_CHECK_ALLOC(d_y_scan, bytes_L_R);
+    CUDA_CHECK_ALLOC(d_y_proj, bytes_L_D);
+    CUDA_CHECK_ALLOC(d_lambda_raw, L * sizeof(float));
+    CUDA_CHECK_ALLOC(d_lambda, L * sizeof(float));
+
+#undef CUDA_CHECK_ALLOC
+
+    /* Copy parameters to device (once for all batches) */
+    cudaMemcpy(d_W_in, block->W_in.data, R * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_out, block->W_out.data, D * R * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A_log, block->A_log.data, N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_B, block->W_B.data, NR * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_C, block->W_C.data, NR * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_delta_proj, block->delta_proj.data, D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_theta, block->theta, (N/2) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lambda_proj, block->lambda_proj.data, D * sizeof(float), cudaMemcpyHostToDevice);
+
+    /* Process each batch */
+    for (size_t b = 0; b < batch_size; b++) {
+        const float *h_in = &input[b * L * D];
+        float *h_out = &output[b * L * D];
+
+        /* Copy input */
+        cudaMemcpy(d_input, h_in, bytes_L_D, cudaMemcpyHostToDevice);
+
+        /* Call GPU kernel */
+        gpu_block_forward(
+            cublas_handle,
+            d_W_in, d_W_out, d_A_log, d_W_B, d_W_C, d_delta_proj,
+            d_theta, d_lambda_proj,
+            d_input, d_output,
+            d_u_raw, d_u, d_dt_raw, d_dt,
+            d_B_exp, d_C_exp, d_dt_exp,
+            d_h_store, d_y_scan, d_y_proj,
+            d_lambda_raw, d_lambda,
+            (int)L, (int)N, (int)D, (int)R);
+
+        /* Copy output */
+        cudaMemcpy(h_out, d_output, bytes_L_D, cudaMemcpyDeviceToHost);
+    }
+
+gpu_cleanup:
+    cudaFree(d_input); cudaFree(d_output);
+    cudaFree(d_W_in); cudaFree(d_W_out); cudaFree(d_A_log);
+    cudaFree(d_W_B); cudaFree(d_W_C);
+    cudaFree(d_delta_proj); cudaFree(d_theta); cudaFree(d_lambda_proj);
+    cudaFree(d_u_raw); cudaFree(d_u); cudaFree(d_dt_raw); cudaFree(d_dt);
+    cudaFree(d_B_exp); cudaFree(d_C_exp); cudaFree(d_dt_exp);
+    cudaFree(d_h_store); cudaFree(d_y_scan); cudaFree(d_y_proj);
+    cudaFree(d_lambda_raw); cudaFree(d_lambda);
+
+    return 0;  /* Success */
+}
+
+/* External declaration of gpu_block_backward from cuda/mamba_block.cu */
+extern void gpu_block_backward(
+    cublasHandle_t cublas,
+    const float *d_W_in, const float *d_W_out, const float *d_A_log,
+    const float *d_W_B, const float *d_W_C, const float *d_delta_proj,
+    const float *d_theta, const float *d_lambda_proj,
+    const float *d_x, const float *d_u_raw, const float *d_u,
+    const float *d_dt_raw, const float *d_dt,
+    const float *d_B_exp, const float *d_C_exp, const float *d_dt_exp,
+    const float *d_h_store, const float *d_y_scan, const float *d_lambda,
+    const float *d_dy,
+    float *d_dW_in, float *d_dW_out, float *d_dA_log,
+    float *d_dW_B, float *d_dW_C, float *d_ddelta_proj,
+    float *d_g_theta, float *d_g_lambda_proj,
+    float *d_dx,
+    float *d_dy_scan, float *d_du, float *d_du_raw,
+    float *d_ddt, float *d_ddt_raw,
+    float *d_dB_scan, float *d_dC_scan, float *d_ddt_scan, float *d_dA_tmp,
+    float *d_dlambda, float *d_dlambda_raw,
+    int L, int state, int dim, int R);
+
+static int _mamba_block_backward_gpu(MambaBlock *block, 
+                                      const float *dY, const float *input,
+                                      float *d_input, size_t batch_index,
+                                      /* Forward activations saved on device */
+                                      const float *d_u_raw, const float *d_u,
+                                      const float *d_dt_raw, const float *d_dt,
+                                      const float *d_B_exp, const float *d_C_exp,
+                                      const float *d_h_store, const float *d_y_scan,
+                                      const float *d_lambda) {
+    (void)batch_index;
+    if (!block || !dY || !input || !d_input) return -1;
+
+    static cublasHandle_t cublas_handle = NULL;
+    static int cuda_init_done = 0;
+    if (!cuda_init_done) {
+        cudaError_t cuda_err = cudaFree(0);
+        if (cuda_err != cudaSuccess) return -1;
+        cublasStatus_t status = cublasCreate(&cublas_handle);
+        if (status != CUBLAS_STATUS_SUCCESS) return -1;
+        cuda_init_done = 1;
+    }
+
+    size_t L = block->config.seq_len;
+    size_t D = block->config.dim;
+    size_t N = block->config.state_size;
+    size_t R = _mimo_R(&block->config);
+    size_t NR = N * R;
+
+    size_t bytes_L_D = L * D * sizeof(float);
+    size_t bytes_L_R = L * R * sizeof(float);
+    size_t bytes_L_NR = L * NR * sizeof(float);
+    size_t bytes_L_N = L * N * sizeof(float);
+
+    /* Device memory for gradients */
+    float *d_dW_in = NULL, *d_dW_out = NULL, *d_dA_log = NULL;
+    float *d_dW_B = NULL, *d_dW_C = NULL, *d_ddelta_proj = NULL;
+    float *d_g_theta = NULL, *d_g_lambda_proj = NULL;
+    float *d_dy = NULL, *d_dx = NULL;
+    float *d_dy_scan = NULL, *d_du = NULL, *d_du_raw = NULL;
+    float *d_ddt = NULL, *d_ddt_raw = NULL;
+    float *d_dB_scan = NULL, *d_dC_scan = NULL, *d_ddt_scan = NULL, *d_dA_tmp = NULL;
+    float *d_dlambda = NULL, *d_dlambda_raw = NULL;
+    float *d_W_params = NULL; /* Temp for copying params */
+
+#define CUDA_CHECK_ALLOC_BWD(ptr, size) do { \
+    cudaError_t err = cudaMalloc((void **)&(ptr), (size)); \
+    if (err != cudaSuccess) { goto gpu_bwd_cleanup; } \
+} while(0)
+
+    /* Allocate gradient buffers */
+    CUDA_CHECK_ALLOC_BWD(d_dW_in, R * D * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dW_out, D * R * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dA_log, N * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dW_B, NR * D * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dW_C, NR * D * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_ddelta_proj, D * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_g_theta, (N/2) * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_g_lambda_proj, D * sizeof(float));
+
+    /* Activations/gradients */
+    CUDA_CHECK_ALLOC_BWD(d_dy, bytes_L_D);
+    CUDA_CHECK_ALLOC_BWD(d_dx, bytes_L_D);
+    CUDA_CHECK_ALLOC_BWD(d_dy_scan, bytes_L_R);
+    CUDA_CHECK_ALLOC_BWD(d_du, bytes_L_R);
+    CUDA_CHECK_ALLOC_BWD(d_du_raw, bytes_L_R);
+    CUDA_CHECK_ALLOC_BWD(d_ddt, L * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_ddt_raw, L * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dB_scan, bytes_L_NR);
+    CUDA_CHECK_ALLOC_BWD(d_dC_scan, bytes_L_NR);
+    CUDA_CHECK_ALLOC_BWD(d_ddt_scan, bytes_L_N);
+    CUDA_CHECK_ALLOC_BWD(d_dA_tmp, N * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dlambda, L * sizeof(float));
+    CUDA_CHECK_ALLOC_BWD(d_dlambda_raw, L * sizeof(float));
+
+    /* Copy W_params to device */
+    CUDA_CHECK_ALLOC_BWD(d_W_params, (R*D + D*R + N + NR*D*2 + D + N/2 + D) * sizeof(float));
+
+#undef CUDA_CHECK_ALLOC_BWD
+
+    /* Zero gradients */
+    cudaMemset(d_dW_in, 0, R * D * sizeof(float));
+    cudaMemset(d_dW_out, 0, D * R * sizeof(float));
+    cudaMemset(d_dA_log, 0, N * sizeof(float));
+    cudaMemset(d_dW_B, 0, NR * D * sizeof(float));
+    cudaMemset(d_dW_C, 0, NR * D * sizeof(float));
+    cudaMemset(d_ddelta_proj, 0, D * sizeof(float));
+    cudaMemset(d_g_theta, 0, (N/2) * sizeof(float));
+    cudaMemset(d_g_lambda_proj, 0, D * sizeof(float));
+
+    /* Copy dY from host */
+    cudaMemcpy(d_dy, dY, bytes_L_D, cudaMemcpyHostToDevice);
+
+    /* Copy params to device */
+    float *d_W_in = d_W_params;
+    float *d_W_out = d_W_in + R * D;
+    float *d_A_log = d_W_out + D * R;
+    float *d_W_B = d_A_log + N;
+    float *d_W_C = d_W_B + NR * D;
+    float *d_delta_proj = d_W_C + NR * D;
+    float *d_theta = d_delta_proj + D;
+    float *d_lambda_proj = d_theta + (N/2);
+
+    cudaMemcpy(d_W_in, block->W_in.data, R * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_out, block->W_out.data, D * R * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A_log, block->A_log.data, N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_B, block->W_B.data, NR * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W_C, block->W_C.data, NR * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_delta_proj, block->delta_proj.data, D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_theta, block->theta, (N/2) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lambda_proj, block->lambda_proj.data, D * sizeof(float), cudaMemcpyHostToDevice);
+
+    /* Call GPU backward - d_dt_exp parameter not used by kernel but kept for API compat */
+    gpu_block_backward(
+        cublas_handle,
+        d_W_in, d_W_out, d_A_log, d_W_B, d_W_C, d_delta_proj,
+        d_theta, d_lambda_proj,
+        d_input, d_u_raw, d_u, d_dt_raw, d_dt,
+        d_B_exp, d_C_exp, NULL,  /* d_dt_exp not used */
+        d_h_store, d_y_scan, d_lambda,
+        d_dy,
+        d_dW_in, d_dW_out, d_dA_log, d_dW_B, d_dW_C, d_ddelta_proj,
+        d_g_theta, d_g_lambda_proj,
+        d_dx,
+        d_dy_scan, d_du, d_du_raw, d_ddt, d_ddt_raw,
+        d_dB_scan, d_dC_scan, d_ddt_scan, d_dA_tmp,
+        d_dlambda, d_dlambda_raw,
+        (int)L, (int)N, (int)D, (int)R);
+
+    /* Copy gradients back to host opt_state */
+    if (block->opt_state) {
+        MBOptimState *s = block->opt_state;
+        cudaMemcpy(s->g_W_in, d_dW_in, R * D * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_W_out, d_dW_out, D * R * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_A_log, d_dA_log, N * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_W_B, d_dW_B, NR * D * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_W_C, d_dW_C, NR * D * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_delta_proj, d_ddelta_proj, D * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_theta, d_g_theta, (N/2) * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s->g_lambda_proj, d_g_lambda_proj, D * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+
+    /* Copy dX back to host */
+    cudaMemcpy(d_input, d_dx, bytes_L_D, cudaMemcpyDeviceToHost);
+
+gpu_bwd_cleanup:
+    cudaFree(d_dW_in); cudaFree(d_dW_out); cudaFree(d_dA_log);
+    cudaFree(d_dW_B); cudaFree(d_dW_C); cudaFree(d_ddelta_proj);
+    cudaFree(d_g_theta); cudaFree(d_g_lambda_proj);
+    cudaFree(d_dy); cudaFree(d_dx);
+    cudaFree(d_dy_scan); cudaFree(d_du); cudaFree(d_du_raw);
+    cudaFree(d_ddt); cudaFree(d_ddt_raw);
+    cudaFree(d_dB_scan); cudaFree(d_dC_scan); cudaFree(d_ddt_scan); cudaFree(d_dA_tmp);
+    cudaFree(d_dlambda); cudaFree(d_dlambda_raw);
+    cudaFree(d_W_params);
+
+    return 0;
 }
 #endif
 

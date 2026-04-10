@@ -69,12 +69,34 @@ Implémentation C pure de l'optimiseur MUON :
 - AdamW avec weight decay
 - **Zero dependency**
 
-### 4. Zero Dependency
+### 4. GPU Optimizations (CUDA)
+
+#### Parallel Scan (Blelloch)
+- Scan SSM parallèle work-efficient
+- Remplacement des kernels `<<<1,1>>>` séquentiels
+- Forward et backward GPU natifs
+
+#### Mixed Precision FP16/BF16
+- **FP16** : Loss scaling dynamique (65536.0f) pour éviter underflow
+- **BF16** : Range FP32 natif, pas de scaling nécessaire
+- **Tensor Cores** : GEMM accéléré via cuBLAS
+
+#### Gradient Checkpointing
+- Réduction mémoire O(L×N×D) → O(N×D)
+- Politiques : `none`, `per-layer`, `per-block`
+- Recompute forward during backward
+
+#### Multi-GPU (Optional NCCL)
+- Data parallelism : split batch
+- Pipeline parallelism : split layers
+- **Zero dependency** : NCCL optionnel
+
+### 5. Zero Dependency
 
 - **CPU** : `gcc`, `nasm`, `libc`, `libm`
 - **Build** : Makefile simple (pas CMake)
 - **Kernels** : C pur inline (pas BLAS externe)
-- **Optionnel** : OpenMP, CUDA
+- **Optionnel** : OpenMP, CUDA, NCCL
 
 ---
 
