@@ -4,6 +4,10 @@
 
 #include "scan_nd.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #define PASS_TAG "  [PASS]"
 #define FAIL_TAG "  [FAIL]"
 
@@ -308,6 +312,82 @@ static int test_scannd_ref_with_plan_matches_plain_ref(void) {
     return ok;
 }
 
+static int test_scannd_ref_with_plan_multithread_deterministic(void) {
+    const long dims[3] = {2, 2, 2};
+    float x[8];
+    float A[3] = {0.f, 0.f, 0.f};
+    float B[8];
+    float C[8];
+    float delta[24];
+    float h_ref[8] = {0.f};
+    float y_ref[8] = {0.f};
+    float h_mt[8] = {0.f};
+    float y_mt[8] = {0.f};
+    ScanNDParams p_ref;
+    ScanNDParams p_mt;
+    KMWavefrontPlan *plan;
+    int ok = 1;
+
+    for (int i = 0; i < 8; i++) {
+        x[i] = (float)(i + 1);
+        B[i] = 1.f;
+        C[i] = 1.f;
+    }
+    for (int i = 0; i < 24; i++) delta[i] = 1.f;
+
+    p_ref.dims = dims;
+    p_ref.ndims = 3;
+    p_ref.D = 1;
+    p_ref.M = 1;
+    p_ref.x = x;
+    p_ref.A = A;
+    p_ref.B = B;
+    p_ref.C = C;
+    p_ref.delta = delta;
+    p_ref.h = h_ref;
+    p_ref.y = y_ref;
+
+    p_mt = p_ref;
+    p_mt.h = h_mt;
+    p_mt.y = y_mt;
+
+    printf("\n--- scannd_ref_with_plan() déterminisme multi-thread ---\n");
+    plan = km_wavefront_plan_create(dims, 3);
+    if (!plan) {
+        printf("%s création du plan wavefront\n", FAIL_TAG);
+        return 0;
+    }
+
+#ifdef _OPENMP
+    omp_set_num_threads(1);
+#endif
+    if (scannd_ref_with_plan(&p_ref, plan) != 0) {
+        printf("%s exécution single-thread\n", FAIL_TAG);
+        km_wavefront_plan_free(plan);
+        return 0;
+    }
+
+#ifdef _OPENMP
+    omp_set_num_threads(4);
+#endif
+    if (scannd_ref_with_plan(&p_mt, plan) != 0) {
+        printf("%s exécution multi-thread\n", FAIL_TAG);
+        km_wavefront_plan_free(plan);
+        return 0;
+    }
+
+    for (int i = 0; i < 8; i++) {
+        if (!nearly_equal(y_ref[i], y_mt[i], 1e-5f)) {
+            printf("%s y[%d] st=%.6f mt=%.6f\n", FAIL_TAG, i, y_ref[i], y_mt[i]);
+            ok = 0;
+        }
+    }
+
+    if (ok) printf("%s sorties st/mt cohérentes sur scannd_ref_with_plan\n", PASS_TAG);
+    km_wavefront_plan_free(plan);
+    return ok;
+}
+
 int main(void) {
     int passed = 0;
     int total = 0;
@@ -320,6 +400,7 @@ int main(void) {
     total++; passed += test_scannd_dispatch_matches_ref_1d();
     total++; passed += test_scannd_dispatch_matches_ref_2d();
     total++; passed += test_scannd_ref_with_plan_matches_plain_ref();
+    total++; passed += test_scannd_ref_with_plan_multithread_deterministic();
 
     printf("\n=== Résultat: %d/%d tests passent ===\n", passed, total);
     return (passed == total) ? 0 : 1;

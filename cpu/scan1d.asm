@@ -22,6 +22,7 @@
 ;   [rbp-48] : y_accum (float)
 ;   [rbp-56] : td_idx  (long)
 ;   [rbp-64] : dm_base (long, d*M)
+;   [rbp-72] : dt_cache (float) pour éviter reload dans loop_m
 ; ============================================================
 
 BITS 64
@@ -75,6 +76,12 @@ scan1d:
     xorps xmm0, xmm0
     movss [rbp-48], xmm0
 
+    ; dt_cache = delta[td_idx] (constant pour tous les m de ce (t,d))
+    mov  rax, [rbp-56]
+    mov  rdx, [r12 + ScanParams.delta]
+    movss xmm0, [rdx + rax*FLOAT32_SIZE]
+    movss [rbp-72], xmm0
+
     xor  r15, r15           ; m = 0
 
 .loop_m:
@@ -87,10 +94,8 @@ scan1d:
 
     ; ---- Préparer et appeler expf(dt * A[dm_idx]) ----
 
-    ; dt = delta[td_idx]
-    mov  rax, [rbp-56]
-    mov  rdx, [r12 + ScanParams.delta]
-    movss xmm0, [rdx + rax*FLOAT32_SIZE]   ; xmm0 = dt
+    ; dt = dt_cache
+    movss xmm0, [rbp-72]                    ; xmm0 = dt
 
     ; a_val = A[dm_idx]
     mov  rdx, [r12 + ScanParams.A]
@@ -107,9 +112,8 @@ scan1d:
     ; td_idx
     mov  rax, [rbp-56]
 
-    ; dt = delta[td_idx]
-    mov  rdx, [r12 + ScanParams.delta]
-    movss xmm1, [rdx + rax*FLOAT32_SIZE]   ; xmm1 = dt
+    ; dt = dt_cache
+    movss xmm1, [rbp-72]                   ; xmm1 = dt
 
     ; b_val = B[td_idx * M + m]
     mov  rcx, rax

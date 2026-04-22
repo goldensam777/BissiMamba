@@ -10,6 +10,8 @@
 #include <omp.h>
 #endif
 
+#define KM_POOL_ALIGN 64
+
 /* Chunk de mémoire réutilisable */
 typedef struct PoolChunk {
     void *ptr;
@@ -64,7 +66,10 @@ void* km_pool_alloc(KMMemoryPool *pool, size_t size) {
     }
     
     /* Pas de chunk réutilisable → allocation */
-    void *ptr = malloc(size);
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, KM_POOL_ALIGN, size) != 0) {
+        ptr = NULL;
+    }
     if (!ptr) return NULL;
     
     /* Ajout au pool */

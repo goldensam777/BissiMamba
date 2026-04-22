@@ -31,6 +31,7 @@
 ;   [rbp-80] : y_accum  (float)
 ;   [rbp-88] : h_prev1  (float, sauvegarde xmm5)
 ;   [rbp-96] : h_prev2  (float, sauvegarde xmm6)
+;   [rbp-104]: dt_mean  ((dt1+dt2)/2) cache par (pos,d)
 ; ============================================================
 
 BITS 64
@@ -53,7 +54,7 @@ scan2d:
     push r13                ; [rbp-24]
     push r14                ; [rbp-32]
     push r15                ; [rbp-40]
-    sub  rsp, 64            ; locaux [rbp-48]..[rbp-96], stack alignée 16
+    sub  rsp, 80            ; locaux [rbp-48]..[rbp-120], stack alignée 16
 
     mov  r12, rdi           ; Scan2DParams*
 
@@ -118,6 +119,18 @@ scan2d:
 
     xorps xmm0, xmm0
     movss [rbp-80], xmm0    ; y_accum = 0
+
+    ; ---- Précompute dt_mean = (delta1[pd_idx] + delta2[pd_idx]) / 2 ----
+    mov  rax, r15
+    imul rax, [r12 + Scan2DParams.D]
+    add  rax, r13           ; pd_idx
+    mov  r8, [r12 + Scan2DParams.delta1]
+    movss xmm1, [r8 + rax*FLOAT32_SIZE]
+    mov  r8, [r12 + Scan2DParams.delta2]
+    movss xmm2, [r8 + rax*FLOAT32_SIZE]
+    addss xmm1, xmm2
+    mulss xmm1, [HALF]
+    movss [rbp-104], xmm1
 
     ; ---- Boucle M (dimension état) ----
     xor  r14, r14           ; m = 0
@@ -202,17 +215,8 @@ scan2d:
     add  rsp, 16            ; restaurer la pile
 
     ; ---- Calculer dB ----
-    ; pd_idx
-    mov  rax, r15
-    imul rax, [r12 + Scan2DParams.D]
-    add  rax, r13
-    ; dt1 + dt2
-    mov  r8, [r12 + Scan2DParams.delta1]
-    movss xmm1, [r8 + rax*FLOAT32_SIZE]
-    mov  r8, [r12 + Scan2DParams.delta2]
-    movss xmm2, [r8 + rax*FLOAT32_SIZE]
-    addss xmm1, xmm2
-    mulss xmm1, [HALF]      ; (dt1+dt2)/2
+    ; dB = dt_mean * B[pDM_idx]
+    movss xmm1, [rbp-104]
     ; pDM_idx (recalcul)
     mov  rcx, [r12 + Scan2DParams.D]
     imul rcx, [r12 + Scan2DParams.M]

@@ -11,7 +11,7 @@
 #   make tests            # Tests unitaires
 #   make clean            # Nettoyage
 
-.PHONY: all lib models cpu_lm_model cuda_lm_model hybrid_lm_model all_models tests clean distclean
+.PHONY: all lib models cpu_lm_model cuda_lm_model hybrid_lm_model all_models tests test-gemm-atb-determinism test-scan-nd-regression bench-gates clean distclean
 
 # ═══════════════════════════════════════════════════════════════
 # Compilateurs et flags
@@ -19,6 +19,10 @@
 CC = gcc
 CFLAGS = -O3 -mavx2 -Wall -Wextra -I./include -fopenmp
 LDFLAGS = -lm -lgomp
+
+ifdef FAST_EXP
+CFLAGS += -DKMAMBA_FAST_EXP_APPROX
+endif
 
 # ═══════════════════════════════════════════════════════════════
 # Rust Tokenizer
@@ -142,6 +146,8 @@ endif
 tests: lib
 	@echo "=== Compilation des tests ==="
 	@$(MAKE) test-mamba3
+	@$(MAKE) test-gemm-atb-determinism
+	@$(MAKE) test-scan-nd-regression
 ifeq ($(CUDA_AVAILABLE),1)
 	@$(MAKE) test-mamba3-gpu
 endif
@@ -249,6 +255,17 @@ ifeq ($(CUDA_AVAILABLE),1)
 else
 	@echo "SKIP: test GPU nécessite CUDA"
 endif
+
+test-gemm-atb-determinism: tests/unit/test_gemm_atb_determinism.c kernels/gemm_f32.c include/kmamba_kernels.h
+	$(CC) $(CFLAGS) -o /tmp/test_gemm_atb_determinism tests/unit/test_gemm_atb_determinism.c kernels/gemm_f32.c $(LDFLAGS)
+	/tmp/test_gemm_atb_determinism
+
+test-scan-nd-regression: tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c cpu/scan1d.o cpu/scan2d.o
+	$(CC) -no-pie $(CFLAGS) -o /tmp/test_scan_nd tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c cpu/scan1d.o cpu/scan2d.o $(LDFLAGS)
+	/tmp/test_scan_nd
+
+bench-gates:
+	bash scripts/bench_cpu_gates.sh
 
 # ═══════════════════════════════════════════════════════════════
 # Nettoyage

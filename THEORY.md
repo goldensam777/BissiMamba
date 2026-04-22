@@ -259,7 +259,7 @@ dans le DAG causal.
 
 ### 4.2 Lemme de causalité
 
-**Lemme** : Si un opérateur ND causal dépend de positions `n - e_k`
+**Lemme** : Si un opérateur ND causal dépend de positions $n - e_k$
 (vecteurs unitaires), alors toute dépendance récurrente de `n` pointe vers
 un niveau strictement inférieur.
 
