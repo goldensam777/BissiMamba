@@ -109,6 +109,25 @@ typedef struct {
     float *scan_C;         /* [seq_len x N*R] */
     float *scan_delta;     /* [seq_len x state_size] */
     float *scan_h;         /* [state_size] */
+
+    /* Pre-allocated buffers to avoid malloc in scan/forward */
+    float *h_rot;          /* [state_size] */
+    float *Bu_cur;         /* [state_size] */
+    float *prev_Bu;        /* [state_size] */
+    float *z_buf;          /* [dim] */
+    float *u_seq;          /* [seq_len x R] */
+    float *lambda_seq;     /* [seq_len] */
+    float *y_rank;         /* [seq_len x R] */
+    float *y_proj;         /* [dim] */
+    float *h_seq;          /* [seq_len x N] - stored for backward */
+    float *Bu_seq;         /* [seq_len x N] - stored for backward */
+
+    /* Backward gradients */
+    float *d_y_rank;       /* [seq_len x R] */
+    float *d_scan_B;       /* [seq_len x NR] */
+    float *d_scan_C;       /* [seq_len x NR] */
+    float *d_delta;        /* [seq_len] */
+    float *d_lambda;       /* [seq_len] */
 } MambaBlockWorkspace;
 
 /* ============================================================================
@@ -142,13 +161,44 @@ typedef struct {
     float *convnd_kernel;  /* [K^convnd_ndims * dim] - noyau dense wavefront */
     float *convnd_bias;    /* [dim] */
     
-    /* Runtime buffers */
+    /* Runtime buffers (deprecated, use workspace) */
     float *hidden;         /* [state_size] — SSM state at last timestep */
     float *delta;          /* [seq_len] */
     float *scan_B;         /* [seq_len x N*R] — normalized B_t columns, R=mimo_rank */
     float *scan_C;         /* [seq_len x N*R] — normalized C_t columns, R=mimo_rank */
     float *scan_delta;     /* [seq_len x state_size] */
     float *scan_h;         /* [state_size] */
+
+#ifdef KMAMBA_BUILD_CUDA
+    /* GPU persistent memory */
+    struct {
+        float *d_W_in;
+        float *d_W_out;
+        float *d_A_log;
+        float *d_W_B;
+        float *d_W_C;
+        float *d_delta_proj;
+        float *d_theta;
+        float *d_lambda_proj;
+        float *d_b_B;
+        float *d_b_C;
+        
+        /* Persistent buffers for forward/backward */
+        float *d_u_raw;
+        float *d_u;
+        float *d_dt_raw;
+        float *d_dt;
+        float *d_B_exp;
+        float *d_C_exp;
+        float *d_h_store;
+        float *d_y_scan;
+        float *d_y_proj;
+        float *d_lambda_raw;
+        float *d_lambda;
+        
+        int gpu_ready;
+    } gpu;
+#endif
 
     MBOptimState *opt_state; /* Optimizer state (Adam, Muon, etc.) */
 } MambaBlock;
