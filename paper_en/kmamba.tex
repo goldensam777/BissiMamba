@@ -497,6 +497,54 @@ a reverse-direction Blelloch scan on GPU (not yet implemented;
 current backward uses sequential kernel).
 
 % ─────────────────────────────────────────────────────────────────────────────
+\section{Separable Convolution}
+\label{sec:separable}
+
+While the wavefront-unified ConvND (Section~\ref{sec:implementation}) provides
+a single-kernel dense $K^N$ implementation, we also implement the
+classical \emph{separable} convolution as a cascade of $N$ 1D convolutions.
+This reduces computational complexity from $O(K^N)$ to $O(N \cdot K)$ per position.
+
+\subsection{Implementation}
+
+Each axis is processed sequentially using the same wavefront infrastructure:
+
+\begin{verbatim}
+// Cascade: N 1D convolutions with ping-pong buffers
+for axis in 0..N-1:
+    convnd_separable_1d_wavefront(input, output, kernel[axis], axis)
+    swap(input, output)
+\end{verbatim}
+
+The separable approach requires $N \cdot K$ multiplications per spatial position
+versus $K^N$ for the dense kernel.
+
+\subsection{CPU vs GPU Performance}
+
+Surprisingly, the performance winner depends on the execution platform:
+
+\begin{table}[htbp]
+\centering
+\caption{ConvND performance: Dense $K^N$ vs Separable cascade (2D grids, $D{=}64$, $K{=}3$).}
+\label{tab:convnd}
+\begin{tabular}{lrrrr}
+\toprule
+Platform & Grid & Dense (ms) & Separable (ms) & Speedup \\
+\midrule
+CPU (AVX2) & $256 \times 256$ & 135.5 & 34.6 & 3.9$\times$ \\
+CPU (AVX2) & $512 \times 512$ & 927.4 & 204.4 & 4.5$\times$ \\
+GPU (MX450) & $256 \times 256$ & 5.30 & 7.13 & 0.74$\times$ \\
+GPU (MX450) & $512 \times 512$ & 15.1 & 19.9 & 0.76$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On CPU, separable wins due to reduced arithmetic ($6$ vs $9$ multiplications).
+On GPU, dense wins because (1) single kernel launch avoids launch overhead,
+(2) better memory coalescing, and (3) the GPU masks computational complexity
+via massive parallelism. This motivates providing both implementations.
+
+% ─────────────────────────────────────────────────────────────────────────────
 \section{Experiments}
 \label{sec:experiments}
 
@@ -583,12 +631,14 @@ The roofline model~\cite{williams2009roofline} guides our kernel classification.
 \section{Conclusion}
 
 We presented K-Mamba, a native $N$-dimensional Mamba SSM library
-with four key contributions: (1) a formal proof that $d \times d$
+with five key contributions: (1) a formal proof that $d \times d$
 wavefront scheduling achieves $d/2$ speedup, experimentally validated
 to 0.1\% accuracy; (2) a reusable ND topological layer eliminating code
 duplication between scan and convolution operators; (3) a Blelloch parallel
 prefix scan reducing CUDA SSM depth from $O(L)$ to $O(\log L)$ with exact
-same work; (4) a zero-dependency C/ASM/CUDA implementation of the full
+same work; (4) separable ConvND with empirical characterization showing
+algorithmic optimality depends on execution platform (CPU vs GPU);
+(5) a zero-dependency C/ASM/CUDA implementation of the full
 training stack including MUONCLIP optimizer, all without Python or external
 ML libraries.
 

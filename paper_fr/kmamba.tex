@@ -516,6 +516,54 @@ un scan Blelloch en sens inverse sur GPU (pas encore implémenté ;
 l'actuelle passe arrière utilise un noyau séquentiel).
 
 % ─────────────────────────────────────────────────────────────────────────────
+\section{Convolution séparable}
+\label{sec:separable}
+
+Alors que le ConvND unifié par front d'onde (Section~\ref{sec:implementation}) fournit
+une implémentation dense $K^N$ en un seul noyau, nous implémentons également la
+\emph{convolution séparable} classique comme une cascade de $N$ convolutions 1D.
+Cela réduit la complexité computationnelle de $O(K^N)$ à $O(N \cdot K)$ par position.
+
+\subsection{Implémentation}
+
+Chaque axe est traité séquentiellement en utilisant la même infrastructure de front d'onde :
+
+\begin{verbatim}
+// Cascade : N convolutions 1D avec buffers ping-pong
+for axis in 0..N-1:
+    convnd_separable_1d_wavefront(input, output, kernel[axis], axis)
+    swap(input, output)
+\end{verbatim}
+
+L'approche séparable nécessite $N \cdot K$ multiplications par position spatiale
+contre $K^N$ pour le noyau dense.
+
+\subsection{Performance CPU vs GPU}
+
+De manière surprenante, le gagnant en performance dépend de la plateforme d'exécution :
+
+\begin{table}[htbp]
+\centering
+\caption{Performance ConvND : Dense $K^N$ vs Cascade séparable (grilles 2D, $D{=}64$, $K{=}3$).}
+\label{tab:convnd}
+\begin{tabular}{lrrrr}
+\toprule
+Plateforme & Grille & Dense (ms) & Séparable (ms) & Accélération \\
+\midrule
+CPU (AVX2) & $256 \times 256$ & 135,5 & 34,6 & 3,9$\times$ \\
+CPU (AVX2) & $512 \times 512$ & 927,4 & 204,4 & 4,5$\times$ \\
+GPU (MX450) & $256 \times 256$ & 5,30 & 7,13 & 0,74$\times$ \\
+GPU (MX450) & $512 \times 512$ & 15,1 & 19,9 & 0,76$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Sur CPU, la séparable gagne grâce à l'arithmétique réduite ($6$ vs $9$ multiplications).
+Sur GPU, la dense gagne car (1) un seul lancement de noyau évite l'overhead,
+(2) meilleure coalescence mémoire, et (3) le GPU masque la complexité computationnelle
+via le parallélisme massif. Cela motive la fourniture des deux implémentations.
+
+% ─────────────────────────────────────────────────────────────────────────────
 \section{Expériences}
 \label{sec:experiments}
 
@@ -604,13 +652,15 @@ Le modèle roofline~\cite{williams2009roofline} guide notre classification des n
 \section{Conclusion}
 
 Nous avons présenté K-Mamba, une bibliothèque SSM Mamba $N$-dimensionnelle native
-avec quatre contributions clés : (1) une preuve formelle que l'ordonnancement
+avec cinq contributions clés : (1) une preuve formelle que l'ordonnancement
 par front d'onde sur grille $d \times d$ atteint une accélération $d/2$,
 validée expérimentalement à 0,1\% près ; (2) une couche topologique ND réutilisable
 éliminant la duplication de code entre les opérateurs de scan et de convolution ;
 (3) un scan préfixé parallèle de Blelloch réduisant la profondeur CUDA du SSM
 de $O(L)$ à $O(\log L)$ avec le même travail ;
-(4) une implémentation C/ASM/CUDA sans dépendance de la pile d'entraînement complète,
+(4) une ConvND séparable avec caractérisation empirique montrant que l'optimalité
+algorithmique dépend de la plateforme d'exécution (CPU vs GPU) ;
+(5) une implémentation C/ASM/CUDA sans dépendance de la pile d'entraînement complète,
 incluant l'optimiseur MUONCLIP, le tout sans Python ni bibliothèques ML externes.
 
 K-Mamba démontre que l'inférence et l'entraînement de SSM de qualité industrielle
