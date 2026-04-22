@@ -11,7 +11,7 @@
 #   make tests            # Tests unitaires
 #   make clean            # Nettoyage
 
-.PHONY: all lib models cpu_lm_model cuda_lm_model hybrid_lm_model all_models tests test-gemm-atb-determinism test-scan-nd-regression bench-gates clean distclean
+.PHONY: all lib cpu cuda models cpu_lm_model cuda_lm_model hybrid_lm_model all_models tests test-gemm-atb-determinism test-scan-nd-regression bench-gates clean distclean help
 
 # ═══════════════════════════════════════════════════════════════
 # Compilateurs et flags
@@ -79,6 +79,7 @@ CUDA_SRCS = cuda/scan1d.cu \
             cuda/scan1d_backward.cu \
             cuda/scan_nd.cu \
             cuda/convnd.cu \
+            cuda/convnd_separable.cu \
             cuda/mamba_scan.cu \
             cuda/mamba_block.cu \
             cuda/kmamba_cuda_utils.cu \
@@ -100,11 +101,28 @@ MODEL_CUDA = models/kmamba_cuda
 MODEL_HYBRID = models/kmamba_hybrid
 
 # ═══════════════════════════════════════════════════════════════
-# Cibles principales
+# Cibles principales (cpu / cuda / all)
 # ═══════════════════════════════════════════════════════════════
 
-# Tout compiler
+# Compilation CPU uniquement (lib + tests CPU)
+cpu: lib
+	@echo "=== Compilation CPU terminée ==="
+	@echo "Bibliothèque: $(TARGET)"
+	@echo "Tests CPU: make tests"
+
+# Compilation CUDA (lib + tests GPU si disponible)
+cuda: lib
+ifeq ($(CUDA_AVAILABLE),1)
+	@echo "=== Compilation CUDA terminée ==="
+	@$(MAKE) bench-convnd-cuda test-convnd-separable-cuda 2>/dev/null || true
+else
+	@echo "✗ CUDA non disponible - impossible de compiler les tests GPU"
+	@exit 1
+endif
+
+# Tout compiler (CPU + CUDA si dispo)
 all: lib all_models
+	@echo "=== Compilation complète terminée ==="
 
 # Juste la bibliothèque
 lib: check_cuda check_rust $(RUST_LIB) $(TARGET)
@@ -266,6 +284,29 @@ test-scan-nd-regression: tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_p
 
 bench-gates:
 	bash scripts/bench_cpu_gates.sh
+
+# ═══════════════════════════════════════════════════════════════
+# Benchmarks ConvND (CPU et CUDA)
+# ═══════════════════════════════════════════════════════════════
+
+# Benchmark ConvND CPU (dense vs séparable)
+bench-convnd-cpu: tests/unit/bench_convnd.c src/convnd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c
+	$(CC) -O3 -fopenmp -I include -I. tests/unit/bench_convnd.c src/convnd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c -o tests/unit/bench_convnd -lm
+	@echo "✓ Benchmark ConvND CPU: tests/unit/bench_convnd"
+
+# Benchmark ConvND CUDA (dense vs séparable) - nécessite CUDA
+ifeq ($(CUDA_AVAILABLE),1)
+bench-convnd-cuda: tests/unit/bench_convnd_cuda.cu cuda/convnd.cu cuda/convnd_separable.cu $(OBJS)
+	$(NVCC) -O3 -arch=sm_70 -I include -I cuda tests/unit/bench_convnd_cuda.cu cuda/convnd.cu cuda/convnd_separable.cu src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c -o tests/unit/bench_convnd_cuda -lcudart
+	@echo "✓ Benchmark ConvND CUDA: tests/unit/bench_convnd_cuda"
+
+test-convnd-separable-cuda: tests/unit/test_convnd_separable.cu cuda/convnd_separable.cu
+	$(NVCC) -O3 -arch=sm_70 -I include -I cuda tests/unit/test_convnd_separable.cu cuda/convnd_separable.cu src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c -o tests/unit/test_convnd_separable_cuda -lcudart
+	@echo "✓ Test ConvND séparable CUDA: tests/unit/test_convnd_separable_cuda"
+else
+bench-convnd-cuda test-convnd-separable-cuda:
+	@echo "✗ Cible $@ nécessite CUDA (non disponible)"
+endif
 
 # ═══════════════════════════════════════════════════════════════
 # Nettoyage
