@@ -47,7 +47,7 @@ k-mamba/ — Les Volontés (orchestration du modèle Mamba)
 │   ├── wavefront_nd.c     # Générateur wavefront
 │   ├── wavefront_plan.c   # Plans wavefront
 │   ├── scan_nd.c          # Scan ND (wavefront séquentiel)
-│   └── convnd.c           # ConvND wavefront parallèle unifiée
+│   └── convnd.c           # ConvND dense K^N + séparable cascade 1D
 │
 ├── kernels/               # La Puissance (kernels inline C pur)
 │   ├── gemm_f32.c         # GEMM/GEMV en C pur

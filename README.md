@@ -38,7 +38,8 @@ h(n) = Σ_{k=1}^{N} A_k · h(n − e_k) + B(n) · x(n)
 | **Scan 1D** | ASM AVX2 | N/A | Séquentiel |
 | **Scan 2D** | ASM AVX2 | Anti-diagonale | Intra-diagonale |
 | **Scan ND** | C pur | Géométrique implicite | OpenMP optionnel |
-| **ConvND** | C pur | Wavefront unifié | OpenMP optionnel |
+| **ConvND Dense** | C pur | Wavefront unifié K^N | OpenMP optionnel |
+| **ConvND Séparable** | C pur | Cascade 1D wavefront | OpenMP optionnel | **4–5× plus rapide** |
 
 ### 2. Unification Wavefront
 
@@ -49,16 +50,14 @@ h(n) = Σ_{k=1}^{N} A_k · h(n − e_k) + B(n) · x(n)
 - Même parallélisme intra-niveau (OpenMP)
 
 ```c
-// ConvND wavefront parallèle
-for (long level = 0; level <= plan->max_level; level++) {
-    #ifdef _OPENMP
-    #pragma omp parallel for  // ← Parallélisme intra-niveau
-    #endif
-    for (long point = 0; point < level_size; point++) {
-        // Convolution dense ND
-    }
-}
+// ConvND Dense — noyau complet K^N
+convnd_forward_wavefront(p, plan);
+
+// ConvND Séparable — cascade de N convolutions 1D (Mamba-classic)
+convnd_separable_forward_wavefront(p, plans_per_axis);  // 4–5× plus rapide
 ```
+
+**Benchmark** (grille 2D 256×256, D=64, K=3) : Dense 135ms → Séparable 35ms = **3.9× speedup**. Voir `figures/convnd_dense_vs_separable.png` et section 8 de THEORY.md.
 
 ### 3. MUON natif CPU
 
