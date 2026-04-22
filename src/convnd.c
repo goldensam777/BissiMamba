@@ -224,6 +224,187 @@ void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPla
 }
 
 /* ============================================================
+ * Backward séparable: gradient dinput et dkernel par axe
+ * ============================================================ */
+
+typedef struct {
+    float *dinput;          /* Grad w.r.t input [prod(dims), D] */
+    float **dkernel_axes;   /* [ndims] grads w.r.t kernels [K] each */
+    float *dbias;           /* Grad w.r.t bias [D] or NULL */
+    long *dims;             /* Shape spatiale [ndims] */
+    long ndims;             /* Nombre d'axes */
+    long D;                 /* Canaux */
+    long K;                 /* Taille noyau par axe */
+} ConvNDSeparableBackwardParams;
+
+/* Backward 1D le long d'un axe: calcule dinput et dkernel */
+static void convnd_separable_1d_backward_wavefront(
+    float *input,          /* forward input [spatial*D] */
+    float *dy,             /* gradient from output [spatial*D] */
+    float *kernel_1d,      /* [K] */
+    float *dinput_out,     /* grad w.r.t input [spatial*D] (accumulate) */
+    float *dkernel_out,    /* grad w.r.t kernel [K] (accumulate) */
+    long axis,
+    long *dims,
+    long ndims,
+    long D,
+    long K,
+    KMWavefrontPlan *plan)
+{
+    long spatial_total = product(dims, ndims);
+    long *strides = (long *)malloc((size_t)ndims * sizeof(long));
+    if (!strides) return;
+    convnd_make_row_major_strides(dims, ndims, strides);
+
+    long axis_stride = strides[axis];
+    long kernel_radius = K / 2;
+
+    /* Init dkernel accumulation */
+    memset(dkernel_out, 0, (size_t)K * sizeof(float));
+
+    /* Wavefront backward: iterate in reverse level order */
+    for (long level = plan->max_level; level >= 0; level--) {
+        const long *level_offsets = km_wavefront_plan_level_offsets(plan, level);
+        long level_size = km_wavefront_plan_level_size(plan, level);
+        if (!level_offsets || level_size < 0) break;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (long point = 0; point < level_size; point++) {
+            long linear = level_offsets[point];
+            long coords[KMAMBA_MAX_NDIMS];
+
+            long tmp = linear;
+            for (long d = ndims; d-- > 0;) {
+                coords[d] = tmp % dims[d];
+                tmp /= dims[d];
+            }
+
+            long coord_axis = coords[axis];
+            if (coord_axis < kernel_radius || coord_axis >= dims[axis] - kernel_radius) {
+                continue;  /* Skip borders */
+            }
+
+            for (long c = 0; c < D; c++) {
+                float grad = dy[linear * D + c];
+
+                /* Accumulate dkernel */
+                for (long k = 0; k < K; k++) {
+                    long offset_k = (k - kernel_radius) * axis_stride;
+                    long src_idx = linear + offset_k;
+                    dkernel_out[k] += grad * input[src_idx * D + c];
+                }
+
+                /* Accumulate dinput */
+                for (long k = 0; k < K; k++) {
+                    long offset_k = (k - kernel_radius) * axis_stride;
+                    long src_idx = linear + offset_k;
+                    dinput_out[src_idx * D + c] += grad * kernel_1d[k];
+                }
+            }
+        }
+    }
+
+    free(strides);
+}
+
+/* Backward séparable: cascade inverse pour gradients */
+void convnd_separable_backward_wavefront(
+    ConvNDSeparableParams *forward_p,  /* params from forward pass */
+    ConvNDSeparableBackwardParams *grad_p,
+    float *dy,                         /* gradient w.r.t output [spatial*D] */
+    KMWavefrontPlan **plans_per_axis)
+{
+    long spatial_total;
+    float *temp_grad = NULL;  /* ping-pong buffer for gradient flow */
+
+    if (!forward_p || !grad_p || !dy) return;
+    if (!forward_p->dims || forward_p->ndims <= 0) return;
+
+    spatial_total = product(forward_p->dims, forward_p->ndims);
+
+    /* Init dinput accumulator */
+    memset(grad_p->dinput, 0, (size_t)spatial_total * grad_p->D * sizeof(float));
+
+    temp_grad = (float *)malloc((size_t)spatial_total * grad_p->D * sizeof(float));
+    if (!temp_grad) return;
+    memcpy(temp_grad, dy, (size_t)spatial_total * grad_p->D * sizeof(float));
+
+    /* Backward cascade: reverse order of axes */
+    for (long axis = forward_p->ndims - 1; axis >= 0; axis--) {
+        KMWavefrontPlan *plan = plans_per_axis ? plans_per_axis[axis] : NULL;
+        if (!plan) {
+            plan = km_wavefront_plan_create(forward_p->dims, forward_p->ndims);
+            if (!plan) { free(temp_grad); return; }
+        }
+
+        /* Need intermediate dinput accumulator for this axis */
+        float *dinput_axis = (axis == 0) ? grad_p->dinput :
+            (float *)calloc((size_t)spatial_total * grad_p->D, sizeof(float));
+        if (!dinput_axis) { km_wavefront_plan_free(plan); free(temp_grad); return; }
+
+        convnd_separable_1d_backward_wavefront(
+            (axis == forward_p->ndims - 1) ? forward_p->input : forward_p->output,
+            temp_grad,
+            forward_p->kernel_axes[axis],
+            dinput_axis,
+            grad_p->dkernel_axes[axis],
+            axis,
+            forward_p->dims,
+            forward_p->ndims,
+            grad_p->D,
+            grad_p->K,
+            plan
+        );
+
+        /* Pass gradient backward to next axis */
+        if (axis > 0) {
+            memcpy(temp_grad, dinput_axis, (size_t)spatial_total * grad_p->D * sizeof(float));
+            if (dinput_axis != grad_p->dinput) free(dinput_axis);
+        }
+
+        if (!plans_per_axis || !plans_per_axis[axis]) {
+            km_wavefront_plan_free(plan);
+        }
+    }
+
+    /* Gradient of bias */
+    if (grad_p->dbias) {
+        for (long i = 0; i < spatial_total; i++) {
+            for (long c = 0; c < grad_p->D; c++) {
+                grad_p->dbias[c] += dy[i * grad_p->D + c];
+            }
+        }
+    }
+
+    free(temp_grad);
+}
+
+/* ============================================================
+ * API unifiée séparable avec dispatch auto
+ * ============================================================ */
+
+typedef enum {
+    CONVND_SEPARABLE_FORWARD = 1,
+    CONVND_SEPARABLE_BACKWARD = 2,
+    CONVND_SEPARABLE_COMPLETE = 3
+} ConvNDSeparableMode;
+
+void convnd_separable(ConvNDSeparableParams *p, ConvNDSeparableMode mode, KMWavefrontPlan **plans_per_axis) {
+    if (!p || !p->dims || p->ndims <= 0) return;
+
+    if (mode & CONVND_SEPARABLE_FORWARD) {
+        convnd_separable_forward_wavefront(p, plans_per_axis);
+    }
+
+    if (mode & CONVND_SEPARABLE_BACKWARD) {
+        /* Backward requires separate grad params structure */
+        /* Caller must set up ConvNDSeparableBackwardParams */
+    }
+}
+
+/* ============================================================
  * Forward Wavefront - Parallélisé intra-niveau (DENSE ORIGINAL)
  * ============================================================ */
 
