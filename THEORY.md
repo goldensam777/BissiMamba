@@ -614,9 +614,32 @@ convnd_separable_forward_wavefront(p, plans_per_axis);  // N×K=6 multiplication
 
 **Parallélisme :** OpenMP `#pragma omp parallel for schedule(static)` sur chaque niveau wavefront. La largeur du niveau fournit le parallélisme géométrique naturel.
 
-### 8.5 Conclusion expérimentale
+### 8.5 Comportement CPU vs GPU — Pourquoi l'inverse?
 
-La convolution séparable Mamba-classic, parallélisée par wavefront, offre un **speedup 4–5×** sur les grilles réalistes (≥256×256) avec une empreinte mémoire réduite (pas de noyau K^N dense à stocker). Cette optimisation est intégrée dans k-mamba comme alternative à la convolution dense, préservant la philosophie zero-dependency.
+Une découverte surprenante des benchmarks : le gagnant dépend de la plateforme.
+
+| Plateforme | Approche gagnante | Speedup |
+|------------|-------------------|---------|
+| **CPU** | Séparable | **3–4× plus rapide** |
+| **GPU** | Dense | **1.3× plus rapide** |
+
+**Explications :**
+
+**Sur CPU**, la complexité computationnelle domine :
+- Dense : 9 multiplications par point (K^N = 3²)
+- Séparable : 6 multiplications par point (N×K = 2×3)
+- La réduction de 33% des ops arithmétiques l'emporte sur l'overhead de la cascade
+
+**Sur GPU**, l'efficacité d'exécution domine :
+- Dense : un seul kernel launch, mémoire coalescente optimale, parallélisme maximal
+- Séparable : N kernel launches (overhead), ping-pong buffers (bandwidth x2), synchronisations
+- Le GPU masque la complexité computationnelle via le parallélisme massif
+
+**Implication architecturale** : Il n'y a pas de "meilleur" algorithme absolu — le choix optimal dépend du backend d'exécution. k-mamba fournit les deux pour permettre cette adaptation.
+
+### 8.6 Conclusion expérimentale
+
+La convolution séparable Mamba-classic, parallélisée par wavefront, offre un **speedup 4–5×** sur CPU pour les grilles réalistes (≥256×256). Sur GPU, la convolution dense K^N est paradoxalement plus efficace (~1.3×) en raison de l'overhead des cascades et de l'excellente coalescence mémoire des kernels denses. Les deux approches sont intégrées dans k-mamba, préservant la philosophie zero-dependency.
 
 ---
 
