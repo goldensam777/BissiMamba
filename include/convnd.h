@@ -41,6 +41,50 @@ void convnd_backward_wavefront(ConvNDParams *p, const KMWavefrontPlan *plan);
 void convnd(ConvNDParams *p, ConvNDMode mode);
 
 /* ============================================================================
+ * SEPARABLE CONVOLUTION ND — Mamba Classic Style
+ * ============================================================================ */
+
+typedef struct {
+    float *input;           /* Input tensor [prod(dims), D] */
+    float *output;          /* Output tensor [prod(dims), D] */
+    float **kernel_axes;    /* [ndims] pointers to 1D kernels [K] each */
+    const float *bias;      /* Bias [D] or NULL */
+    long *dims;             /* Spatial shape [ndims] */
+    long ndims;             /* Number of spatial dimensions */
+    long D;                 /* Depth/channels */
+    long K;                 /* Kernel size along every axis */
+} ConvNDSeparableParams;
+
+typedef struct {
+    float *dinput;          /* Grad w.r.t input [prod(dims), D] */
+    float **dkernel_axes;   /* [ndims] grads w.r.t kernels [K] each */
+    float *dbias;           /* Grad w.r.t bias [D] or NULL */
+    long *dims;             /* Spatial shape [ndims] */
+    long ndims;             /* Number of spatial dimensions */
+    long D;                 /* Depth/channels */
+    long K;                 /* Kernel size along every axis */
+} ConvNDSeparableBackwardParams;
+
+typedef enum {
+    CONVND_SEPARABLE_FORWARD = 1,
+    CONVND_SEPARABLE_BACKWARD = 2,
+    CONVND_SEPARABLE_COMPLETE = 3
+} ConvNDSeparableMode;
+
+/* Forward pass — cascade of 1D convolutions per axis with wavefront */
+void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPlan **plans_per_axis);
+
+/* Backward pass — reverse cascade for gradients */
+void convnd_separable_backward_wavefront(
+    ConvNDSeparableParams *forward_p,
+    ConvNDSeparableBackwardParams *grad_p,
+    float *dy,
+    KMWavefrontPlan **plans_per_axis);
+
+/* Unified entry point for separable convolution */
+void convnd_separable(ConvNDSeparableParams *p, ConvNDSeparableMode mode, KMWavefrontPlan **plans_per_axis);
+
+/* ============================================================================
  * CUDA Backend (optional — compile with nvcc)
  * ============================================================================ */
 #ifdef __CUDACC__

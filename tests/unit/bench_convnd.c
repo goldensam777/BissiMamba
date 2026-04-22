@@ -19,31 +19,17 @@
 #include "km_topology.h"
 #include "wavefront_plan.h"
 
-/* Structure pour convolution séparable (définie dans convnd.c) */
-typedef struct {
-    float *input;
-    float *output;
-    float **kernel_axes;
-    const float *bias;
-    long *dims;
-    long ndims;
-    long D;
-    long K;
-} ConvNDSeparableParams;
-
-extern void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPlan **plans_per_axis);
-
-/* Timer utils */
+/* Timer utils - avoid conflict with POSIX timer_t */
 typedef struct {
     struct timespec start;
     struct timespec end;
-} timer_t;
+} bench_timer_t;
 
-static void timer_start(timer_t *t) {
+static void timer_start(bench_timer_t *t) {
     clock_gettime(CLOCK_MONOTONIC, &t->start);
 }
 
-static double timer_elapsed_ms(timer_t *t) {
+static double timer_elapsed_ms(bench_timer_t *t) {
     clock_gettime(CLOCK_MONOTONIC, &t->end);
     double ms = (t->end.tv_sec - t->start.tv_sec) * 1000.0;
     ms += (t->end.tv_nsec - t->start.tv_nsec) / 1e6;
@@ -70,10 +56,11 @@ int main(int argc, char *argv[]) {
     ConvNDParams p_dense;
     ConvNDSeparableParams p_sep;
     KMWavefrontPlan *plan;
-    timer_t timer;
+    bench_timer_t timer;
     double t_dense, t_sep;
-    int i, j, k;
+    int i, j;
     float max_diff, diff;
+    (void)product;  /* Suppress unused warning */
 
     /* Parse arguments */
     if (argc >= 3) {

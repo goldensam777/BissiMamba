@@ -25,6 +25,17 @@
 #include "kmamba_cuda_utils.h"
 
 /* ============================================================
+ * Forward declarations for separable convolution
+ * ============================================================ */
+
+void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPlan **plans_per_axis);
+void convnd_separable_backward_wavefront(
+    ConvNDSeparableParams *forward_p,
+    ConvNDSeparableBackwardParams *grad_p,
+    float *dy,
+    KMWavefrontPlan **plans_per_axis);
+
+/* ============================================================
  * Helpers
  * ============================================================ */
 
@@ -71,17 +82,8 @@ long convnd_kernel_volume(long ndims, long K) {
  * On applique: input -> conv_axis0 -> temp -> conv_axis1 -> ... -> output
  */
 
-/* Structure paramètres pour convolution séparable */
-typedef struct {
-    float *input;           /* Input [prod(dims), D] */
-    float *output;          /* Output [prod(dims), D] */
-    float **kernel_axes;    /* [ndims] pointeurs vers noyaux 1D [K] chacun */
-    const float *bias;      /* Bias [D] ou NULL */
-    long *dims;             /* Shape spatiale [ndims] */
-    long ndims;             /* Nombre d'axes */
-    long D;                 /* Canaux */
-    long K;                 /* Taille noyau par axe */
-} ConvNDSeparableParams;
+/* Structures ConvNDSeparableParams et ConvNDSeparableBackwardParams 
+ * sont définies dans convnd.h */
 
 /* Conv 1D le long d'un axe spécifique avec wavefront */
 static void convnd_separable_1d_wavefront(
@@ -227,16 +229,6 @@ void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPla
  * Backward séparable: gradient dinput et dkernel par axe
  * ============================================================ */
 
-typedef struct {
-    float *dinput;          /* Grad w.r.t input [prod(dims), D] */
-    float **dkernel_axes;   /* [ndims] grads w.r.t kernels [K] each */
-    float *dbias;           /* Grad w.r.t bias [D] or NULL */
-    long *dims;             /* Shape spatiale [ndims] */
-    long ndims;             /* Nombre d'axes */
-    long D;                 /* Canaux */
-    long K;                 /* Taille noyau par axe */
-} ConvNDSeparableBackwardParams;
-
 /* Backward 1D le long d'un axe: calcule dinput et dkernel */
 static void convnd_separable_1d_backward_wavefront(
     float *input,          /* forward input [spatial*D] */
@@ -379,29 +371,6 @@ void convnd_separable_backward_wavefront(
     }
 
     free(temp_grad);
-}
-
-/* ============================================================
- * API unifiée séparable avec dispatch auto
- * ============================================================ */
-
-typedef enum {
-    CONVND_SEPARABLE_FORWARD = 1,
-    CONVND_SEPARABLE_BACKWARD = 2,
-    CONVND_SEPARABLE_COMPLETE = 3
-} ConvNDSeparableMode;
-
-void convnd_separable(ConvNDSeparableParams *p, ConvNDSeparableMode mode, KMWavefrontPlan **plans_per_axis) {
-    if (!p || !p->dims || p->ndims <= 0) return;
-
-    if (mode & CONVND_SEPARABLE_FORWARD) {
-        convnd_separable_forward_wavefront(p, plans_per_axis);
-    }
-
-    if (mode & CONVND_SEPARABLE_BACKWARD) {
-        /* Backward requires separate grad params structure */
-        /* Caller must set up ConvNDSeparableBackwardParams */
-    }
 }
 
 /* ============================================================
