@@ -14,6 +14,19 @@
 #include "km_topology.h"
 #include "kmamba_cuda_utils.h"
 
+static inline float km_scan_exp(float x) {
+#ifdef KMAMBA_FAST_EXP_APPROX
+    /* Fast 3rd-order approximation around 0, clamped for stability. */
+    if (x > 8.0f) x = 8.0f;
+    if (x < -8.0f) x = -8.0f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    return 1.0f + x + 0.5f * x2 + (1.0f / 6.0f) * x3;
+#else
+    return expf(x);
+#endif
+}
+
 int scannd_validate(const ScanNDParams *p) {
     long total_points;
 
@@ -78,15 +91,15 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
 
         /* Wavefront: tous les points d'un niveau sont indépendants → parallélisme */
         int level_error = 0;
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static) reduction(||:level_error)
         for (long point = 0; point < level_size; point++) {
             long offset = level_offsets[point];
             long idx_local[KMAMBA_MAX_NDIMS];
 
             if (offset < 0 || offset >= total_points) {
                 level_error = 1;
+                continue;
             }
-            if (level_error) continue;
 
             km_unravel_index(offset, p->dims, strides, p->ndims, idx_local);
 
@@ -111,59 +124,40 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
                     float bu_t = p->B[pdm] * x_val;
                     if (Bu_cur) Bu_cur[dm] = bu_t;
 
-                    /* Mamba-3 exp-trapezoidal: accumulate weighted Bu_prev from predecessors */
-                    float bu_prev_acc = 0.0f;
-                    float decay_acc = 0.0f;
-                    int n_pred = 0;
-
-                    for (long axis = 0; axis < p->ndims; axis++) {
-                        if (idx_local[axis] > 0) {
-                            long prev_offset = offset - strides[axis];
-                            float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
-                            float a_val = p->A[(axis * p->D + d) * p->M + m];
-                            if (a_val > -1e-5f) a_val = -1e-5f;
-                            float alpha = expf(dt_axis * a_val);
-
-                            long prev_pdm = prev_offset * p->D * p->M + dm;
-
-                            if (p->lambda && Bu_prev) {
-                                /* Mamba-3: weighted average of predecessor Bu values */
-                                bu_prev_acc += Bu_prev[prev_pdm];
-                                decay_acc += alpha;
-                            } else {
-                                /* Original: simple decay accumulation */
-                                decay_acc += alpha;
-                            }
-                            n_pred++;
-                        }
-                    }
-
+                    /* Mamba-3 exp-trapezoidal: compute alphas once, reuse for Bu and h decay */
                     float h_new;
                     if (p->lambda && Bu_prev && Bu_cur) {
+                        float bu_prev_acc = 0.0f;
+                        float decay_acc = 0.0f;
+                        float h_decay_acc = 0.0f;
+                        int n_pred = 0;
+
+                        /* Single pass: compute all alphas, accumulate Bu and h contributions */
+                        for (long axis = 0; axis < p->ndims; axis++) {
+                            if (idx_local[axis] > 0) {
+                                long prev_offset = offset - strides[axis];
+                                float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
+                                float a_val = p->A[(axis * p->D + d) * p->M + m];
+                                if (a_val > -1e-5f) a_val = -1e-5f;
+                                float alpha = km_scan_exp(dt_axis * a_val);
+                                long prev_pdm = prev_offset * p->D * p->M + dm;
+
+                                bu_prev_acc += Bu_prev[prev_pdm];
+                                decay_acc += alpha;
+                                /* Use h_rot if available, else use h directly */
+                                float h_prev = h_rot ? h_rot[prev_pdm] : p->h[prev_pdm];
+                                h_decay_acc += alpha * h_prev;
+                                n_pred++;
+                            }
+                        }
+
                         /* Mamba-3 exp-trapezoidal formula */
                         float bu_prev_avg = (n_pred > 0) ? (bu_prev_acc / n_pred) : 0.0f;
                         float alpha_avg = (n_pred > 0) ? (decay_acc / n_pred) : 0.0f;
                         float beta = (1.0f - lambda_n) * dt_bar * alpha_avg;
                         float gamma = lambda_n * dt_bar;
 
-                        /* Note: h_rot application happens after this loop per channel pair */
-                        h_new = bu_prev_avg * beta + bu_t * gamma;
-                        if (n_pred > 0) {
-                            /* Add decayed rotated state from predecessors */
-                            for (long axis = 0; axis < p->ndims; axis++) {
-                                if (idx_local[axis] > 0) {
-                                    long prev_offset = offset - strides[axis];
-                                    float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
-                                    float a_val = p->A[(axis * p->D + d) * p->M + m];
-                                    if (a_val > -1e-5f) a_val = -1e-5f;
-                                    float alpha = expf(dt_axis * a_val);
-                                    long prev_pdm = prev_offset * p->D * p->M + dm;
-                                    /* Use h_rot if available, else use h directly */
-                                    float h_prev = h_rot ? h_rot[prev_pdm] : p->h[prev_pdm];
-                                    h_new += alpha * h_prev;
-                                }
-                            }
-                        }
+                        h_new = bu_prev_avg * beta + bu_t * gamma + h_decay_acc;
                         Bu_prev[pdm] = bu_t;  /* Store for next level */
                     } else {
                         /* Original scan_nd formula (backward compatible) */
@@ -173,7 +167,7 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
                                 long prev_offset = offset - strides[axis];
                                 float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
                                 float a_val = p->A[(axis * p->D + d) * p->M + m];
-                                float decay = expf(dt_axis * a_val);
+                                float decay = km_scan_exp(dt_axis * a_val);
                                 long prev_pdm = prev_offset * p->D * p->M + dm;
                                 h_new += decay * p->h[prev_pdm];
                             }
