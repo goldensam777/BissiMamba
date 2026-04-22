@@ -24,9 +24,21 @@ extern "C" {
 void gemm_f32(const float *A, const float *B, float *C,
               int M, int K, int N);
 
+/* GEMM: C[M,N] = A[M,K] @ B^T[N,K] */
+void gemm_f32_ABt(const float *A, const float *B, float *C,
+                  int M, int K, int N);
+
+/* GEMM: C[M,N] = A^T[M,K] @ B[K,N] */
+void gemm_f32_AtB(const float *A, const float *B, float *C,
+                  int M, int K, int N);
+
 /* GEMV: y[M] = A[M,N] @ x[N] (row-major) */
 void gemv_f32(const float *A, const float *x, float *y,
               int M, int N);
+
+/* GEMV: y[N] = A^T[N,M] @ x[M] */
+void gemv_f32_At(const float *A, const float *x, float *y,
+                 int M, int N);
 
 /* ============================================================
  * Activations (inline for performance)
