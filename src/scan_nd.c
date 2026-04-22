@@ -31,7 +31,6 @@ int scannd_validate(const ScanNDParams *p) {
 int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
     long total_points;
     long *strides;
-    long *idx;
 
     if (!scannd_validate(p)) return -1;
     if (!km_wavefront_plan_matches_dims(plan, p->dims, p->ndims)) return -1;
@@ -42,15 +41,12 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
     /* Utilise memory pool thread-local pour éviter malloc répété */
     KMMemoryPool *pool = km_memory_pool_threadlocal();
     strides = (long *)km_pool_alloc(pool, (size_t)p->ndims * sizeof(long));
-    idx = (long *)km_pool_alloc(pool, (size_t)p->ndims * sizeof(long));
-    if (!strides || !idx) {
+    if (!strides) {
         km_pool_free(pool, strides);
-        km_pool_free(pool, idx);
         return -1;
     }
     if (!km_make_row_major_strides(p->dims, p->ndims, strides)) {
         km_pool_free(pool, strides);
-        km_pool_free(pool, idx);
         return -1;
     }
 
@@ -63,7 +59,7 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
         Bu_prev = (float *)km_pool_alloc(pool, (size_t)total_points * p->D * p->M * sizeof(float));
         Bu_cur = (float *)km_pool_alloc(pool, (size_t)p->D * p->M * sizeof(float));
         if (!h_rot || !Bu_prev || !Bu_cur) {
-            km_pool_free(pool, strides); km_pool_free(pool, idx); 
+            km_pool_free(pool, strides);
             km_pool_free(pool, h_rot); km_pool_free(pool, Bu_prev); km_pool_free(pool, Bu_cur);
             return -1;
         }
@@ -76,7 +72,6 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
         long level_size = km_wavefront_plan_level_size(plan, level);
         if (!level_offsets || level_size < 0) {
             km_pool_free(pool, strides);
-            km_pool_free(pool, idx);
             km_pool_free(pool, h_rot); km_pool_free(pool, Bu_prev); km_pool_free(pool, Bu_cur);
             return -1;
         }
@@ -86,13 +81,14 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
         #pragma omp parallel for
         for (long point = 0; point < level_size; point++) {
             long offset = level_offsets[point];
+            long idx_local[KMAMBA_MAX_NDIMS];
 
             if (offset < 0 || offset >= total_points) {
                 level_error = 1;
             }
             if (level_error) continue;
 
-            km_unravel_index(offset, p->dims, strides, p->ndims, idx);
+            km_unravel_index(offset, p->dims, strides, p->ndims, idx_local);
 
             /* Mamba-3: lambda per point for exp-trapezoidal */
             float lambda_n = p->lambda ? p->lambda[offset] : 0.5f;
@@ -121,7 +117,7 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
                     int n_pred = 0;
 
                     for (long axis = 0; axis < p->ndims; axis++) {
-                        if (idx[axis] > 0) {
+                        if (idx_local[axis] > 0) {
                             long prev_offset = offset - strides[axis];
                             float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
                             float a_val = p->A[(axis * p->D + d) * p->M + m];
@@ -155,7 +151,7 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
                         if (n_pred > 0) {
                             /* Add decayed rotated state from predecessors */
                             for (long axis = 0; axis < p->ndims; axis++) {
-                                if (idx[axis] > 0) {
+                                if (idx_local[axis] > 0) {
                                     long prev_offset = offset - strides[axis];
                                     float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
                                     float a_val = p->A[(axis * p->D + d) * p->M + m];
@@ -173,7 +169,7 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
                         /* Original scan_nd formula (backward compatible) */
                         h_new = dt_bar * bu_t;
                         for (long axis = 0; axis < p->ndims; axis++) {
-                            if (idx[axis] > 0) {
+                            if (idx_local[axis] > 0) {
                                 long prev_offset = offset - strides[axis];
                                 float dt_axis = p->delta[(axis * total_points + offset) * p->D + d];
                                 float a_val = p->A[(axis * p->D + d) * p->M + m];
@@ -217,7 +213,6 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
         /* Vérification erreur après la boucle parallèle */
         if (level_error) {
             km_pool_free(pool, strides);
-            km_pool_free(pool, idx);
             km_pool_free(pool, h_rot); km_pool_free(pool, Bu_prev); km_pool_free(pool, Bu_cur);
             return -1;
         }
@@ -225,7 +220,6 @@ int scannd_ref_with_plan(ScanNDParams *p, const KMWavefrontPlan *plan) {
 
     /* Libère vers le pool pour réutilisation (pas de free système) */
     km_pool_free(pool, strides);
-    km_pool_free(pool, idx);
     km_pool_free(pool, h_rot);
     km_pool_free(pool, Bu_prev);
     km_pool_free(pool, Bu_cur);
