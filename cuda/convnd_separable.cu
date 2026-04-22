@@ -68,7 +68,7 @@ __global__ void separable_1d_kernel(
 
 
 /* ── API: Separable Forward ─────────────────────────────────── */
-extern "C" int om_convnd_separable_forward(ConvNDSeparableParams *p) {
+int om_convnd_separable_forward(ConvNDSeparableParams *p) {
     KMWavefrontPlan **plans = NULL;
     float *d_temp = NULL;
     float *current_input = NULL;

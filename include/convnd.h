@@ -93,6 +93,9 @@ int om_convnd_forward(ConvNDParams *p);
 
 /* Backward pass on GPU. Returns 0 on success, -1 on error. */
 int om_convnd_backward(ConvNDParams *p);
+
+/* Separable forward pass on GPU. Returns 0 on success, -1 on error. */
+int om_convnd_separable_forward(ConvNDSeparableParams *p);
 #endif
 
 #endif
