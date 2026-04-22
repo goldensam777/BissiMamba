@@ -111,6 +111,24 @@ void muon_update_vec_f32(float *param, const float *grad, float *m,
 void init_xavier_uniform_f32(float *W, size_t fan_in, size_t fan_out, unsigned int seed);
 void init_kaiming_uniform_f32(float *W, size_t fan_in, unsigned int seed);
 
+/* ============================================================
+ * T7: Aligned Memory Allocation for SIMD
+ * ============================================================ */
+
+/* Allocate memory aligned to 32 bytes (AVX2) or 64 bytes (AVX-512) */
+void* km_aligned_alloc(size_t size, size_t alignment);
+void km_aligned_free(void *ptr);
+
+/* Helper macros for common alignments */
+#define KM_ALIGN_AVX2 32
+#define KM_ALIGN_AVX512 64
+#define KM_ALIGN_CACHE 64
+
+/* Allocate with default AVX2 alignment */
+static inline void* km_alloc_simd(size_t size) {
+    return km_aligned_alloc(size, KM_ALIGN_AVX2);
+}
+
 #ifdef __cplusplus
 }
 #endif
