@@ -53,35 +53,6 @@ static inline void softmax_f32(const float *x, float *probs, int rows, int cols)
     for (int i = 0; i < cols; i++) probs[i] *= inv_sum;
 }
 
-/* GEMM variants for backward pass */
-static inline void gemm_f32_ABt(const float *A, const float *B, float *C,
-                                 int M, int N, int K) {
-    /* C[M,N] = A[M,K] @ B^T[N,K] (B is [N,K], we use it transposed) */
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[i * K + k] * B[j * K + k];
-            }
-            C[i * N + j] = sum;
-        }
-    }
-}
-
-static inline void gemm_f32_AtB(const float *A, const float *B, float *C,
-                                 int M, int N, int K) {
-    /* C[M,N] = A^T[M,K] @ B[K,N] (A is [K,M], we use it transposed) */
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[k * M + i] * B[k * N + j];
-            }
-            C[i * N + j] = sum;
-        }
-    }
-}
-
 /* ========= embedding ========= */
 
 static void embed_lookup(const KMamba *m, float *out, const uint32_t *tokens) {
