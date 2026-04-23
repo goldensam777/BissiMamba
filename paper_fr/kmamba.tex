@@ -557,10 +557,24 @@ GPU (MX450) & $512 \times 512$ & 15,1 & 19,9 & 0,76$\times$ \\
 \end{tabular}
 \end{table}
 
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.8\textwidth]{../figures/convnd_dense_vs_separable.pdf}
+\caption{Performance ConvND Dense vs Séparable sur CPU (grilles 2D, $D{=}64$, $K{=}3$).}
+\label{fig:convnd_cpu}
+\end{figure}
+
 Sur CPU, la séparable gagne grâce à l'arithmétique réduite ($6$ vs $9$ multiplications).
 Sur GPU, la dense gagne car (1) un seul lancement de noyau évite l'overhead,
 (2) meilleure coalescence mémoire, et (3) le GPU masque la complexité computationnelle
 via le parallélisme massif. Cela motive la fourniture des deux implémentations.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.8\textwidth]{../figures/convnd_cuda_dense_vs_separable.pdf}
+\caption{Performance ConvND Dense vs Séparable sur GPU (NVIDIA MX450).}
+\label{fig:convnd_gpu}
+\end{figure}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{Expériences}
