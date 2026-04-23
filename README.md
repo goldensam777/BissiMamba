@@ -57,7 +57,13 @@ convnd_forward_wavefront(p, plan);
 convnd_separable_forward_wavefront(p, plans_per_axis);  // 4–5× plus rapide
 ```
 
-**Benchmark** (grille 2D 256×256, D=64, K=3) : Dense 135ms → Séparable 35ms = **3.9× speedup**. Voir [`figures/convnd_dense_vs_separable.png`](figures/convnd_dense_vs_separable.p) et section 8 de THEORY.md.
+**Théorème** : Pour une grille $d \times d$, l'ordonnancement par front d'onde nécessite $2d - 1$ étapes séquentielles, chacune exposant jusqu'à $d$ tâches parallèles :
+
+$$S(d) = \frac{d^2}{2d - 1} \approx \frac{d}{2} \quad (d \gg 1)$$
+
+Mesuré : **32.25×** de speedup à $d = 64$ (Table `bench_paper.c`).
+
+**Benchmark** (grille 2D 256×256, D=64, K=3) : Dense 135ms → Séparable 35ms = **3.9× speedup**. Voir [`figures/convnd_dense_vs_separable.png`](figures/convnd_dense_vs_separable.png) et section 8 de THEORY.md.
 
 ### 3. MUON natif CPU
 
@@ -71,9 +77,22 @@ Implémentation C pure de l'optimiseur MUON :
 ### 4. GPU Optimizations (CUDA)
 
 #### Parallel Scan (Blelloch)
-- Scan SSM parallèle work-efficient
-- Remplacement des kernels `<<<1,1>>>` séquentiels
-- Forward et backward GPU natifs
+
+Scan SSM parallèle work-efficient utilisant l'algorithme de Blelloch sur le monoïde $(\otimes, (1,0))$ :
+
+```
+h_t = A_t · h_{t-1} + B_t · x_t    →    (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})
+```
+
+**Complexité** : Profondeur $O(\log L)$, Travail $O(L)$ — réduction de $51×$ à $L=1024$.
+
+| Méthode | Profondeur | Parallélisme |
+|---------|-----------|--------------|
+| CPU séquentiel | $O(L)$ | $O(1)$ |
+| CUDA séquentiel | $O(L)$ | $O(D \times M)$ |
+| **Blelloch CUDA** | $O(\log L)$ | $O(L \times D \times M)$ |
+
+Accélération théorique : **790×** pour $L=1024$, $D=128$, $M=16$.
 
 #### Mixed Precision FP16/BF16
 - **FP16** : Loss scaling dynamique (65536.0f) pour éviter underflow
@@ -206,4 +225,4 @@ convnd(&p, CONVND_FORWARD);   // Wavefront parallèle
 
 **YEVI Mawuli Peniel Samuel** — IFRI-UAC, Bénin
 
-*Ego Sum Optimus Optimus*
+_*Optima, Immo Absoluta Perfectio*_

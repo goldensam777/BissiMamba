@@ -58,6 +58,12 @@ convnd_forward_wavefront(p, plan);
 convnd_separable_forward_wavefront(p, plans_per_axis);  // 4–5× faster
 ```
 
+**Theorem**: For a $d \times d$ grid, wavefront scheduling requires $2d - 1$ sequential steps, each exposing up to $d$ parallel tasks:
+
+$$S(d) = \frac{d^2}{2d - 1} \approx \frac{d}{2} \quad (d \gg 1)$$
+
+Measured: **32.25×** speedup at $d = 64$ (Table `bench_paper.c`).
+
 **Benchmark** (2D grid 256×256, D=64, K=3): Dense 135ms → Separable 35ms = **3.9× speedup**. See `figures/convnd_dense_vs_separable.png` and section 8 of THEORY.md.
 
 ### 3. Native CPU MUON
@@ -72,9 +78,22 @@ Pure C implementation of the MUON optimizer:
 ### 4. GPU Optimizations (CUDA)
 
 #### Parallel Scan (Blelloch)
-- Work-efficient parallel SSM scan
-- Replacement for sequential `<<<1,1>>>` kernels
-- Native GPU forward and backward passes
+
+Work-efficient parallel SSM scan using Blelloch's algorithm over the monoid $(\otimes, (1,0))$:
+
+```
+h_t = A_t · h_{t-1} + B_t · x_t    →    (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})
+```
+
+**Complexity**: Depth $O(\log L)$, Work $O(L)$ — $51\times$ reduction at $L=1024$.
+
+| Method | Depth | Parallelism |
+|--------|-------|-------------|
+| CPU sequential | $O(L)$ | $O(1)$ |
+| CUDA sequential | $O(L)$ | $O(D \times M)$ |
+| **Blelloch CUDA** | $O(\log L)$ | $O(L \times D \times M)$ |
+
+Theoretical speedup: **790×** for $L=1024$, $D=128$, $M=16$.
 
 #### Mixed Precision FP16/BF16
 - **FP16**: Dynamic loss scaling (65536.0f) to prevent underflow
