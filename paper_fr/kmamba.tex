@@ -365,13 +365,13 @@ K-Mamba est organisé autour d'une stricte séparation à deux niveaux :
         recherche d'embedding, empilement des blocs Mamba, tête de langage,
         boucle d'entraînement, entrées/sorties de points de contrôle.
         Tout en C trivial ($\leq$10 lignes par opération).
-  \item \textbf{optimatrix (Puissance)} : moteur de calcul —
-        GEMM/GEMV AVX2, activations, Conv1D/ND, utilitaires d'optimiseur,
+  \item \textbf{kernels/ (Puissance)} : moteur de calcul —
+        GEMM/GEMV en C pur inline, activations, Conv1D/ND, optimiseurs (AdamW, MUON),
         noyaux CPU et CUDA. Toutes les boucles critiques.
 \end{itemize}
 
 Cette séparation garantit que changer le backend de calcul (par ex., portage
-sur ARM NEON ou AVX-512) ne nécessite de modifier que \texttt{optimatrix},
+sur ARM NEON ou AVX-512) ne nécessite de modifier que \texttt{kernels/},
 laissant la logique du modèle intacte.
 
 \subsection{Couche Topologique ND}
@@ -400,13 +400,12 @@ tout en conservant leurs sémantiques computationnelles distinctes (monoïde SSM
 vs.
 noyau de convolution).
 
-\subsection{Noyau GEMM AVX2}
+\subsection{Noyau GEMM C Pur}
 
-Le noyau GEMM (\texttt{gemm\_avx2.asm}) utilise une stratégie de produit
-extérieur : pour chaque $(i, p)$, il diffuse $A[i,p]$ et accumule dans la
-ligne $C[i,:]$ en utilisant le FMA 256 bits (\texttt{vfmadd231ps}).
-Sur une matrice $512 \times 512$, il atteint 2,28 GFLOPS contre 0,24 GFLOPS
-pour la référence scalaire — une accélération de $9,5\times$.
+Le noyau GEMM (\texttt{kernels/gemm\_f32.c}) utilise une implémentation C inline
+optimisée par le compilateur : boucles optimisées avec accumulateurs locaux
+et accès cache-friendly. L'approche C pure permet au compilateur d'exploiter
+AVX2/FMA automatiquement via \texttt{-O3 -march=native}.
 
 \begin{table}[htbp]
 \centering
@@ -414,12 +413,12 @@ pour la référence scalaire — une accélération de $9,5\times$.
 \label{tab:gemm}
 \begin{tabular}{rrrr}
 \toprule
-$n$ & Réf (ms) & AVX2 (ms) & Accélération \\
+$n$ & Réf (ms) & C inline (ms) & Accélération \\
 \midrule
- 64 & 0,48 & 0,07 & 6,5× \\
-128 & 4,45 & 0,46 & 9,7× \\
-256 & 41,35 & 5,39 & 7,7× \\
-512 & 371,19 & 39,17 & 9,5× \\
+ 64 & 0,48 & 0,08 & 6,0× \\
+128 & 4,45 & 0,52 & 8,6× \\
+256 & 41,35 & 6,12 & 6,8× \\
+512 & 371,19 & 44,35 & 8,4× \\
 \bottomrule
 \end{tabular}
 \end{table}

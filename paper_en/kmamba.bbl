@@ -1,0 +1,53 @@
+\begin{thebibliography}{1}
+
+\bibitem{bjorck1971}
+{\AA}ke Bj{\"o}rck and C~Bowie.
+\newblock An iterative algorithm for computing the best estimate of an
+  orthogonal matrix.
+\newblock {\em SIAM Journal on Numerical Analysis}, 8(2):358--364, 1971.
+
+\bibitem{blelloch1990}
+Guy~E Blelloch.
+\newblock Prefix sums and their applications.
+\newblock Technical Report CMU-CS-90-190, Carnegie Mellon University, 1990.
+
+\bibitem{mamba2023}
+Albert Gu and Tri Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock {\em arXiv preprint arXiv:2312.00752}, 2023.
+
+\bibitem{s4}
+Albert Gu, Karan Goel, and Christopher Re.
+\newblock Efficiently modeling long sequences with structured state spaces.
+\newblock In {\em International Conference on Learning Representations}, 2022.
+
+\bibitem{harris2007gpu}
+Mark Harris, Shubhabrata Sengupta, and John~D Owens.
+\newblock Parallel prefix sum (scan) with cuda.
+\newblock In {\em GPU gems 3}, volume~39, pages 851--876. Addison-Wesley
+  Professional, 2007.
+
+\bibitem{muon2025}
+Keller Jordan et~al.
+\newblock Muon: Momentum + orthogonalization.
+\newblock {\em arXiv preprint arXiv:2502.16982}, 2025.
+\newblock Moonshot AI.
+
+\bibitem{mamband}
+Shibo Li, Harsimrat Singh, and Aditya Grover.
+\newblock Mamba-nd: Selective state space modeling for multi-dimensional data.
+\newblock {\em arXiv preprint arXiv:2402.05892}, 2024.
+
+\bibitem{vmamba}
+Yue Liu, Yunjie Tian, Yuzhong Zhao, Hongtian Yu, Lingxi Xie, Yaowei Wang,
+  Qixiang Ye, and Yunfan Liu.
+\newblock Vmamba: Visual state space models.
+\newblock {\em arXiv preprint arXiv:2401.13260}, 2024.
+
+\bibitem{williams2009roofline}
+Samuel Williams, Andrew Waterman, and David Patterson.
+\newblock Roofline: an insightful visual performance model for multicore
+  architectures.
+\newblock {\em Communications of the ACM}, 52(4):65--76, 2009.
+
+\end{thebibliography}

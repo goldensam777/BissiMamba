@@ -54,7 +54,8 @@ void gpu_optimizer_step(MambaBlock *block, const MBOptimConfig *conf);
 void cuda_embedding_forward(const float *d_embed, const uint32_t *d_tokens, float *d_out, int L, int D);
 void cuda_head_forward(cublasHandle_t handle, const float *d_head, const float *d_hidden, float *d_logits, int L, int D, int V);
 void cuda_softmax_loss_kernel(const float *d_logits, const uint32_t *d_targets, float *d_loss, float *d_dlogits, int L, int V);
-void cuda_adamw_step_kernel(float *param, const float *grad, float *m, float *v, float lr, float beta1, float beta2, float eps, float wd, int n, int t);
+void cuda_adamw_step_wrapper(float *param, float *grad, float *m, float *v,
+                              float lr, float beta1, float beta2, float eps, float wd, int n, int step);
 #ifdef __cplusplus
 }
 #endif
@@ -483,10 +484,10 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
     for (size_t i = 0; i < n_layers; i++) {
         gpu_optimizer_step(m->layers[i], &m->opt_blocks);
     }
-    int blk_e = (V * D + 255) / 256;
-    cuda_adamw_step_kernel<<<blk_e, 256>>>(m->gpu.d_embedding, m->gpu.d_g_embed, m->gpu.d_m_embed, m->gpu.d_v_embed, m->lr_embed_head, 0.9f, 0.999f, 1e-8f, m->weight_decay, (int)(V * D), (int)m->step_embed_head);
-    int blk_h = (D * V + 255) / 256;
-    cuda_adamw_step_kernel<<<blk_h, 256>>>(m->gpu.d_head, m->gpu.d_g_head, m->gpu.d_m_head, m->gpu.d_v_head, m->lr_embed_head, 0.9f, 0.999f, 1e-8f, m->weight_decay, (int)(D * V), (int)m->step_embed_head);
+    cuda_adamw_step_wrapper(m->gpu.d_embedding, m->gpu.d_g_embed, m->gpu.d_m_embed, m->gpu.d_v_embed,
+                          m->lr_embed_head, 0.9f, 0.999f, 1e-8f, m->weight_decay, (int)(V * D), (int)m->step_embed_head);
+    cuda_adamw_step_wrapper(m->gpu.d_head, m->gpu.d_g_head, m->gpu.d_m_head, m->gpu.d_v_head,
+                          m->lr_embed_head, 0.9f, 0.999f, 1e-8f, m->weight_decay, (int)(D * V), (int)m->step_embed_head);
 
     cudaFree(d_acts); cudaFree(d_logits); cudaFree(d_dlogits); cudaFree(d_dhidden); cudaFree(d_loss); cudaFree(d_batch_tokens);
     return total_loss * invB;

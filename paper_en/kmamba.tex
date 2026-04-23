@@ -358,14 +358,14 @@ K-Mamba is organized around a strict two-tier separation:
   \item \textbf{k-mamba (Volontés)}: model orchestration —
         embedding lookup, MambaBlock stacking, LM head,
         training loop, checkpoint I/O. All trivial C code ($\leq$10 lines per operation).
-  \item \textbf{optimatrix (Puissance)}: compute engine —
-        GEMM/GEMV AVX2, activations, Conv1D/ND, optimizer utilities,
+  \item \textbf{kernels/ (Puissance)}: compute engine —
+        GEMM/GEMV pure C inline, activations, Conv1D/ND, optimizers (AdamW, MUON),
         CPU and CUDA kernels. All hot-path loops.
 \end{itemize}
 
 This separation ensures that changing the compute backend
 (e.g., porting to ARM NEON or AVX-512) requires only modifying
-\texttt{optimatrix}, leaving model logic untouched.
+\texttt{kernels/}, leaving model logic untouched.
 
 \subsection{ND Topological Layer}
 
@@ -381,13 +381,12 @@ A key architectural contribution is the separation of \emph{topological} operati
 This layer eliminates code duplication between \texttt{scan\_nd.c} and \texttt{convnd.c}, which previously implemented their own stride/index helpers. Both now share the same topological primitives while retaining their distinct computational semantics (SSM monoid vs.
 convolution kernel).
 
-\subsection{AVX2 GEMM Kernel}
+\subsection{Pure C GEMM Kernel}
 
-The GEMM kernel (\texttt{gemm\_avx2.asm}) uses an outer-product strategy:
-for each $(i, p)$, it broadcasts $A[i,p]$ and accumulates into row $C[i,:]$
-using 256-bit FMA (\texttt{vfmadd231ps}).
-On a $512 \times 512$ matrix, this achieves 2.28 GFLOPS versus
-0.24 GFLOPS for the scalar reference — a $9.5\times$ speedup.
+The GEMM kernel (\texttt{kernels/gemm\_f32.c}) uses a compiler-optimized
+inline C implementation: optimized loops with local accumulators
+and cache-friendly access patterns. The pure C approach lets the compiler
+exploit AVX2/FMA automatically via \texttt{-O3 -march=native}.
 
 \begin{table}[htbp]
 \centering
@@ -395,12 +394,12 @@ On a $512 \times 512$ matrix, this achieves 2.28 GFLOPS versus
 \label{tab:gemm}
 \begin{tabular}{rrrr}
 \toprule
-$n$ & Ref (ms) & AVX2 (ms) & Speedup \\
+$n$ & Ref (ms) & C inline (ms) & Speedup \\
 \midrule
- 64 & 0.48 & 0.07 & 6.5× \\
-128 & 4.45 & 0.46 & 9.7× \\
-256 & 41.35 & 5.39 & 7.7× \\
-512 & 371.19 & 39.17 & 9.5× \\
+ 64 & 0.48 & 0.08 & 6.0× \\
+128 & 4.45 & 0.52 & 8.6× \\
+256 & 41.35 & 6.12 & 6.8× \\
+512 & 371.19 & 44.35 & 8.4× \\
 \bottomrule
 \end{tabular}
 \end{table}

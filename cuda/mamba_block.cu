@@ -908,3 +908,11 @@ extern "C" void gpu_optimizer_step(MambaBlock *block, const MBOptimConfig *conf)
     if (block->theta)
         step_gpu(block->gpu.d_theta, block->gpu.d_g_theta, block->gpu.d_m_theta, block->gpu.d_v_theta, TS);
 }
+
+/* ── Wrapper C pour l'optimizer AdamW ─────────────────────────── */
+extern "C" void cuda_adamw_step_wrapper(float *param, float *grad, float *m, float *v,
+                                          float lr, float beta1, float beta2, float eps,
+                                          float wd, int n, int step) {
+    int blk = (n + 255) / 256;
+    cuda_adamw_step_kernel<<<blk, 256>>>(param, grad, m, v, lr, beta1, beta2, eps, wd, n, step);
+}

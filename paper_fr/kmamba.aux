@@ -1,0 +1,112 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{vmamba,mamband}
+\citation{blelloch1990}
+\citation{muon2025}
+\citation{mamba2023}
+\citation{vmamba}
+\citation{mamband}
+\citation{muon2025}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\citation{s4}
+\citation{mamba2023}
+\citation{blelloch1990}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Contexte}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Modèles d'espace d'état sélectifs}{2}{subsection.2.1}\protected@file@percent }
+\newlabel{eq:mamba_ab}{{5}{2}{Modèles d'espace d'état sélectifs}{equation.2.5}{}}
+\newlabel{eq:mamba_rec}{{6}{2}{Modèles d'espace d'état sélectifs}{equation.2.6}{}}
+\newlabel{eq:mamba_out}{{7}{2}{Modèles d'espace d'état sélectifs}{equation.2.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Scan parallèle préfixé}{2}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:blelloch_bg}{{2.2}{2}{Scan parallèle préfixé}{subsection.2.2}{}}
+\newlabel{eq:monoid}{{9}{2}{Scan parallèle préfixé}{equation.2.9}{}}
+\citation{vmamba}
+\citation{mamband}
+\citation{blelloch1990,harris2007gpu}
+\@writefile{toc}{\contentsline {section}{\numberline {3}K-Mamba : récurrence ND native}{3}{section.3}\protected@file@percent }
+\newlabel{sec:theory}{{3}{3}{K-Mamba : récurrence ND native}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Formulation}{3}{subsection.3.1}\protected@file@percent }
+\newlabel{eq:nd_rec}{{10}{3}{Formulation}{equation.3.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Comparaison avec les travaux antérieurs}{3}{subsection.3.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Approches Mamba multi-dimensionnelles.}}{3}{table.1}\protected@file@percent }
+\newlabel{tab:comparison}{{1}{3}{Approches Mamba multi-dimensionnelles}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Ordonnancement par front d'onde}{3}{section.4}\protected@file@percent }
+\newlabel{sec:wavefront}{{4}{3}{Ordonnancement par front d'onde}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Graphe de dépendances 2D}{3}{subsection.4.1}\protected@file@percent }
+\newlabel{thm:wavefront}{{1}{3}{Parallélisme par front d'onde}{theorem.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Validation expérimentale}{3}{subsection.4.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Accélération par front d'onde sur grilles $d \times d$ ($D{=}32$, $M{=}8$).}}{4}{table.2}\protected@file@percent }
+\newlabel{tab:wavefront}{{2}{4}{Accélération par front d'onde sur grilles $d \times d$ ($D{=}32$, $M{=}8$)}{table.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Scan CUDA de Blelloch}{4}{section.5}\protected@file@percent }
+\newlabel{sec:blelloch}{{5}{4}{Scan CUDA de Blelloch}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Algorithme}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Scan SSM de Blelloch (un bloc, une paire $(d,m)$)}}{4}{algorithm.1}\protected@file@percent }
+\newlabel{alg:blelloch}{{1}{4}{Algorithme}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Analyse de complexité}{4}{subsection.5.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Complexité du scan. $P = d_1 \times d_2$ positions ; $D$, $M$ fixés.}}{4}{table.3}\protected@file@percent }
+\newlabel{tab:complexity}{{3}{4}{Complexité du scan. $P = d_1 \times d_2$ positions ; $D$, $M$ fixés}{table.3}{}}
+\citation{muon2025}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Substitution pour $L > L_{\max }$}{5}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Implémentation}{5}{section.6}\protected@file@percent }
+\newlabel{sec:implementation}{{6}{5}{Implémentation}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Architecture : Volontés/Puissance}{5}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Couche Topologique ND}{5}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Noyau GEMM C Pur}{5}{subsection.6.3}\protected@file@percent }
+\citation{bjorck1971}
+\citation{williams2009roofline}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Performance GEMM (carré $n \times n$, 200 itérations).}}{6}{table.4}\protected@file@percent }
+\newlabel{tab:gemm}{{4}{6}{Performance GEMM (carré $n \times n$, 200 itérations)}{table.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Optimiseur MUONCLIP}{6}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Analyse FLOP}{6}{subsection.6.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Analyse roofline}{6}{section.7}\protected@file@percent }
+\newlabel{sec:roofline}{{7}{6}{Analyse roofline}{section.7}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Classification roofline des noyaux K-Mamba.}}{6}{table.5}\protected@file@percent }
+\newlabel{tab:roofline}{{5}{6}{Classification roofline des noyaux K-Mamba}{table.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Passe arrière et adjoint}{7}{section.8}\protected@file@percent }
+\newlabel{sec:backward}{{8}{7}{Passe arrière et adjoint}{section.8}{}}
+\newlabel{eq:adjoint_g}{{17}{7}{Passe arrière et adjoint}{equation.8.17}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Convolution séparable}{7}{section.9}\protected@file@percent }
+\newlabel{sec:separable}{{9}{7}{Convolution séparable}{section.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}Implémentation}{7}{subsection.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}Performance CPU vs GPU}{7}{subsection.9.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Performance ConvND : Dense $K^N$ vs Cascade séparable (grilles 2D, $D{=}64$, $K{=}3$).}}{7}{table.6}\protected@file@percent }
+\newlabel{tab:convnd}{{6}{7}{Performance ConvND : Dense $K^N$ vs Cascade séparable (grilles 2D, $D{=}64$, $K{=}3$)}{table.6}{}}
+\citation{mamba2023}
+\citation{s4}
+\citation{vmamba}
+\citation{mamband}
+\citation{blelloch1990}
+\citation{harris2007gpu}
+\citation{muon2025}
+\citation{bjorck1971}
+\citation{williams2009roofline}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Expériences}{8}{section.10}\protected@file@percent }
+\newlabel{sec:experiments}{{10}{8}{Expériences}{section.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.1}GEMM}{8}{subsection.10.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.2}Parallélisme par front d'onde}{8}{subsection.10.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.3}Profondeur de Blelloch}{8}{subsection.10.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Profondeur de Blelloch vs profondeur séquentielle.}}{8}{table.7}\protected@file@percent }
+\newlabel{tab:blelloch}{{7}{8}{Profondeur de Blelloch vs profondeur séquentielle}{table.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.4}Tests de l'optimiseur}{8}{subsection.10.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}Discussion}{8}{section.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Limites.}{8}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Généralisation $N$-dimensionnelle.}{8}{section*.3}\protected@file@percent }
+\bibstyle{plain}
+\bibdata{kmamba}
+\bibcite{bjorck1971}{1}
+\bibcite{blelloch1990}{2}
+\bibcite{mamba2023}{3}
+\bibcite{s4}{4}
+\bibcite{harris2007gpu}{5}
+\@writefile{toc}{\contentsline {section}{\numberline {12}Travaux connexes}{9}{section.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13}Conclusion}{9}{section.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Preuve de l'associativité du monoïde}{9}{appendix.A}\protected@file@percent }
+\newlabel{app:monoid}{{A}{9}{Preuve de l'associativité du monoïde}{appendix.A}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Parallélisme par front d'onde pour $d_1 \neq  d_2$}{9}{appendix.B}\protected@file@percent }
+\newlabel{app:wavefront_rect}{{B}{9}{Parallélisme par front d'onde pour $d_1 \neq d_2$}{appendix.B}{}}
+\bibcite{muon2025}{6}
+\bibcite{mamband}{7}
+\bibcite{vmamba}{8}
+\bibcite{williams2009roofline}{9}
+\gdef \@abspage@last{10}
