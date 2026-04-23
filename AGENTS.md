@@ -230,6 +230,7 @@ Devise : **"Ego Sum Optimus Optimus"**
 |---------|-----------|
 | `libs/kser/include/kser.h` | Nouveau layout documenté (16+96+4+V+D+4+T+32), structures packed avec `_pad[]` |
 | `libs/kser/src/kser_write.c` | Ordre d'écriture strict : header→config→vocab_count→vocab→tensors→tensor_index→SHA256. Atomic rename sur `.tmp` |
+| `libs/kser/src/kser_read.c` | **Reader complet réimplémenté** avec mmap cross-platform (POSIX + Windows), détection auto de tensor_count par scan arrière depuis checksum |
 | `libs/kser/src/kser_checksum.c` | SHA256 optimisé, ajout de `kser_sha256_file()` pour streaming |
 | `libs/kser/src/kser_quantize.c` | Code simplifié, fonctions FP16/BF16/INT8 compactées |
 

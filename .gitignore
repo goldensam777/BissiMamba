@@ -62,3 +62,5 @@ data/
 
 CONCEPT.md
 
+# Rust Packages
+tokenizer_rs/target

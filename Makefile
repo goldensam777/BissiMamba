@@ -52,6 +52,14 @@ CFLAGS += -DKMAMBA_BUILD_CUDA
 endif
 
 # ═══════════════════════════════════════════════════════════════
+# libkser Integration
+# ═══════════════════════════════════════════════════════════════
+KSER_DIR = libs/kser
+KSER_LIB = $(KSER_DIR)/libkser.a
+KSER_LDFLAGS = -L$(KSER_DIR) -lkser
+CFLAGS += -I$(KSER_DIR)/include
+
+# ═══════════════════════════════════════════════════════════════
 # Fichiers source
 # ═══════════════════════════════════════════════════════════════
 SRCS = src/kmamba.c \
@@ -66,6 +74,7 @@ SRCS = src/kmamba.c \
        src/scan_nd.c \
        src/convnd.c \
        src/km_memory_pool.c \
+       src/kmamba_ser.c \
        kernels/gemm_f32.c \
        kernels/activations_f32.c \
        kernels/elementwise_f32.c \
@@ -125,9 +134,15 @@ all: lib all_models
 	@echo "=== Compilation complète terminée ==="
 
 # Juste la bibliothèque
-lib: check_cuda check_rust $(RUST_LIB) $(TARGET)
+lib: check_cuda check_rust $(KSER_LIB) $(RUST_LIB) $(TARGET)
 	@echo ""
 	@echo "=== libkmamba.a prête ==="
+
+# libkser static library
+$(KSER_LIB):
+	@echo "Building libkser..."
+	$(MAKE) -C $(KSER_DIR)
+	@echo "✓ libkser.a prête"
 
 # Tous les modèles
 models: all_models
@@ -209,7 +224,7 @@ models_dir:
 	@mkdir -p models
 
 # Lien des libs
-MODEL_LDFLAGS = $(TARGET) $(LDFLAGS)
+MODEL_LDFLAGS = $(TARGET) $(KSER_LIB) $(LDFLAGS)
 ifeq ($(RUST_AVAILABLE),1)
 MODEL_LDFLAGS += $(RUST_LIB) $(RUST_LDFLAGS)
 endif
@@ -218,19 +233,19 @@ MODEL_LDFLAGS += $(CUDA_LDFLAGS)
 endif
 
 # Modèle CPU
-$(MODEL_CPU): models/kmamba_cpu.c $(TARGET) $(RUST_LIB) | models_dir
+$(MODEL_CPU): models/kmamba_cpu.c $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 	$(CC) $(CFLAGS) -o $@ $< $(MODEL_LDFLAGS)
 	@echo "Built: $@ (CPU 500K params, BPE 32K)"
 
 # Modèle CUDA (fichier .cu compilé avec nvcc)
-$(MODEL_CUDA): models/kmamba_cuda.cu $(TARGET) $(RUST_LIB) | models_dir
+$(MODEL_CUDA): models/kmamba_cuda.cu $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 ifeq ($(CUDA_AVAILABLE),1)
-	$(NVCC) $(CUDA_FLAGS) -o $@ $< $(TARGET) $(CUDA_LDFLAGS) $(RUST_LIB) $(RUST_LDFLAGS) -Xcompiler "$(CFLAGS)"
+	$(NVCC) $(CUDA_FLAGS) -o $@ $< $(TARGET) $(KSER_LIB) $(CUDA_LDFLAGS) $(RUST_LIB) $(RUST_LDFLAGS) -Xcompiler "$(CFLAGS)"
 	@echo "Built: $@ (CUDA 500M params, BPE 32K)"
 endif
 
 # Modèle Hybrid
-$(MODEL_HYBRID): models/kmamba_hybrid.c $(TARGET) $(RUST_LIB) | models_dir
+$(MODEL_HYBRID): models/kmamba_hybrid.c $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 ifeq ($(CUDA_AVAILABLE),1)
 	$(CC) $(CFLAGS) -o $@ $< $(MODEL_LDFLAGS)
 	@echo "Built: $@ (Hybrid 1.5M params, BPE 32K)"
@@ -316,6 +331,7 @@ clean:
 	rm -f $(OBJS) $(ASM_OBJS)
 	rm -f src/*.o kernels/*.o cpu/*.o
 	rm -f test_mamba3 test_mamba3_gpu
+	$(MAKE) -C $(KSER_DIR) clean 2>/dev/null || true
 ifeq ($(CUDA_AVAILABLE),1)
 	rm -f cuda/*.cu.o
 endif

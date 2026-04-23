@@ -3,6 +3,7 @@
  * Single source of truth — never duplicate in other files.
  * ============================================================================ */
 
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include "kser.h"

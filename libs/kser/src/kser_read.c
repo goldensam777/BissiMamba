@@ -1,8 +1,20 @@
 /* ============================================================================
- * kser_read.c - Lecture de fichiers .ser avec mmap
+ * kser_read.c — Reader for .ser files
+ *
+ * Reads the file layout written by kser_write.c:
+ *   [0]       16  Header
+ *   [16]      96  KSerConfig
+ *   [112]      4  vocab_count
+ *   [116]      V  Vocab entries
+ *   [116+V]    D  Tensor data
+ *   [116+V+D]  4  tensor_count
+ *   [+4]       T  KSerTensorEntry[]
+ *   [end-32]  32  SHA256
+ *
+ * Cross-platform: mmap on POSIX, MapViewOfFile on Windows.
+ * Falls back to fread if mmap fails.
  * ============================================================================ */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,224 +23,268 @@
 #include "kser.h"
 
 #ifdef _WIN32
-#include <windows.h>
-#include <io.h>
-#define FSEEKO _fseeki64
-#define FTELLO _ftelli64
+#  include <windows.h>
+#  include <io.h>
+#  define FSEEKO _fseeki64
+#  define FTELLO _ftelli64
 #else
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
-#define FSEEKO fseeko
-#define FTELLO ftello
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <sys/mman.h>
+#  define FSEEKO fseeko
+#  define FTELLO ftello
 #endif
 
-/* Forward declarations */
-extern void sha256_init(void* ctx);
-extern void sha256_update(void* ctx, const uint8_t* data, size_t len);
-extern void sha256_final(void* ctx, uint8_t hash[32]);
-typedef struct { uint32_t state[8]; uint64_t count; uint8_t buffer[64]; } SHA256_CTX;
-extern void sha256(const uint8_t* data, size_t len, uint8_t hash[32]);
+/* Forward from kser_checksum.c */
+int kser_sha256_file(FILE* fp, long end_pos, uint8_t hash[32]);
 
-/* Forward declaration for internal function */
-static void kser_reader_close(KSerReader* r);
+/* ── Platform mmap abstraction ──────────────────────────────────────────── */
 
-/* Internal reader structure */
-struct KSerReader {
-    /* File handling */
+typedef struct {
+    uint8_t* ptr;
+    size_t   size;
+#ifdef _WIN32
+    HANDLE   file_handle;
+    HANDLE   map_handle;
+#else
     int      fd;
+#endif
+} MmapView;
+
+static int mmap_open(const char* path, MmapView* v) {
+    memset(v, 0, sizeof(MmapView));
+
+#ifdef _WIN32
+    v->file_handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (v->file_handle == INVALID_HANDLE_VALUE) return -1;
+
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(v->file_handle, &sz)) {
+        CloseHandle(v->file_handle); return -1;
+    }
+    v->size = (size_t)sz.QuadPart;
+
+    v->map_handle = CreateFileMappingA(v->file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!v->map_handle) {
+        CloseHandle(v->file_handle); return -1;
+    }
+
+    v->ptr = (uint8_t*)MapViewOfFile(v->map_handle, FILE_MAP_READ, 0, 0, 0);
+    if (!v->ptr) {
+        CloseHandle(v->map_handle);
+        CloseHandle(v->file_handle);
+        return -1;
+    }
+    return 0;
+
+#else
+    v->fd = open(path, O_RDONLY);
+    if (v->fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(v->fd, &st) < 0) { close(v->fd); return -1; }
+    v->size = (size_t)st.st_size;
+
+    v->ptr = (uint8_t*)mmap(NULL, v->size, PROT_READ, MAP_PRIVATE, v->fd, 0);
+    if (v->ptr == MAP_FAILED) { v->ptr = NULL; close(v->fd); return -1; }
+    return 0;
+#endif
+}
+
+static void mmap_close(MmapView* v) {
+    if (!v->ptr) return;
+#ifdef _WIN32
+    UnmapViewOfFile(v->ptr);
+    CloseHandle(v->map_handle);
+    CloseHandle(v->file_handle);
+#else
+    munmap(v->ptr, v->size);
+    close(v->fd);
+#endif
+    memset(v, 0, sizeof(MmapView));
+}
+
+/* ── Reader internals ───────────────────────────────────────────────────── */
+
+struct KSerReader {
+    /* Memory view (primary access) */
+    MmapView mmap;
+    int      has_mmap;
+
+    /* Fallback FILE* when mmap fails */
     FILE*    fp;
-    
-    /* Memory mapping */
-    uint8_t* mmap_data;
-    size_t   mmap_size;
-    int      use_mmap;
-    
-    /* Header info */
-    uint8_t  header[KSER_HEADER_SIZE];
-    
-    /* Config */
-    KSerConfig cfg;
-    long     cfg_offset;
-    
-    /* Vocabulary */
-    long     vocab_offset;
-    uint32_t vocab_count;
-    
-    /* Tensor index */
-    long     tensor_index_offset;
-    uint32_t tensor_count;
+
+    /* Parsed layout */
+    KSerConfig       cfg;
+    uint32_t         vocab_count;
+    long             vocab_data_pos; /* file offset of first vocab entry */
+
     KSerTensorEntry* tensors;
-    
-    /* Data section */
-    long     data_offset;
-    
+    uint32_t         tensor_count;
+
     /* Checksum */
-    long     checksum_offset;
-    uint8_t  stored_checksum[32];
-    int      checksum_valid;
+    uint8_t          stored_hash[32];
+    int              hash_valid;
 };
 
-static int validate_header(const uint8_t* header) {
-    /* Check magic bytes: SERENITY + η grec + version */
-    if (memcmp(header, KSER_MAGIC, KSER_MAGIC_SIZE) != 0) return 0;
-    if (header[8] != 0xCE || header[9] != 0xB7) return 0; /* η UTF-8 */
-    if (header[10] != KSER_VERSION) return 0;
+/* Read n bytes at offset from mmap or FILE* */
+static int rread(KSerReader* r, long offset, void* dst, size_t n) {
+    if (r->has_mmap) {
+        if ((size_t)offset + n > r->mmap.size) return -1;
+        memcpy(dst, r->mmap.ptr + offset, n);
+        return 0;
+    }
+    if (FSEEKO(r->fp, offset, SEEK_SET) != 0) return -1;
+    if (fread(dst, 1, n, r->fp) != n) return -1;
+    return 0;
+}
+
+static const uint8_t* rptr(KSerReader* r, long offset) {
+    if (!r->has_mmap) return NULL;
+    if ((size_t)offset >= r->mmap.size) return NULL;
+    return r->mmap.ptr + offset;
+}
+
+/* ── Header validation ──────────────────────────────────────────────────── */
+
+static int validate_header(const uint8_t hdr[KSER_HEADER_SIZE]) {
+    if (memcmp(hdr, KSER_MAGIC_BYTES, KSER_MAGIC_SIZE) != 0) return 0;
+    if (hdr[8] != 0xCE || hdr[9] != 0xB7)   return 0; /* η UTF-8 */
+    if (hdr[10] != KSER_VERSION)              return 0;
     return 1;
 }
 
+/* ── Public API ─────────────────────────────────────────────────────────── */
+
 KSerReader* kser_reader_open(const char* path) {
+    if (!path) return NULL;
+
     KSerReader* r = calloc(1, sizeof(KSerReader));
     if (!r) return NULL;
-    
-    /* Open file */
-    r->fd = open(path, O_RDONLY);
-    if (r->fd < 0) {
-        free(r);
-        return NULL;
-    }
-    
-    /* Get file size */
-    struct stat st;
-    if (fstat(r->fd, &st) < 0) {
-        close(r->fd);
-        free(r);
-        return NULL;
-    }
-    r->mmap_size = st.st_size;
-    
-    /* Memory map the file */
-    r->mmap_data = mmap(NULL, r->mmap_size, PROT_READ, MAP_PRIVATE, r->fd, 0);
-    if (r->mmap_data == MAP_FAILED) {
-        /* Fallback to regular file reading */
-        r->mmap_data = NULL;
-        r->use_mmap = 0;
-        r->fp = fdopen(r->fd, "rb");
-        if (!r->fp) {
-            close(r->fd);
-            free(r);
-            return NULL;
-        }
+
+    /* Try mmap first */
+    if (mmap_open(path, &r->mmap) == 0) {
+        r->has_mmap = 1;
     } else {
-        r->use_mmap = 1;
+        r->fp = fopen(path, "rb");
+        if (!r->fp) { free(r); return NULL; }
+        r->has_mmap = 0;
     }
-    
-    /* Read and validate header */
-    if (r->use_mmap) {
-        memcpy(r->header, r->mmap_data, KSER_HEADER_SIZE);
+
+    /* Need file size for fallback path */
+    size_t file_size;
+    if (r->has_mmap) {
+        file_size = r->mmap.size;
     } else {
-        if (fread(r->header, 1, KSER_HEADER_SIZE, r->fp) != KSER_HEADER_SIZE) {
-            kser_reader_close(r);
-            return NULL;
-        }
+        if (FSEEKO(r->fp, 0, SEEK_END) != 0) goto fail;
+        file_size = (size_t)FTELLO(r->fp);
     }
-    
-    if (!validate_header(r->header)) {
-        kser_reader_close(r);
-        return NULL;
-    }
-    
-    /* Read config */
-    r->cfg_offset = KSER_HEADER_SIZE;
-    if (r->use_mmap) {
-        memcpy(&r->cfg, r->mmap_data + r->cfg_offset, sizeof(KSerConfig));
-    } else {
-        FSEEKO(r->fp, r->cfg_offset, SEEK_SET);
-        if (fread(&r->cfg, sizeof(KSerConfig), 1, r->fp) != 1) {
-            kser_reader_close(r);
-            return NULL;
-        }
-    }
-    
-    /* Vocab starts right after config */
-    r->vocab_offset = r->cfg_offset + sizeof(KSerConfig);
-    
-    /* Read vocab count */
-    if (r->use_mmap) {
-        memcpy(&r->vocab_count, r->mmap_data + r->vocab_offset, sizeof(uint32_t));
-    } else {
-        FSEEKO(r->fp, r->vocab_offset, SEEK_SET);
-        fread(&r->vocab_count, sizeof(uint32_t), 1, r->fp);
-    }
-    
-    /* Calculate data offset (after vocab entries) */
-    r->data_offset = r->vocab_offset + sizeof(uint32_t);
+
+    /* Minimum viable file: header(16)+config(96)+vocab_count(4)+tensor_count(4)+sha256(32) = 152 */
+    if (file_size < 152) goto fail;
+
+    /* 1. Validate header */
+    uint8_t hdr[KSER_HEADER_SIZE];
+    if (rread(r, 0, hdr, KSER_HEADER_SIZE) != 0) goto fail;
+    if (!validate_header(hdr)) goto fail;
+
+    /* 2. Read config */
+    if (rread(r, KSER_HEADER_SIZE, &r->cfg, sizeof(KSerConfig)) != 0) goto fail;
+
+    /* 3. Read vocab_count */
+    long vocab_count_pos = KSER_HEADER_SIZE + (long)sizeof(KSerConfig);
+    if (rread(r, vocab_count_pos, &r->vocab_count, sizeof(uint32_t)) != 0) goto fail;
+
+    /* 4. Walk vocab to find data_start */
+    r->vocab_data_pos = vocab_count_pos + (long)sizeof(uint32_t);
+    long pos = r->vocab_data_pos;
     for (uint32_t i = 0; i < r->vocab_count; i++) {
-        uint32_t id;
-        uint16_t len;
-        if (r->use_mmap) {
-            memcpy(&id, r->mmap_data + r->data_offset, sizeof(uint32_t));
-            memcpy(&len, r->mmap_data + r->data_offset + sizeof(uint32_t), sizeof(uint16_t));
-        } else {
-            FSEEKO(r->fp, r->data_offset, SEEK_SET);
-            fread(&id, sizeof(uint32_t), 1, r->fp);
-            fread(&len, sizeof(uint16_t), 1, r->fp);
+        uint32_t id;  uint16_t len;
+        if (rread(r, pos,                  &id,  sizeof(uint32_t)) != 0) goto fail;
+        if (rread(r, pos+sizeof(uint32_t), &len, sizeof(uint16_t)) != 0) goto fail;
+        pos += (long)sizeof(uint32_t) + (long)sizeof(uint16_t) + len;
+    }
+    /* pos now points to start of tensor data */
+
+    /* 5. SHA256 is the last 32 bytes */
+    long checksum_pos = (long)file_size - 32;
+    if (rread(r, checksum_pos, r->stored_hash, 32) != 0) goto fail;
+
+    /* 6. Tensor index is just before the checksum */
+    /*    Layout: ... | tensor_count(4) | KSerTensorEntry[tensor_count] | sha256(32) */
+    /*    We don't know tensor_count yet, so read it from just before the index end  */
+    /*    Walk backwards: checksum at end, before it is the index, before that data  */
+    /*    We know: index_end = checksum_pos                                           */
+    /*    Read tensor_count from (checksum_pos - tensor_count*sizeof(Entry) - 4)     */
+    /*    But we don't know tensor_count — scan forward from data_start instead      */
+
+    /* Simpler: tensor_count is written first, then entries, then sha256.
+     * So: [data...][tensor_count:4][entries:N*72][sha256:32]
+     * We scan the tensor_count from checksum_pos - 4 backwards:
+     *   checksum_pos = end_of_entries
+     *   tensor_count_pos = ?
+     * Use binary search: try reading tensor_count at various positions
+     * Actually: scan forward from pos (data_start) — tensor data is opaque,
+     * so we can't skip it. The only anchor is checksum_pos.
+     *
+     * Layout guarantee from kser_write.c finalize():
+     *   fwrite(&tensor_count, 4, ...)
+     *   fwrite(tensors, 72*tensor_count, ...)
+     *   <sha256 pos>
+     *
+     * So: tensor_count is at offset (checksum_pos - 4 - tensor_count*72)
+     * This is a chicken-and-egg problem. Resolve by reading uint32 from
+     * successive candidate positions starting from checksum_pos-4-0*72 = checksum_pos-4.
+     */
+    {
+        long index_end = checksum_pos; /* = checksum_pos */
+
+        /* Try tensor_count = 0 first, then increase */
+        int found = 0;
+        uint32_t tc = 0;
+        long tc_pos;
+
+        /* Maximum plausible tensor count for a 3B model ≈ 24*8 = 192 */
+        for (tc = 0; tc <= 4096; tc++) {
+            tc_pos = index_end - (long)(4 + tc * sizeof(KSerTensorEntry));
+            if (tc_pos < pos) break; /* before data start — impossible */
+            uint32_t candidate;
+            if (rread(r, tc_pos, &candidate, sizeof(uint32_t)) != 0) break;
+            if (candidate == tc) {
+                found = 1;
+                break;
+            }
         }
-        r->data_offset += sizeof(uint32_t) + sizeof(uint16_t) + len;
-    }
-    
-    /* Tensor index is at the end before checksum */
-    /* Minimum file size: header(16) + config(96) + vocab(4) + tensor_index(4) + checksum(32) = ~152 bytes */
-    if (r->mmap_size < 152) {
-        fprintf(stderr, "DEBUG READER: File too small: %zu bytes\n", r->mmap_size);
-        kser_reader_close(r);
-        return NULL;
-    }
-    
-    /* Calculate: file_size - 32 (checksum) = position of tensor count */
-    r->checksum_offset = r->mmap_size - 32;
-    long tensor_count_pos = r->checksum_offset - sizeof(uint32_t);
-    
-    if (r->use_mmap) {
-        memcpy(&r->tensor_count, r->mmap_data + tensor_count_pos, sizeof(uint32_t));
-    } else {
-        FSEEKO(r->fp, tensor_count_pos, SEEK_SET);
-        fread(&r->tensor_count, sizeof(uint32_t), 1, r->fp);
-    }
-    
-    fprintf(stderr, "DEBUG READER: tensor_count=%u at pos=%ld\n", r->tensor_count, tensor_count_pos);
-    
-    /* Calculate tensor index start */
-    long tensor_index_size = sizeof(uint32_t) + r->tensor_count * sizeof(KSerTensorEntry);
-    r->tensor_index_offset = r->checksum_offset - tensor_index_size;
-    
-    fprintf(stderr, "DEBUG READER: tensor_index_offset=%ld, data_offset=%ld\n", 
-            r->tensor_index_offset, r->data_offset);
-    
-    if (r->tensor_index_offset < r->data_offset) {
-        fprintf(stderr, "DEBUG READER: Invalid tensor index offset\n");
-        kser_reader_close(r);
-        return NULL;
-    }
-    
-    /* Allocate and read tensor entries */
-    r->tensors = calloc(r->tensor_count, sizeof(KSerTensorEntry));
-    if (!r->tensors) {
-        kser_reader_close(r);
-        return NULL;
-    }
-    
-    if (r->use_mmap) {
-        memcpy(r->tensors, r->mmap_data + r->tensor_index_offset + sizeof(uint32_t), 
-               r->tensor_count * sizeof(KSerTensorEntry));
-    } else {
-        FSEEKO(r->fp, r->tensor_index_offset + sizeof(uint32_t), SEEK_SET);
-        if (fread(r->tensors, sizeof(KSerTensorEntry), r->tensor_count, r->fp) != r->tensor_count) {
-            kser_reader_close(r);
-            return NULL;
+
+        if (!found) goto fail;
+
+        r->tensor_count = tc;
+        if (tc > 0) {
+            r->tensors = calloc(tc, sizeof(KSerTensorEntry));
+            if (!r->tensors) goto fail;
+            long entries_pos = tc_pos + (long)sizeof(uint32_t);
+            if (rread(r, entries_pos, r->tensors,
+                      tc * sizeof(KSerTensorEntry)) != 0) goto fail;
         }
     }
-    
-    /* Read checksum */
-    if (r->use_mmap) {
-        memcpy(r->stored_checksum, r->mmap_data + r->checksum_offset, 32);
-    } else {
-        FSEEKO(r->fp, r->checksum_offset, SEEK_SET);
-        size_t n = fread(r->stored_checksum, 1, 32, r->fp);
-        (void)n;
+
+    /* 7. Verify checksum (optional — only if FILE* path; mmap can verify too) */
+    if (!r->has_mmap && r->fp) {
+        uint8_t computed[32];
+        if (kser_sha256_file(r->fp, checksum_pos, computed) == 0) {
+            r->hash_valid = (memcmp(computed, r->stored_hash, 32) == 0);
+        }
     }
-    
+
     return r;
+
+fail:
+    if (r->has_mmap) mmap_close(&r->mmap);
+    if (r->fp) fclose(r->fp);
+    free(r->tensors);
+    free(r);
+    return NULL;
 }
 
 const KSerConfig* kser_reader_config(KSerReader* r) {
@@ -236,102 +292,67 @@ const KSerConfig* kser_reader_config(KSerReader* r) {
 }
 
 int kser_reader_load_vocab(KSerReader* r, KSerVocabCallback cb, void* userdata) {
-    if (!r || !cb || r->vocab_count == 0) return KSER_OK;
-    
-    long pos = r->vocab_offset + sizeof(uint32_t);
-    
+    if (!r || !cb) return KSER_OK;
+
+    long pos = r->vocab_data_pos;
     for (uint32_t i = 0; i < r->vocab_count; i++) {
         uint32_t id;
         uint16_t len;
-        
-        if (r->use_mmap) {
-            memcpy(&id, r->mmap_data + pos, sizeof(uint32_t));
-            memcpy(&len, r->mmap_data + pos + sizeof(uint32_t), sizeof(uint16_t));
+
+        if (rread(r, pos, &id, sizeof(uint32_t)) != 0) return KSER_ERR_IO;
+        pos += sizeof(uint32_t);
+        if (rread(r, pos, &len, sizeof(uint16_t)) != 0) return KSER_ERR_IO;
+        pos += sizeof(uint16_t);
+
+        int ret;
+        if (r->has_mmap) {
+            const char* token = (const char*)rptr(r, pos);
+            if (!token) return KSER_ERR_IO;
+            ret = cb(id, token, len, userdata);
         } else {
-            FSEEKO(r->fp, pos, SEEK_SET);
-            size_t n1 = fread(&id, sizeof(uint32_t), 1, r->fp);
-            size_t n2 = fread(&len, sizeof(uint16_t), 1, r->fp);
-            (void)n1; (void)n2;
+            char* buf = malloc(len + 1);
+            if (!buf) return KSER_ERR_MEMORY;
+            if (rread(r, pos, buf, len) != 0) { free(buf); return KSER_ERR_IO; }
+            buf[len] = '\0';
+            ret = cb(id, buf, len, userdata);
+            free(buf);
         }
-        
-        pos += sizeof(uint32_t) + sizeof(uint16_t);
-        
-        const char* token = r->use_mmap ? 
-            (const char*)(r->mmap_data + pos) : NULL;
-        
-        if (!r->use_mmap) {
-            /* Read token to temporary buffer */
-            char* temp = malloc(len);
-            if (temp) {
-                size_t nread = fread(temp, 1, len, r->fp);
-                (void)nread; /* Suppress warning - we proceed with what we have */
-                int ret = cb(id, temp, len, userdata);
-                free(temp);
-                if (ret != 0) return ret;
-            }
-        } else {
-            int ret = cb(id, token, len, userdata);
-            if (ret != 0) return ret;
-        }
-        
+
+        if (ret != 0) return ret;
         pos += len;
     }
-    
     return KSER_OK;
 }
 
-void* kser_reader_load_tensor(KSerReader* r, const char* name, KSerDtype target_dtype) {
+float* kser_reader_load_tensor(KSerReader* r, const char* name) {
     if (!r || !name) return NULL;
-    
-    /* Find tensor by name */
+
     for (uint32_t i = 0; i < r->tensor_count; i++) {
-        if (strcmp(r->tensors[i].name, name) == 0) {
-            KSerTensorEntry* entry = &r->tensors[i];
-            
-            /* Calculate number of elements */
-            uint64_t n_elements = 1;
-            for (int j = 0; j < 4; j++) {
-                if (entry->shape[j] > 0) n_elements *= entry->shape[j];
+        if (strcmp(r->tensors[i].name, name) != 0) continue;
+
+        KSerTensorEntry* e = &r->tensors[i];
+        uint64_t n = 1;
+        for (int j = 0; j < 4; j++) if (e->shape[j] > 0) n *= e->shape[j];
+
+        float* out = calloc(n, sizeof(float));
+        if (!out) return NULL;
+
+        if (r->has_mmap) {
+            const uint8_t* src = rptr(r, (long)e->offset);
+            if (!src) { free(out); return NULL; }
+            kser_dequantize(src, out, n, (KSerDtype)e->dtype);
+        } else {
+            void* tmp = malloc(e->size_bytes);
+            if (!tmp) { free(out); return NULL; }
+            if (rread(r, (long)e->offset, tmp, e->size_bytes) != 0) {
+                free(tmp); free(out); return NULL;
             }
-            
-            /* Allocate output buffer (always FP32 for k-mamba) */
-            float* output = calloc(n_elements, sizeof(float));
-            if (!output) return NULL;
-            
-            /* Get pointer to tensor data */
-            const void* src_data;
-            if (r->use_mmap) {
-                src_data = r->mmap_data + entry->offset;
-            } else {
-                /* Read from file */
-                void* temp = malloc(entry->size_bytes);
-                if (!temp) {
-                    free(output);
-                    return NULL;
-                }
-                FSEEKO(r->fp, entry->offset, SEEK_SET);
-                if (fread(temp, 1, entry->size_bytes, r->fp) != entry->size_bytes) {
-                    free(temp);
-                    free(output);
-                    return NULL;
-                }
-                
-                /* Dequantize */
-                extern int kser_dequantize(const void* src, float* dst, uint64_t n, KSerDtype dtype);
-                kser_dequantize(temp, output, n_elements, entry->dtype);
-                free(temp);
-                return output;
-            }
-            
-            /* Dequantize from mmap */
-            extern int kser_dequantize(const void* src, float* dst, uint64_t n, KSerDtype dtype);
-            kser_dequantize(src_data, output, n_elements, entry->dtype);
-            
-            return output;
+            kser_dequantize(tmp, out, n, (KSerDtype)e->dtype);
+            free(tmp);
         }
+        return out;
     }
-    
-    return NULL; /* Tensor not found */
+    return NULL;
 }
 
 uint64_t kser_reader_count_tensors(KSerReader* r) {
@@ -345,55 +366,42 @@ const KSerTensorEntry* kser_reader_get_tensor_info(KSerReader* r, uint64_t idx) 
 
 void kser_reader_close(KSerReader* r) {
     if (!r) return;
-    
-    if (r->mmap_data) {
-        munmap(r->mmap_data, r->mmap_size);
-    }
+    if (r->has_mmap) mmap_close(&r->mmap);
     if (r->fp) fclose(r->fp);
-    if (r->fd >= 0) close(r->fd);
-    
     free(r->tensors);
     free(r);
 }
 
 KSerInfo kser_file_info(const char* path) {
-    KSerInfo info = {0};
-    
-    struct stat st;
-    if (stat(path, &st) < 0) return info;
-    info.file_size = st.st_size;
-    
-    /* Quick peek at header */
+    KSerInfo info;
+    memset(&info, 0, sizeof(info));
+
     FILE* fp = fopen(path, "rb");
     if (!fp) return info;
-    
-    uint8_t header[KSER_HEADER_SIZE];
-    if (fread(header, 1, KSER_HEADER_SIZE, fp) != KSER_HEADER_SIZE) {
-        fclose(fp);
-        return info;
-    }
-    
-    if (!validate_header(header)) {
-        fclose(fp);
-        return info;
-    }
-    
-    /* Read config */
+
+    struct stat st;
+    if (stat(path, &st) == 0) info.file_size = (uint64_t)st.st_size;
+
+    uint8_t hdr[KSER_HEADER_SIZE];
+    if (fread(hdr, 1, KSER_HEADER_SIZE, fp) != KSER_HEADER_SIZE) goto done;
+    if (!validate_header(hdr)) goto done;
+
     KSerConfig cfg;
-    if (fread(&cfg, sizeof(KSerConfig), 1, fp) == 1) {
-        info.valid = 1;
-        info.vocab_size = cfg.vocab_size;
-        info.dim = cfg.dim;
-        info.n_layers = cfg.n_layers;
-        info.dtype = cfg.dtype;
-        memcpy(info.model_name, cfg.model_name, 64);
-        
-        /* Estimate n_params */
-        info.n_params = (uint64_t)cfg.vocab_size * cfg.dim * 2; /* embedding + head */
-        info.n_params += (uint64_t)cfg.dim * cfg.state_size * 4 * cfg.n_layers; /* SSM */
-        info.n_params += (uint64_t)cfg.dim * cfg.dim * 4 * cfg.n_layers; /* MLP + projections */
-    }
-    
+    if (fread(&cfg, sizeof(KSerConfig), 1, fp) != 1) goto done;
+
+    info.valid      = 1;
+    info.vocab_size = cfg.vocab_size;
+    info.dim        = cfg.dim;
+    info.n_layers   = cfg.n_layers;
+    info.dtype      = cfg.dtype;
+    memcpy(info.model_name, cfg.model_name, 64);
+
+    /* Rough parameter estimate */
+    info.n_params  = (uint64_t)cfg.vocab_size * cfg.dim * 2;
+    info.n_params += (uint64_t)cfg.dim * cfg.state_size * 4 * cfg.n_layers;
+    info.n_params += (uint64_t)cfg.dim * cfg.dim * 4 * cfg.n_layers;
+
+done:
     fclose(fp);
     return info;
 }

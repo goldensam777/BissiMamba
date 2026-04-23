@@ -84,7 +84,7 @@ int main(void) {
         TEST_ASSERT(vocab_count == 3, "vocab count mismatch");
         
         /* Check tensor */
-        float* read_data = kser_reader_load_tensor(r, "test_tensor", KSER_FP32);
+        float* read_data = kser_reader_load_tensor(r, "test_tensor");
         TEST_ASSERT(read_data != NULL, "load_tensor failed");
         
         int tensor_ok = 1;
