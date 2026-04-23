@@ -178,6 +178,7 @@ Stratégie hybride: 32K vocab pour petits modèles (PC local), 100K cl100k_base 
 - **VOCAB**: 100,277 | **DIM**: 3072 | **STATE**: 4096 | **LAYERS**: 24 | **SEQ**: 2048
 - **Params**: ~7.5B (embedding: 100K × 3072 = 307M)
 - **ConvND**: Dense unified
+- **Training**: **Full GPU** (embedding + blocks + head all on GPU)
 - **Data**: `data/conversations.txt` (1GB) pre-tokenized
 - **Location**: **Microsoft Azure** (GPU instances A100/V100)
 - **Usage**: Production training, modèle final distribuable

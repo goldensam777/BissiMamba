@@ -285,3 +285,51 @@ Devise : **"Ego Sum Optimus Optimus"**
 
 **État** : ✅ Système de sérialisation et Tokenizer 100% opérationnels.
 
+
+
+### Session 23 Avril 2026 (Fin) — Refonte Full GPU : Suppression du Mode Hybrid
+
+**Objectif** : Remplacer l'entraînement hybride CPU/GPU par un entraînement **Full GPU** pour Azure et supprimer la complexité du transfert CPU↔GPU.
+
+**Motivation** :
+- L'implémentation hybride avait des bugs cuBLAS error 13 non résolus
+- Le transfert constant CPU↔GPU est un goulot d'étranglement
+- Pour Azure (cloud), on a accès à des GPU puissants (A100/V100) avec suffisamment de VRAM
+- Simplification drastique du code
+
+**Travail effectué** :
+
+1. **Création `mamba_block_gpu_init()` et `mamba_block_gpu_free()`** (`src/kmamba.c`)
+   - Allocation persistante des buffers GPU pour chaque bloc
+   - Paramètres (W_in, W_out, A_log, W_B, W_C, b_B, b_C, delta_proj, lambda_proj, theta)
+   - Gradients (d_g_W_in, d_g_W_out, etc.)
+   - Moments Adam (d_m_W_in, d_v_W_in, etc.)
+   - Buffers forward temporaires (d_u_raw, d_u, d_dt_raw, d_B_exp, d_C_exp, d_h_store, etc.)
+
+2. **Mise à jour `kmamba_gpu_init()`** (`src/kmamba.c`)
+   - Allocation des buffers GPU pour embedding et head
+   - Allocation des gradients GPU (d_g_embed, d_g_head)
+   - Appel de `mamba_block_gpu_init()` pour chaque couche
+
+3. **Implémentation `kmamba_train_batch()` Full GPU** (`src/kmamba.c`)
+   - Embedding forward sur GPU via `cuda_embedding_forward()`
+   - Forward des blocs sur GPU via `cuda_block_forward()`
+   - Head forward sur GPU via `cuda_head_forward()`
+   - Loss et softmax sur GPU via `cuda_softmax_loss_kernel()`
+   - Backward complet sur GPU
+   - Optimizer step sur GPU via `cuda_adamw_step_kernel()`
+
+4. **Suppression de l'API hybride**
+   - Suppression de `kmamba_train_batch_hybrid()`
+   - Mise à jour de `include/kmamba.h` (suppression de la déclaration)
+   - Mise à jour de `models/kmamba_azure.cu` pour utiliser `kmamba_train_batch()`
+
+5. **Correction des casts `cudaMalloc`**
+   - Ajout de `(void**)` sur tous les appels `cudaMalloc` pour éliminer les warnings
+
+**Fichiers modifiés** :
+- `src/kmamba.c` — Implémentation Full GPU, suppression hybride
+- `include/kmamba.h` — Mise à jour API (kmamba_train_batch uniquement)
+- `models/kmamba_azure.cu` — Utilisation kmamba_train_batch()
+
+**État** : ✅ Build propre, Full GPU prêt pour Azure.
