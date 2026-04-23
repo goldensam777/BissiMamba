@@ -80,9 +80,7 @@ Implémentation C pure de l'optimiseur MUON :
 
 Scan SSM parallèle work-efficient utilisant l'algorithme de Blelloch sur le monoïde $(\otimes, (1,0))$ :
 
-```
-h_t = A_t · h_{t-1} + B_t · x_t    →    (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})
-```
+$$h_t = A_t · h_{t-1} + B_t · x_t    →    (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})$$
 
 **Complexité** : Profondeur $O(\log L)$, Travail $O(L)$ — réduction de $51×$ à $L=1024$.
 
@@ -216,7 +214,7 @@ convnd(&p, CONVND_FORWARD);   // Wavefront parallèle
 ## Documentation
 
 - **[THEORY.md](THEORY.md)** — Fondement mathématique
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Volontés/Puissance
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Architecture technique
 - **[AGENTS.md](AGENTS.md)** — Contexte technique
 
 ---

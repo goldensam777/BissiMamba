@@ -1,35 +1,36 @@
-# ARCHITECTURE.md — Séparation Volontés/Puissance
+# ARCHITECTURE.md — Architecture Technique
 
 ## Philosophie
 
-**"On est assez grand pour voir des unités, il faut voir des structures."**
+**Séparation des responsabilités par couche**
 
-Le projet k-mamba repose sur une séparation architecturale fondamentale :
-- **Volontés** = intentions, logique modèle, orchestration (k-mamba)
-- **Puissance** = calcul brut, kernels optimisés (kernels/ inline)
+Le projet k-mamba repose sur une architecture en trois couches :
+- **Orchestration** = logique modèle, API, boucle d'entraînement (src/)
+- **Topologie** = indexation ND, scheduling wavefront (src/km_topology.c)
+- **Kernels** = opérations compute-intensive (kernels/, cuda/, cpu/)
 
-Cette séparation n'est pas technique seulement — elle est **philosophique**. Elle reflète la Théorie des Volontés : les systèmes doivent opérer par intentions qui convergent vers un équilibre, pas par instructions séquentielles.
+Cette séparation technique permet une maintenance claire et des optimisations ciblées.
 
 ---
 
 ## Règle de séparation
 
-| Critère | k-mamba (Volontés) | kernels (Puissance) |
-|---------|-------------------|---------------------|
+| Critère | Orchestration (src/) | Kernels (kernels/) |
+|---------|---------------------|-------------------|
 | Complexité | Triviale (5-10 lignes) | Intensive (millions d'itérations) |
 | Abstraction | Logique modèle, I/O | Kernels mathématiques purs |
 | Langage | C pur, lisible | C pur + ASM AVX2 |
 | Optimisation | Clarté | Performance maximale |
 | Couverture | Architecture complète | Compute engine intégré |
 
-**Règle d'or** : Si c'est trivial, ça va dans k-mamba. Si ça boucle des millions de fois, ça va dans kernels/.
+**Règle d'or** : Si c'est trivial, ça va dans src/. Si ça boucle des millions de fois, ça va dans kernels/.
 
 ---
 
 ## Structure de k-mamba (Zero Dependency)
 
 ```
-k-mamba/ — Les Volontés (orchestration du modèle Mamba)
+k-mamba/ — (logique modèle Mamba)
 │
 ├── include/
 │   ├── kmamba.h           # API publique : KMamba, KMambaConfig, MambaBlock
@@ -49,7 +50,7 @@ k-mamba/ — Les Volontés (orchestration du modèle Mamba)
 │   ├── scan_nd.c          # Scan ND (wavefront séquentiel)
 │   └── convnd.c           # ConvND dense K^N + séparable cascade 1D
 │
-├── kernels/               # La Puissance (kernels inline C pur)
+├── kernels/               # (kernels inline C pur)
 │   ├── gemm_f32.c         # GEMM/GEMV en C pur
 │   ├── activations_f32.c  # SiLU, ReLU, Sigmoid, Softplus
 │   ├── optimizer_f32.c    # MUON, AdamW
@@ -136,7 +137,6 @@ void convnd(ConvNDParams *p, ConvNDMode mode);
 **Ce que k-mamba n'utilise PAS** :
 - ❌ CMake
 - ❌ OpenBLAS
-- ❌ optimatrix (submodule supprimé)
 - ❌ OpenMP (optionnel, pas obligatoire)
 - ❌ Python/PyTorch
 
@@ -176,86 +176,81 @@ make NCCL_AVAILABLE=1  # Active NCCL pour multi-GPU
 ## Cycle de vie d'une forward pass
 
 ```
-Appel utilisateur
-       │
-       ▼
+            Appel utilisateur
+                    │
+                    ▼
 ┌─────────────────────────────────────┐
 │ k-mamba : kmamba_forward()          │
-│ 1. embed_lookup() — memcpy        │
-│ 2. Pour chaque layer :            │
-│    mamba_block_forward()          │
-│ 3. gemm_f32(head, hidden)         │
-│       └──> kernels/                │
+│ 1. embed_lookup() — memcpy          │
+│ 2. Pour chaque layer :              │
+│    mamba_block_forward()            │
+│ 3. gemm_f32(head, hidden)           │
+│       └──> kernels/                 │
 └─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────┐
-│ mamba_block_forward() (k-mamba) │
-│ 1. gemv_f32(W_in, x)             │  ← kernels/
-│ 2. silu_f32()                   │  ← kernels/
-│ 3. gemv_f32(delta_proj, x)      │  ← kernels/
-│ 4. softplus + clamp             │  ← kernels/
-│ 5. scan1d() or scan2d()         │  ← cpu/ (ASM)
-│ 6. gemv_f32(W_out, h)            │  ← kernels/
-│    └──> retourne à k-mamba      │
-└─────────────────────────────────┘
-       │
-       ▼
+                    │
+                    ▼
+    ┌─────────────────────────────────┐
+    │ mamba_block_forward() (k-mamba) │
+    │ 1. gemv_f32(W_in, x)            │  ← kernels/
+    │ 2. silu_f32()                   │  ← kernels/
+    │ 3. gemv_f32(delta_proj, x)      │  ← kernels/
+    │ 4. softplus + clamp             │  ← kernels/
+    │ 5. scan1d() or scan2d()         │  ← cpu/ (ASM)
+    │ 6. gemv_f32(W_out, h)           │  ← kernels/
+    │    └──> retourne à k-mamba      │
+    └─────────────────────────────────┘
+                    │
+                    ▼
 ┌─────────────────────────────────────┐
-│ k-mamba : suite du forward        │
-│ 4. softmax() + cross-entropy()     │
-│ 5. retourne logits/loss            │
+│ k-mamba : suite du forward          │
+│ 4. softmax() + cross-entropy()      │
+│ 5. retourne logits/loss             │
 └─────────────────────────────────────┘
 ```
 
 ---
 
-## Théorie des Volontés dans le code
+## Design Patterns
 
-### Chaque MambaBlock est une Volonté
+### MambaBlock as Stateful Transform
 
 ```c
-// Une Volonté se manifeste par sa transformation
+// Each block transforms input through selective state space
 void mamba_block_forward(MambaBlock *block, float *out, const float *in, size_t batch) {
-    // La Volonté projette l'entrée dans son espace d'état
+    // Project input to state space
     gemv_f32(in, block->W_in.data, tmp, ...);
     
-    // La Volonté choisit quoi retenir (selectivité)
+    // Apply selectivity (SiLU gating)
     silu_f32(tmp, u, ...);
     compute_delta(dt, in, block->delta_proj);
     
-    // La Volonté propage son état (récurrence wavefront)
-    scan1d(&params);  // ou scan2d pour ND
+    // State recurrence via wavefront scan
+    scan1d(&params);  // or scan2d for ND
     
-    // La Volonté projette sa décision
+    // Project to output
     gemv_f32(h, block->W_out.data, out, ...);
 }
 ```
 
-### MUON arbitre les tensions
+### MUON Optimizer
 
 ```c
-// Les gradients sont des tensions entre Volontés
+// Orthogonalized momentum for stable training
 void mamba_optimizer_step(MambaBlock *block, MBOptimConfig *conf) {
-    // Momentum = mémoire des tensions passées
-    // Newton-Schulz = orthogonalisation des directions
-    // → Directions isotropiques = équilibre des Volontés
+    // Nesterov momentum + Newton-Schulz orthogonalization
+    // → Isotropic gradient directions for better conditioning
 }
 ```
 
 ---
 
-## Vision long terme
+## Future Directions
 
-k-mamba est une brique fondatrice vers un **OS-IA post-Von Neumann** :
-- Processus = Volontés (MambaBlocks)
-- Communication = streams de tenseurs
-- Scheduler = ordonnancement wavefront unifié
-- Mémoire = états persistants (h_t)
-
-La séparation Volontés/Puissance préfigure cette architecture :
-- Les Volontés sont les processus métier
-- La Puissance est le moteur d'exécution (inline, zero-dependency)
+k-mamba provides a foundation for efficient sequence modeling:
+- Modular blocks with persistent state (h_t)
+- Tensor stream communication
+- Unified wavefront scheduling
+- Zero-dependency compute kernels
 
 ---
 
@@ -268,6 +263,6 @@ La séparation Volontés/Puissance préfigure cette architecture :
 
 ## Auteur
 
-**YEVI Mawuli Peniel Samuel**
+**YEVI Mawuli Peniel Samuel** — IFRI-UAC, Bénin
 
-*Ego Sum Optimus Optimus*
+*Optima, Immo Absoluta Perfectio*

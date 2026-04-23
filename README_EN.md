@@ -81,9 +81,7 @@ Pure C implementation of the MUON optimizer:
 
 Work-efficient parallel SSM scan using Blelloch's algorithm over the monoid $(\otimes, (1,0))$:
 
-```
-h_t = A_t · h_{t-1} + B_t · x_t    →    (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})
-```
+$$h_t = A_t · h_{t-1} + B_t · x_t  → (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})$$
 
 **Complexity**: Depth $O(\log L)$, Work $O(L)$ — $51\times$ reduction at $L=1024$.
 
@@ -136,17 +134,17 @@ See benchmark graphs:
 
 ## Architecture
 
-### Volontés/Puissance Separation (Will/Power)
+### Layered Design
 
-The project follows a strict architectural separation:
+The project follows a clean separation of concerns across three layers:
 
 | Layer | Role | Location |
 |-------|------|----------|
-| **Volontés** (Will) | Model orchestration, API | `src/kmamba.c`, `src/mamba_block.c` |
-| **Topologie** (Topology) | ND indexing, wavefront | `src/km_topology.c`, `src/wavefront_*.c` |
-| **Puissance** (Power) | Compute kernels | `kernels/*.c`, `cuda/*.cu`, `cpu/*.asm` |
+| **Orchestration** | Model logic, API, training loop | `src/kmamba.c`, `src/mamba_block.c` |
+| **Topology** | ND indexing, wavefront scheduling | `src/km_topology.c`, `src/wavefront_*.c` |
+| **Kernels** | Compute-intensive operations | `kernels/*.c`, `cuda/*.cu`, `cpu/*.asm` |
 
-**Golden Rule**: If it's trivial (5-10 lines), it goes in k-mamba. If it loops millions of times, it goes in kernels/.
+**Design Principle**: High-level model code (5-10 lines per operation) stays in `src/`. Performance-critical loops (millions of iterations) go in `kernels/`.
 
 ---
 
@@ -291,7 +289,7 @@ Run: `make bench-convnd-cpu && ./tests/unit/bench_convnd 256 256 64 3`
 | 512×512 | 927.4 | 204.4 | **4.5×** |
 | 1024×1024 | 3497.6 | 807.6 | **4.3×** |
 
-*Note: The 66× anomaly at 64×64 is due to L1/L2 cache fitting the entire separable computation.*
+_*Note: The 66× anomaly at 64×64 is due to L1/L2 cache fitting the entire separable computation.*_
 
 ### GPU Benchmarks (NVIDIA GeForce MX450)
 
@@ -304,12 +302,12 @@ Run: `make bench-convnd-cuda && ./tests/unit/bench_convnd_cuda`
 | 256×256 | 5.30 | 7.13 | **0.74×** |
 | 512×512 | 15.1 | 19.9 | **0.76×** |
 
-**Key Finding**: On GPU, Dense K^N is ~1.3× faster than Separable! This is the opposite of CPU behavior.
+**Key Finding**: On GPU, Dense $K^N$ is ~1.3× faster than Separable! This is the opposite of CPU behavior.
 
 ### Generated Graphs
 
-- `figures/convnd_dense_vs_separable.png` — CPU comparison
-- `figures/convnd_cuda_dense_vs_separable.png` — GPU comparison
+- [`figures/convnd_dense_vs_separable.png`](figures/convnd_dense_vs_separable.png) — CPU comparison
+- [`figures/convnd_cuda_dense_vs_separable.png`](figures/convnd_cuda_dense_vs_separable.png) — GPU comparison
 
 ---
 
@@ -365,7 +363,7 @@ If you use k-mamba in your research, please cite:
 
 **YEVI Mawuli Peniel Samuel** — IFRI-UAC (Benin)
 
-Motto: **"Ego Sum Optimus Optimus"**
+Motto: **"Optima, Immo Absoluta Perfectio"**
 
 ---
 

@@ -22,9 +22,9 @@ Cette unification révèle que la complexité algorithmique réside dans la topo
 
 Le parallélisme exploitable est une propriété géométrique exacte : tous les points d'un même niveau wavefront sont mutuellement indépendants (Corollaire 4.3). Ce parallélisme est borné par la largeur du niveau, atteignant Θ(d) pour une grille d×d en 2D.
 
-**Pilier IV : Architecture Volontés/Puissance**
+**Pilier IV : Architecture en Couches**
 
-Séparation philosophique entre intention (logique modèle, orchestration dans k-mamba) et calcul (kernels optimisés dans kernels/). Cette dualité reflète la Théorie des Volontés : les systèmes opèrent par intentions convergentes vers un équilibre, où chaque MambaBlock est une Volonté qui transforme la séquence, et MUON arbitre les tensions entre gradients.
+Séparation technique entre orchestration (logique modèle, API dans src/) et calcul (kernels optimisés dans kernels/, cuda/, cpu/). Cette architecture permet une maintenance claire : le code de haut niveau reste lisible tandis que les boucles critiques sont optimisées séparément.
 
 ### 0.2 Contribution originale
 

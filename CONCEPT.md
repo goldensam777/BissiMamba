@@ -24,14 +24,14 @@ L'état caché $h$ devient un vecteur de nombres complexes.
 - **Stabilité** : Les rotations complexes ($e^{i\theta}$) conservent la norme, empêchant l'explosion ou la disparition des gradients sur de très longues séquences ND.
 - **Interférence** : Les dimensions ne s'ajoutent pas bêtement ; elles interfèrent. C'est ce qui permet au modèle de capturer des géométries complexes (ex: variétés de Calabi-Yau).
 
-## 4. Partage des Rôles (Volontés vs Puissance)
+## 4. Architecture Logicielle
 
-### Les Volontés (C / CPU)
+### Couche d'Orchestration (C / CPU)
 - Orchestration du `KMWavefrontPlan`.
 - Gestion de la topologie ND (strides, offsets).
 - Dispatch intelligent entre les axes.
 
-### La Puissance (CUDA / cuBLAS)
+### Couche de Calcul (CUDA / cuBLAS)
 - **cuBLAS** : Projections linéaires massives ($W_{in}, W_{out}$).
 - **Custom Kernels** : ScanND et ConvND complexes avec réduction en mémoire partagée.
 - **SIMD AVX2** : Micro-kernels pour le mode CPU ultra-rapide.

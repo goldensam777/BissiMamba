@@ -149,7 +149,7 @@ float loss = kmamba_train_step(m, tokens_plus1);
 
 **YEVI Mawuli Peniel Samuel** — IFRI-UAC (Bénin)
 
-Devise : **"Ego Sum Optimus Optimus"**
+Devise : **"Optima, Immo Absoluta Perfectio"**
 
 ---
 
