@@ -10,9 +10,6 @@
 #include "kmamba_ser.h"
 #include "kser.h"
 
-/* Forward declarations from kmamba internals */
-extern float* kmamba_get_tensor(KMamba* m, const char* name);
-
 /* ============================================================================
  * Save k-mamba model to .ser format
  * ============================================================================ */
@@ -169,6 +166,11 @@ cleanup:
     return ret;
 }
 
+static int load_vocab_cb(uint32_t id, const char* token, uint16_t len, void* userdata) {
+    KMamba* m = (KMamba*)userdata;
+    return kmamba_set_vocab(m, id, token, len);
+}
+
 /* ============================================================================
  * Load k-mamba model from .ser format
  * ============================================================================ */
@@ -181,8 +183,11 @@ KMamba* kmamba_load_ser(const char* path, int flags) {
     
     /* Verify checksum if requested */
     if (flags & KM_SER_VERIFY) {
-        /* Checksum verification happens in reader_open */
-        /* If invalid, we should reject - TODO: expose checksum validity */
+        if (!kser_reader_is_valid(r)) {
+            fprintf(stderr, "Error: Checksum verification failed for %s\n", path);
+            kser_reader_close(r);
+            return NULL;
+        }
     }
     
     /* Get config */
@@ -212,15 +217,21 @@ KMamba* kmamba_load_ser(const char* path, int flags) {
         return NULL;
     }
     
-    /* Load tensors - this would need proper integration with kmamba internals */
-    /* For now, we just return the model structure */
-    /* Full implementation requires kmamba_set_tensor() or similar */
+    /* Load tensors */
+    uint64_t nt = kser_reader_count_tensors(r);
+    for (uint64_t i = 0; i < nt; i++) {
+        const KSerTensorEntry* info = kser_reader_get_tensor_info(r, i);
+        if (info) {
+            float* data = kser_reader_load_tensor(r, info->name);
+            if (data) {
+                kmamba_set_tensor(m, info->name, data);
+                free(data);
+            }
+        }
+    }
     
     /* Load vocabulary if present */
-    if (scfg->vocab_size > 256) {
-        /* Vocab loading callback */
-        /* kmamba_load_vocab(m, r); */
-    }
+    kser_reader_load_vocab(r, load_vocab_cb, m);
     
     kser_reader_close(r);
     return m;

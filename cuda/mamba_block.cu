@@ -181,6 +181,35 @@ __global__ void cuda_outer_add_kernel(float *dx, const float *ddt,
     dx[idx] += ddt[t] * dproj[d];
 }
 
+/* AdamW GPU kernel */
+__global__ void cuda_adamw_step_kernel(float *param, const float *grad,
+                                      float *m, float *v,
+                                      float lr, float beta1, float beta2,
+                                      float eps, float wd,
+                                      int n, int t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float g = grad[i];
+    float p = param[i];
+
+    /* Weight decay */
+    p -= lr * wd * p;
+
+    /* Update moments */
+    float mi = beta1 * m[i] + (1.0f - beta1) * g;
+    float vi = beta2 * v[i] + (1.0f - beta2) * g * g;
+    m[i] = mi;
+    v[i] = vi;
+
+    /* Bias correction */
+    float m_hat = mi / (1.0f - powf(beta1, (float)t));
+    float v_hat = vi / (1.0f - powf(beta2, (float)t));
+
+    /* Update parameter */
+    param[i] = p - lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
 /* ── Forward d'un bloc ────────────────────────────────────────── */
 /*
  * Tous les pointeurs sont des device pointers (VRAM).
@@ -839,17 +868,14 @@ extern "C" void cuda_block_backward(
 }
 
 /* ============================================================
- * GPU Optimizer Step (Hybrid support)
- * Download gradients, apply CPU optimizer, upload updated params
+ * GPU Optimizer Step (Full GPU)
+ * Applies AdamW step entirely on GPU.
  * ============================================================ */
 #include "kmamba.h"
 #include "kmamba_kernels.h"
 
 extern "C" void gpu_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
-    if (!block || !block->opt_state) return;
-    
-    /* For now: download gradients to CPU, apply optimizer, upload back */
-    /* This is a practical approach for the Hybrid model */
+    if (!block || !block->opt_state || !block->gpu.gpu_ready) return;
     
     size_t D = block->config.dim;
     size_t N = block->config.state_size;
@@ -860,36 +886,25 @@ extern "C" void gpu_optimizer_step(MambaBlock *block, const MBOptimConfig *conf)
     MBOptimState *s = (MBOptimState *)block->opt_state;
     s->step++;
     
-    /* Helper to download gradient, apply adamw/muon, upload param */
-    auto step_param = [&](float *param, float *grad, float *m, float *v, size_t n) {
-        if (!param || !grad || !m || !v || n == 0) return;
-        
-        /* Allocate CPU buffer for gradient */
-        float *h_grad = (float *)malloc(n * sizeof(float));
-        if (!h_grad) return;
-        
-        /* Download gradient from GPU */
-        cudaMemcpy(h_grad, grad, n * sizeof(float), cudaMemcpyDeviceToHost);
-        
-        /* Apply AdamW step on CPU */
-        adamw_step_f32(param, h_grad, m, v, conf->lr, 0.9f, 0.999f, conf->eps, 
-                       conf->weight_decay, (int)n, s->step);
-        
-        /* Upload updated param to GPU */
-        cudaMemcpy(param, param, n * sizeof(float), cudaMemcpyHostToDevice);
-        
-        free(h_grad);
+    /* Helper to launch AdamW kernel on GPU */
+    auto step_gpu = [&](float *d_param, float *d_grad, float *d_m, float *d_v, size_t n) {
+        if (!d_param || !d_grad || !d_m || !d_v || n == 0) return;
+        int blk = (int)((n + 255) / 256);
+        cuda_adamw_step_kernel<<<blk, 256>>>(d_param, d_grad, d_m, d_v,
+                                            conf->lr, 0.9f, 0.999f, conf->eps, 
+                                            conf->weight_decay, (int)n, (int)s->step);
     };
     
-    /* Apply to all parameters */
-    step_param(block->W_in.data,  s->g_W_in,  s->m_W_in,  s->v_W_in,  R * D);
-    step_param(block->W_out.data, s->g_W_out, s->m_W_out, s->v_W_out, D * R);
-    step_param(block->A_log.data, s->g_A_log, s->m_A_log, s->v_A_log, N);
-    step_param(block->W_B.data,   s->g_W_B,   s->m_W_B,   s->v_W_B,   NR * D);
-    step_param(block->W_C.data,   s->g_W_C,   s->m_W_C,   s->v_W_C,   NR * D);
-    step_param(block->b_B,        s->g_b_B,   s->m_b_B,   s->v_b_B,   NR);
-    step_param(block->b_C,        s->g_b_C,   s->m_b_C,   s->v_b_C,   NR);
-    step_param(block->delta_proj.data,  s->g_delta_proj,  s->m_delta_proj,  s->v_delta_proj, D);
-    step_param(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, s->v_lambda_proj, D);
-    step_param(block->theta, s->g_theta, s->m_theta, s->v_theta, TS);
+    /* Apply to all parameters using the persistent GPU buffers in block->gpu */
+    step_gpu(block->gpu.d_W_in,  block->gpu.d_g_W_in,  block->gpu.d_m_W_in,  block->gpu.d_v_W_in,  R * D);
+    step_gpu(block->gpu.d_W_out, block->gpu.d_g_W_out, block->gpu.d_m_W_out, block->gpu.d_v_W_out, D * R);
+    step_gpu(block->gpu.d_A_log, block->gpu.d_g_A_log, block->gpu.d_m_A_log, block->gpu.d_v_A_log, N);
+    step_gpu(block->gpu.d_W_B,   block->gpu.d_g_W_B,   block->gpu.d_m_W_B,   block->gpu.d_v_W_B,   NR * D);
+    step_gpu(block->gpu.d_W_C,   block->gpu.d_g_W_C,   block->gpu.d_m_W_C,   block->gpu.d_v_W_C,   NR * D);
+    step_gpu(block->gpu.d_b_B,   block->gpu.d_g_b_B,   block->gpu.d_m_b_B,   block->gpu.d_v_b_B,   NR);
+    step_gpu(block->gpu.d_b_C,   block->gpu.d_g_b_C,   block->gpu.d_m_b_C,   block->gpu.d_v_b_C,   NR);
+    step_gpu(block->gpu.d_delta_proj,  block->gpu.d_g_delta_proj,  block->gpu.d_m_delta_proj,  block->gpu.d_v_delta_proj, D);
+    step_gpu(block->gpu.d_lambda_proj, block->gpu.d_g_lambda_proj, block->gpu.d_m_lambda_proj, block->gpu.d_v_lambda_proj, D);
+    if (block->theta)
+        step_gpu(block->gpu.d_theta, block->gpu.d_g_theta, block->gpu.d_m_theta, block->gpu.d_v_theta, TS);
 }

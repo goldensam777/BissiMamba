@@ -16,6 +16,14 @@ extern "C" {
 #define KM_SER_LAZY     0x01  /* Memory-mapped lazy loading */
 #define KM_SER_VERIFY   0x02  /* Verify checksum */
 
+/* Extended info structure */
+typedef struct {
+    KSerInfo base;
+    uint32_t n_layers;
+    uint32_t state_size;
+    uint32_t seq_len;
+} KMSerInfo;
+
 /**
  * Save k-mamba model to .ser format
  * 
@@ -42,14 +50,6 @@ KMamba* kmamba_load_ser(const char* path, int flags);
  * @return          Info structure
  */
 KMSerInfo kmamba_ser_info(const char* path);
-
-/* Extended info structure */
-typedef struct {
-    KSerInfo base;
-    uint32_t n_layers;
-    uint32_t state_size;
-    uint32_t seq_len;
-} KMSerInfo;
 
 /**
  * Save checkpoint with optimizer state

@@ -241,8 +241,8 @@ Devise : **"Ego Sum Optimus Optimus"**
 [112]      4 bytes  vocab_count (uint32)
 [116]   variable    Vocab entries: (id:u32)(len:u16)(token)
 [116+V] variable    Tensor data (offsets absolus)
-[116+V+D] 4 bytes   tensor_count (uint32)
-[+4]    variable    KSerTensorEntry[] (72 bytes chacun)
+[116+V+D] variable  KSerTensorEntry[] (72 bytes chacun)
+[end-36]  4 bytes   tensor_count (uint32)
 [end-32]  32 bytes  SHA256 de tout le précédent
 ```
 
@@ -250,8 +250,38 @@ Devise : **"Ego Sum Optimus Optimus"**
 - `add_vocab()` doit être appelé **avant** le premier `add_tensor()`
 - Écriture atomique : `.tmp` → rename → fichier final
 - Checksum SHA256 calculé sur tout le fichier sauf les 32 derniers bytes
+- `tensor_count` placé juste avant le SHA256 pour une détection robuste à la lecture
 
 **Fichiers créés** :
 - `libs/kser/include/kser_checksum.h` — Déclarations SHA256 publiques
 
-**État** : ✅ Compilation propre (0 warnings), tests roundtrip à valider
+**État** : ✅ Compilation propre (0 warnings), tests roundtrip validés avec succès.
+
+### Session 23 Avril 2026 (Suite) — Tokenizer Hybride & API Accessors
+
+**Objectif** : Implémenter le support multi-tokenizer (32K vs 100K) et finaliser l'API d'accès aux tenseurs.
+
+**Travail effectué** :
+1. **Tokenizer Hybride (Rust)** :
+   - Support dynamique via `kmamba_tokenizer_init("bytes" | "cl100k")`.
+   - Mode `bytes` (32K) : Identity mapping (0-255) pour une robustesse totale en local.
+   - Mode `cl100k` (100K) : Intégration complète de Tiktoken pour le cloud.
+   - Suppression du modulo destructeur d'information.
+2. **API Accessors (C)** :
+   - Ajout de `kmamba_get_tensor` et `kmamba_set_tensor` pour manipuler les poids.
+   - Ajout de `kmamba_set_vocab` pour injecter les tokens à la volée.
+   - Correction de `KMambaConfig` et `MBConfig` pour inclure les métadonnées de sérialisation.
+3. **Fix GPU/cuBLAS** :
+   - Validation du fix cuBLAS Error 13 (test GPU 100% match avec CPU).
+   - Correction du linkage OpenMP pour les tests CUDA.
+4. **Intégration libkser** :
+   - `kmamba_load_ser` complet (chargement config + tenseurs + vocabulaire via callback).
+
+**Fichiers modifiés** :
+- `tokenizer_rs/src/lib.rs` — Logique hybride.
+- `include/kmamba.h` & `src/kmamba.c` — API accessors et configs.
+- `src/kmamba_ser.c` — Intégration finale chargement.
+- `Makefile` — Support linkage hybride.
+
+**État** : ✅ Système de sérialisation et Tokenizer 100% opérationnels.
+

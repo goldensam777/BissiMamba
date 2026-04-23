@@ -12,6 +12,10 @@
 #include "kmamba_kernels.h"
 #include "kmamba_cuda_utils.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ============================================================================
  * Basic Matrix type
  * ============================================================================ */
@@ -48,6 +52,8 @@ typedef struct {
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND locale */
     long   convnd_K;       /* Conv kernel_size (K>=1), distinct du state_size */
     long   convnd_ndims;   /* 0 => dérivé de spatial_ndims ; sinon doit matcher */
+    uint32_t d_conv;        /* Standard 1D conv width */
+    float    expand_factor; /* SSM expansion factor */
 } MBConfig;
 
 /* ============================================================================
@@ -196,6 +202,18 @@ typedef struct {
         float *d_lambda_raw;
         float *d_lambda;
         
+        /* Persistent Optimizer States on GPU */
+        float *d_m_W_in,  *d_v_W_in,  *d_g_W_in;
+        float *d_m_W_out, *d_v_W_out, *d_g_W_out;
+        float *d_m_A_log, *d_v_A_log, *d_g_A_log;
+        float *d_m_W_B,   *d_v_W_B,   *d_g_W_B;
+        float *d_m_W_C,   *d_v_W_C,   *d_g_W_C;
+        float *d_m_b_B,   *d_v_b_B,   *d_g_b_B;
+        float *d_m_b_C,   *d_v_b_C,   *d_g_b_C;
+        float *d_m_delta_proj,  *d_v_delta_proj,  *d_g_delta_proj;
+        float *d_m_lambda_proj, *d_v_lambda_proj, *d_g_lambda_proj;
+        float *d_m_theta, *d_v_theta, *d_g_theta;
+
         int gpu_ready;
     } gpu;
 #endif
@@ -228,6 +246,12 @@ typedef struct {
     long   convnd_K;       /* Conv kernel_size (K>=1), distinct du state_size */
     long   convnd_ndims;   /* 0 => dérivé de spatial_ndims ; sinon doit matcher */
     
+    /* Model metadata for serialization */
+    uint32_t d_conv;        /* Standard 1D conv width */
+    float    expand_factor; /* SSM expansion factor */
+    char     model_name[64];
+    const char **vocab_data; /* String tokens for cl100k_base or BPE */
+
     /* Weight tying: share embedding with output head (saves VRAM) */
     int    weight_tying;   /* 1 = tie weights, 0 = separate matrices */
 } KMambaConfig;
@@ -265,8 +289,10 @@ typedef struct {
         float *d_head;       /* [dim, vocab_size] device */
         float *d_m_embed;    /* Adam momentum device */
         float *d_v_embed;
+        float *d_g_embed;
         float *d_m_head;
         float *d_v_head;
+        float *d_g_head;
         int gpu_ready;       /* 1 if GPU buffers allocated */
     } gpu;
 #endif
@@ -348,18 +374,22 @@ int kmamba_forward(KMamba *m, const uint32_t *tokens, float *logits_out);
 /* One training step on one sequence. */
 float kmamba_train_step(KMamba *m, const uint32_t *tokens_plus1);
 
-/* Batch training: B sequences of (seq_len+1) bytes each. Returns mean loss. */
+/* Batch training: B sequences of (seq_len+1) bytes each. Returns mean loss. (Full GPU) */
 float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_size);
 
-/* Hybrid batch training: embedding/head on CPU, blocks on GPU. Returns mean loss. */
-float kmamba_train_batch_hybrid(KMamba *m, const uint32_t *batch_tokens, size_t batch_size);
-
 /* Tokenizer FFI interface (from Rust) */
+extern int      kmamba_tokenizer_init(const char* type_str);
 extern uint32_t* kmamba_encode(const char* text, size_t* out_len);
 extern char* kmamba_decode(const uint32_t* tokens, size_t len);
 extern void kmamba_free_tokens(uint32_t* tokens, size_t len);
 extern void kmamba_free_string(char* text);
 extern size_t kmamba_vocab_size(void);
+
+/* Tensors & Config Access */
+const KMambaConfig* kmamba_get_config(const KMamba *m);
+float* kmamba_get_tensor(KMamba *m, const char *name);
+int    kmamba_set_tensor(KMamba *m, const char *name, const float *data);
+int    kmamba_set_vocab(KMamba *m, uint32_t id, const char *token, uint16_t len);
 
 /* Training state getters (for CSV logging) */
 float kmamba_last_grad_norm(const KMamba *m);
@@ -369,5 +399,9 @@ size_t kmamba_step_count(const KMamba *m);
 
 /* Update learning rates (for LR scheduler) */
 void kmamba_update_lr(KMamba *m, float lr_blocks, float lr_embed);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* KMAMBA_H */

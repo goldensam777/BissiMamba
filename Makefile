@@ -107,7 +107,7 @@ TARGET = libkmamba.a
 
 MODEL_CPU = models/kmamba_cpu
 MODEL_CUDA = models/kmamba_cuda
-MODEL_HYBRID = models/kmamba_hybrid
+MODEL_AZURE = models/kmamba_azure
 
 # ═══════════════════════════════════════════════════════════════
 # Cibles principales (cpu / cuda / all)
@@ -159,19 +159,19 @@ else
 	@echo "✗ CUDA non disponible — modèle CUDA ignoré"
 endif
 
-# Modèle Hybrid uniquement (si dispo)
-hybrid_lm_model: lib $(MODEL_HYBRID)
+# Modèle Azure uniquement (si dispo)
+azure_lm_model: lib $(MODEL_AZURE)
 ifeq ($(CUDA_AVAILABLE),1)
-	@echo "✓ Modèle Hybrid prêt: $(MODEL_HYBRID)"
+	@echo "✓ Modèle Azure prêt: $(MODEL_AZURE)"
 else
-	@echo "✗ CUDA non disponible — modèle Hybrid ignoré"
+	@echo "✗ CUDA non disponible — modèle Azure ignoré"
 endif
 
 # Tous les modèles (selon disponibilité CUDA)
 all_models: cpu_lm_model
 ifeq ($(CUDA_AVAILABLE),1)
 	@echo "Compilation modèles CUDA..."
-	@$(MAKE) $(MODEL_CUDA) $(MODEL_HYBRID)
+	@$(MAKE) $(MODEL_CUDA) $(MODEL_AZURE)
 	@echo "✓ Tous les modèles sont prêts"
 endif
 
@@ -241,14 +241,14 @@ $(MODEL_CPU): models/kmamba_cpu.c $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 $(MODEL_CUDA): models/kmamba_cuda.cu $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 ifeq ($(CUDA_AVAILABLE),1)
 	$(NVCC) $(CUDA_FLAGS) -o $@ $< $(TARGET) $(KSER_LIB) $(CUDA_LDFLAGS) $(RUST_LIB) $(RUST_LDFLAGS) -Xcompiler "$(CFLAGS)"
-	@echo "Built: $@ (CUDA 500M params, BPE 32K)"
+	@echo "Built: $@ (CUDA 350M params, BPE 32K)"
 endif
 
-# Modèle Hybrid
-$(MODEL_HYBRID): models/kmamba_hybrid.c $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
+# Modèle Azure
+$(MODEL_AZURE): models/kmamba_azure.cu $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 ifeq ($(CUDA_AVAILABLE),1)
-	$(CC) $(CFLAGS) -o $@ $< $(MODEL_LDFLAGS)
-	@echo "Built: $@ (Hybrid 1.5M params, BPE 32K)"
+	$(NVCC) $(CUDA_FLAGS) -o $@ $< $(TARGET) $(KSER_LIB) $(CUDA_LDFLAGS) $(RUST_LIB) $(RUST_LDFLAGS) -Xcompiler "$(CFLAGS)"
+	@echo "Built: $@ (Azure 7.5B params, cl100k 100K)"
 endif
 
 # ═══════════════════════════════════════════════════════════════
@@ -283,7 +283,7 @@ endif
 
 test-mamba3-gpu: $(TARGET) tests/unit/test_mamba3_gpu.cu
 ifeq ($(CUDA_AVAILABLE),1)
-	$(NVCC) -O3 -arch=sm_70 -I./include -I$(CUDA_HOME)/include -o test_mamba3_gpu tests/unit/test_mamba3_gpu.cu $(TARGET) -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+	$(NVCC) -O3 -arch=sm_70 -I./include -I$(CUDA_HOME)/include -o test_mamba3_gpu tests/unit/test_mamba3_gpu.cu $(TARGET) -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Xcompiler -fopenmp -lgomp
 	./test_mamba3_gpu
 else
 	@echo "SKIP: test GPU nécessite CUDA"

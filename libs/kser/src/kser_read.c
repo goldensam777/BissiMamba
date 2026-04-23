@@ -212,60 +212,20 @@ KSerReader* kser_reader_open(const char* path) {
     if (rread(r, checksum_pos, r->stored_hash, 32) != 0) goto fail;
 
     /* 6. Tensor index is just before the checksum */
-    /*    Layout: ... | tensor_count(4) | KSerTensorEntry[tensor_count] | sha256(32) */
-    /*    We don't know tensor_count yet, so read it from just before the index end  */
-    /*    Walk backwards: checksum at end, before it is the index, before that data  */
-    /*    We know: index_end = checksum_pos                                           */
-    /*    Read tensor_count from (checksum_pos - tensor_count*sizeof(Entry) - 4)     */
-    /*    But we don't know tensor_count — scan forward from data_start instead      */
-
-    /* Simpler: tensor_count is written first, then entries, then sha256.
-     * So: [data...][tensor_count:4][entries:N*72][sha256:32]
-     * We scan the tensor_count from checksum_pos - 4 backwards:
-     *   checksum_pos = end_of_entries
-     *   tensor_count_pos = ?
-     * Use binary search: try reading tensor_count at various positions
-     * Actually: scan forward from pos (data_start) — tensor data is opaque,
-     * so we can't skip it. The only anchor is checksum_pos.
-     *
-     * Layout guarantee from kser_write.c finalize():
-     *   fwrite(&tensor_count, 4, ...)
-     *   fwrite(tensors, 72*tensor_count, ...)
-     *   <sha256 pos>
-     *
-     * So: tensor_count is at offset (checksum_pos - 4 - tensor_count*72)
-     * This is a chicken-and-egg problem. Resolve by reading uint32 from
-     * successive candidate positions starting from checksum_pos-4-0*72 = checksum_pos-4.
-     */
+    /*    Layout: ... | KSerTensorEntry[tc] | tc:4 | sha256:32 */
     {
-        long index_end = checksum_pos; /* = checksum_pos */
+        long tc_pos = checksum_pos - 4;
+        if (rread(r, tc_pos, &r->tensor_count, sizeof(uint32_t)) != 0) goto fail;
 
-        /* Try tensor_count = 0 first, then increase */
-        int found = 0;
-        uint32_t tc = 0;
-        long tc_pos;
+        if (r->tensor_count > 0) {
+            /* Verify it fits in the file after pos (data_start) */
+            long entries_pos = tc_pos - (long)(r->tensor_count * sizeof(KSerTensorEntry));
+            if (entries_pos < pos) goto fail; /* invalid count, would overlap vocab/config */
 
-        /* Maximum plausible tensor count for a 3B model ≈ 24*8 = 192 */
-        for (tc = 0; tc <= 4096; tc++) {
-            tc_pos = index_end - (long)(4 + tc * sizeof(KSerTensorEntry));
-            if (tc_pos < pos) break; /* before data start — impossible */
-            uint32_t candidate;
-            if (rread(r, tc_pos, &candidate, sizeof(uint32_t)) != 0) break;
-            if (candidate == tc) {
-                found = 1;
-                break;
-            }
-        }
-
-        if (!found) goto fail;
-
-        r->tensor_count = tc;
-        if (tc > 0) {
-            r->tensors = calloc(tc, sizeof(KSerTensorEntry));
+            r->tensors = calloc(r->tensor_count, sizeof(KSerTensorEntry));
             if (!r->tensors) goto fail;
-            long entries_pos = tc_pos + (long)sizeof(uint32_t);
             if (rread(r, entries_pos, r->tensors,
-                      tc * sizeof(KSerTensorEntry)) != 0) goto fail;
+                      r->tensor_count * sizeof(KSerTensorEntry)) != 0) goto fail;
         }
     }
 
@@ -289,6 +249,10 @@ fail:
 
 const KSerConfig* kser_reader_config(KSerReader* r) {
     return r ? &r->cfg : NULL;
+}
+
+int kser_reader_is_valid(KSerReader* r) {
+    return r ? r->hash_valid : 0;
 }
 
 int kser_reader_load_vocab(KSerReader* r, KSerVocabCallback cb, void* userdata) {

@@ -174,13 +174,13 @@ int kser_writer_finalize(KSerWriter* w) {
     if (w->data_start < 0)
         w->data_start = ftell(w->fp);
 
-    /* 6+7. Write tensor_count followed by KSerTensorEntry[] */
-    if (fwrite(&w->tensor_count, sizeof(uint32_t), 1, w->fp) != 1)
-        return KSER_ERR_IO;
+    /* 6+7. Write KSerTensorEntry[] followed by tensor_count */
     for (uint32_t i = 0; i < w->tensor_count; i++) {
         if (fwrite(&w->tensors[i], sizeof(KSerTensorEntry), 1, w->fp) != 1)
             return KSER_ERR_IO;
     }
+    if (fwrite(&w->tensor_count, sizeof(uint32_t), 1, w->fp) != 1)
+        return KSER_ERR_IO;
 
     /* Update vocab_count at its reserved position */
     long pre_checksum_pos = ftell(w->fp);

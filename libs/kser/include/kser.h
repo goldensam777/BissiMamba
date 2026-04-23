@@ -114,6 +114,7 @@ void        kser_writer_free     (KSerWriter* w);
 
 KSerReader*            kser_reader_open          (const char* path);
 const KSerConfig*      kser_reader_config        (KSerReader* r);
+int                    kser_reader_is_valid      (KSerReader* r);
 int                    kser_reader_load_vocab     (KSerReader* r,
                                                    KSerVocabCallback cb,
                                                    void* userdata);
