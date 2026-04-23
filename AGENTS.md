@@ -212,42 +212,45 @@ Devise : **"Ego Sum Optimus Optimus"**
 
 **État** : Compilation OK. Exécution échoue sur cuBLAS error 13. À investiguer plus profondément (versions CUDA, mémoire, ou abandonner cuBLAS pour kernels CPU).
 
-### Session 10 Avril 2026 (soir) — Scripts Cloud Training
 
-**Objectif** : Créer scripts pour entraînement sur Kaggle et Google Colab (GPU cloud gratuit).
 
-**Travail effectué** :
+### Session 23 Avril 2026 — Refonte libkser (Sérialisation .ser v1)
 
-1. **Scripts Kaggle** (`kaggle/`)
-   - `kmamba_kaggle_500M.ipynb` — Notebook complet 500M params
-   - `setup_kaggle.sh` — Script setup avec Rust + build
-   - `README.md` — Instructions Kaggle
-   - `train_kaggle.py` — Script Python d'entraînement
+**Objectif** : Stabiliser le format de sérialisation `.ser` et corriger les bugs de roundtrip.
 
-2. **Scripts Google Colab** (`colab/`)
-   - `kmamba_colab_500M.ipynb` — Notebook Colab 500M params
-   - `setup_colab.sh` — Script setup Colab
-   - `README.md` — Instructions Colab (upload Drive, download, etc.)
+**Problèmes identifiés et corrigés** :
+1. **Layout fichier incohérent** — Le writer mélangeait vocab et tensor data
+2. **SHA256 dupliqué** — Stub incomplet dans `kser_write.c`, implémentation complète dans `kser_checksum.c`
+3. **Fread warnings** — `-Werror=unused-result` sur tous les appels `fread()`
+4. **Forward declaration manquante** — `kser_reader_close()` utilisée avant définition
 
-3. **Configuration 500M params** (pour cloud)
-   - VOCAB=32K, DIM=1024, STATE=2048, LAYERS=24, SEQ=1024
-   - BATCH_SIZE=4 (limite T4 16GB)
-   - Tokenizer BPE Rust intégré dans les scripts
+**Changements majeurs** :
 
-**Features** :
-- Installation auto Rust/cargo pour tokenizer
-- Build k-mamba CUDA avec make
-- Visualisation matplotlib des losses
-- Sauvegarde checkpoints (Kaggle: /output/, Colab: download/Drive)
-- Chinchilla scaling configurable
+| Fichier | Changement |
+|---------|-----------|
+| `libs/kser/include/kser.h` | Nouveau layout documenté (16+96+4+V+D+4+T+32), structures packed avec `_pad[]` |
+| `libs/kser/src/kser_write.c` | Ordre d'écriture strict : header→config→vocab_count→vocab→tensors→tensor_index→SHA256. Atomic rename sur `.tmp` |
+| `libs/kser/src/kser_checksum.c` | SHA256 optimisé, ajout de `kser_sha256_file()` pour streaming |
+| `libs/kser/src/kser_quantize.c` | Code simplifié, fonctions FP16/BF16/INT8 compactées |
+
+**Format .ser v1 (final)** :
+```
+[0]       16 bytes  Magic (SERENITY + η + version)
+[16]      96 bytes  KSerConfig (packed, 96 bytes)
+[112]      4 bytes  vocab_count (uint32)
+[116]   variable    Vocab entries: (id:u32)(len:u16)(token)
+[116+V] variable    Tensor data (offsets absolus)
+[116+V+D] 4 bytes   tensor_count (uint32)
+[+4]    variable    KSerTensorEntry[] (72 bytes chacun)
+[end-32]  32 bytes  SHA256 de tout le précédent
+```
+
+**Règles du writer** :
+- `add_vocab()` doit être appelé **avant** le premier `add_tensor()`
+- Écriture atomique : `.tmp` → rename → fichier final
+- Checksum SHA256 calculé sur tout le fichier sauf les 32 derniers bytes
 
 **Fichiers créés** :
-- `kaggle/kmamba_kaggle_500M.ipynb`
-- `kaggle/setup_kaggle.sh`
-- `kaggle/README.md`
-- `kaggle/train_kaggle.py`
-- `colab/kmamba_colab_500M.ipynb`
-- `colab/setup_colab.sh`
-- `colab/README.md`
+- `libs/kser/include/kser_checksum.h` — Déclarations SHA256 publiques
 
-**État** : ✅ Scripts prêts pour upload sur GitHub et utilisation cloud
+**État** : ✅ Compilation propre (0 warnings), tests roundtrip à valider
