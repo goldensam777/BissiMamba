@@ -17,7 +17,7 @@
 # Compilateurs et flags
 # ═══════════════════════════════════════════════════════════════
 CC = gcc
-CFLAGS = -O3 -mavx2 -Wall -Wextra -I./include -fopenmp
+CFLAGS = -O3 -mavx2 -Wall -Wextra -I./include -Ilibs/train_set/include -fopenmp
 LDFLAGS = -lm -lgomp
 
 ifdef FAST_EXP
@@ -46,7 +46,7 @@ endif
 
 ifeq ($(CUDA_AVAILABLE),1)
 CUDA_HOME ?= $(dir $(NVCC))..
-CUDA_FLAGS = -O3 -arch=sm_70 -I./include -I$(CUDA_HOME)/include -DKMAMBA_BUILD_CUDA
+CUDA_FLAGS = -O3 -arch=sm_70 -I./include -Ilibs/train_set/include -I$(CUDA_HOME)/include -DKMAMBA_BUILD_CUDA
 CUDA_LDFLAGS = -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 CFLAGS += -DKMAMBA_BUILD_CUDA
 endif
@@ -74,6 +74,7 @@ SRCS = src/kmamba.c \
        src/convnd.c \
        src/km_memory_pool.c \
        src/kmamba_ser.c \
+       libs/train_set/src/trainer.c \
        kernels/gemm_f32.c \
        kernels/activations_f32.c \
        kernels/elementwise_f32.c \
@@ -86,7 +87,8 @@ CUDA_SRCS = cuda/scan_nd.cu \
             cuda/mamba_block.cu \
             cuda/kmamba_cuda_utils.cu \
             cuda/kmamba_mixed_precision.cu \
-            cuda/kmamba_distributed.cu
+            cuda/kmamba_distributed.cu \
+            cuda/kmamba_kernels.cu
 
 # ═══════════════════════════════════════════════════════════════
 # Objets et cibles
@@ -329,6 +331,10 @@ endif
 # ═══════════════════════════════════════════════════════════════
 # Nettoyage
 # ═══════════════════════════════════════════════════════════════
+
+test-trainer-gc: $(TARGET) tests/unit/test_trainer_gc.c
+	$(CC) $(CFLAGS) -o test_trainer_gc tests/unit/test_trainer_gc.c $(TARGET) libs/kser/libkser.a $(LDFLAGS) $(RUST_LDFLAGS) $(CUDA_LDFLAGS)
+	./test_trainer_gc
 
 clean:
 	rm -f $(OBJS)

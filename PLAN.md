@@ -19,6 +19,8 @@
 | **6. Validation** | ✅ Completed | All test suites updated and passing with strict configuration rules. |
 | **7. ASM Cleanup** | ✅ Completed | Removed scan1d.asm and scan2d.asm; unified on C wavefront implementation. |
 | **8. DEBUG Cleanup** | ✅ Completed | Removed all DBG_SCAN debug statements from scan_nd.c. |
+| **9. Gradient Checkpointing**| ✅ Completed | Added `libs/train_set/Trainer` with layer-wise GC and recompute. |
+| **10. Full GPU Backward**| ✅ Completed | Mamba-3 backward pass implemented and aligned with ScanND. |
 
 ## Completed Steps
 - [x] Fix `tests/unit/test_mamba3_backward.c` (optimizer config initialization).
@@ -27,3 +29,11 @@
 - [x] Document/Update `kser` serialization for new config fields.
 - [x] Remove ASM scan backends (scan1d.asm, scan2d.asm) and unify on C wavefront.
 - [x] Remove DEBUG statements from scan_nd.c.
+- [x] Implement `libs/train_set/Trainer` for Gradient Checkpointing (GC).
+- [x] Unify CUDA backend with Mamba-3 ND formulation and implement full GPU backward.
+
+## Upcoming Tasks (Serialization & Large Scale Training)
+- [ ] **Full Optimizer Serialization**: Save Adam momentum `m` and `v` buffers in `.ser` format (critical for Resume Training).
+- [ ] **Extended Header Config**: Persist `use_pgf`, `pgf_block_size`, and `weight_tying` in serialization headers.
+- [ ] **Trainer State Persistence**: Support saving/loading the `Trainer` object and its GC policy.
+- [ ] **BFloat16 Tuning**: Fine-tune BF16 kernels for stability on large models (1B+).

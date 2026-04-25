@@ -333,3 +333,38 @@ Devise : **"Optima, Immo Absoluta Perfectio"**
 - `models/kmamba_azure.cu` — Utilisation kmamba_train_batch()
 
 **État** : ✅ Build propre, Full GPU prêt pour Azure.
+
+### Session 25 Avril 2026 — Alignement Mamba-3 & Gradient Checkpointing (GC)
+
+**Objectif** : Unifier le pipeline CUDA avec les innovations Mamba-3 et implémenter le Gradient Checkpointing pour les modèles larges.
+
+**Travail effectué** :
+
+1. **Alignement Mamba-3 GPU** :
+   - Refonte de `cuda_block_forward` pour utiliser le backend unifié `om_scannd_forward`.
+   - Support natif des rotations $R(\theta)$ et de la discrétisation exp-trapézoïdale sur GPU.
+   - Implémentation du backward pass GPU complet (`om_scannd_backward`).
+
+2. **Bibliothèque `Trainer` (Gradient Checkpointing)** :
+   - Création de `libs/train_set/` pour isoler la logique d'entraînement.
+   - Implémentation du Gradient Checkpointing par couches (`TRAINER_GC_EVERY_N`).
+   - Gestion automatique de la recomputation forward lors du backward pour économiser la VRAM.
+   - Support transparent CPU et GPU (via `cudaMemcpyDeviceToDevice`).
+
+3. **Nettoyage et Consolidation** :
+   - Suppression de ~1000 lignes de code mort (vieux kernels 1D, checkpointing partiel).
+   - Harmonisation de `MBConfig` et `ScanNDParams`.
+   - Correction des avertissements de compilation (casts CUDA, variables inutilisées).
+
+**Tâches à venir (Sérialisation)** :
+- [ ] **Persistance Config** : Sauvegarder `use_pgf` et `pgf_block_size` dans le format `.ser`.
+- [ ] **Checkpoints Complets** : Implémenter la sauvegarde des moments Adam (`m`, `v`) dans `kmamba_save_checkpoint_ser` (indispensable pour le Resume Training).
+- [ ] **Trainer Serialization** : Permettre la sérialisation de l'objet `Trainer` et de sa politique de GC.
+
+**Fichiers modifiés** :
+- `libs/train_set/include/trainer.h` & `libs/train_set/src/trainer.c` — Nouveau Trainer.
+- `cuda/scan_nd.cu` & `cuda/mamba_block.cu` — Backend Mamba-3 GPU.
+- `include/kmamba.h` & `src/kmamba.c` — Alignement et API Trainer.
+- `Makefile` — Intégration de `libs/train_set`.
+
+**État** : ✅ Compilation parfaite, backend Mamba-3 unifié, Trainer prêt.
