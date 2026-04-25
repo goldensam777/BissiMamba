@@ -23,6 +23,8 @@ int main(void) {
 
     /* Configuration Mamba-3 */
     MBConfig cfg = {
+        .max_ndims = 8,
+        .max_state = 64,
         .dim = TEST_DIM,
         .state_size = TEST_STATE,
         .seq_len = TEST_SEQ_LEN,

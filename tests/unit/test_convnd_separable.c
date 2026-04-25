@@ -69,7 +69,7 @@ static int test_2d_validity(void) {
         .input = input, .output = output_dense, .kernel = kernel_dense,
         .bias = NULL, .dims = dims, .ndims = ndims, .D = D, .K = K
     };
-    KMWavefrontPlan *plan = km_wavefront_plan_create(dims, ndims);
+    KMWavefrontPlan *plan = km_wavefront_plan_create(dims, ndims, 0);
     convnd_forward_wavefront(&p_dense, plan);
     km_wavefront_plan_free(plan);
     

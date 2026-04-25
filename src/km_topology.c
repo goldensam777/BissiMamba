@@ -8,7 +8,7 @@
 int km_spatial_dims_product(const long *dims, long ndims, size_t *product_out) {
     size_t product = 1;
 
-    if (!dims || !product_out || ndims <= 0 || ndims > KMAMBA_MAX_NDIMS) return 0;
+    if (!dims || !product_out || ndims <= 0 || ndims > KMAMBA_CONFIG_MAX_NDIMS) return 0;
     if (!wavefront_nd_validate_dims(dims, ndims)) return 0;
 
     for (long axis = 0; axis < ndims; axis++) {
@@ -24,7 +24,7 @@ int km_spatial_dims_product(const long *dims, long ndims, size_t *product_out) {
 int km_make_row_major_strides(const long *dims, long ndims, long *strides_out) {
     long stride;
 
-    if (!dims || !strides_out || ndims <= 0 || ndims > KMAMBA_MAX_NDIMS) return 0;
+    if (!dims || !strides_out || ndims <= 0 || ndims > KMAMBA_CONFIG_MAX_NDIMS) return 0;
     if (!wavefront_nd_validate_dims(dims, ndims)) return 0;
 
     stride = 1;
@@ -41,7 +41,7 @@ void km_unravel_index(long linear,
                       const long *strides,
                       long ndims,
                       long *coords_out) {
-    if (!dims || !strides || !coords_out || ndims <= 0 || ndims > KMAMBA_MAX_NDIMS) return;
+    if (!dims || !strides || !coords_out || ndims <= 0 || ndims > KMAMBA_CONFIG_MAX_NDIMS) return;
     if (linear < 0) return;
 
     for (long axis = 0; axis < ndims; axis++) {
@@ -55,7 +55,7 @@ long km_ravel_index(const long *coords,
                     long ndims) {
     long offset;
 
-    if (!coords || !dims || !strides || ndims <= 0 || ndims > KMAMBA_MAX_NDIMS) return -1;
+    if (!coords || !dims || !strides || ndims <= 0 || ndims > KMAMBA_CONFIG_MAX_NDIMS) return -1;
 
     offset = 0;
     for (long axis = 0; axis < ndims; axis++) {
@@ -92,7 +92,7 @@ int km_normalize_spatial_topology(long *spatial_ndims,
     if (seq_len > (size_t)LONG_MAX) return -1;
 
     if (*spatial_ndims <= 0) {
-        memset(spatial_dims, 0, (size_t)KMAMBA_MAX_NDIMS * sizeof(long));
+        memset(spatial_dims, 0, (size_t)KMAMBA_CONFIG_MAX_NDIMS * sizeof(long));
         *spatial_ndims = 1;
         spatial_dims[0] = (long)seq_len;
     }

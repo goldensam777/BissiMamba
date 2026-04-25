@@ -27,15 +27,21 @@ extern "C" {
 typedef struct {
     long *dims;           /* [ndims] */
     long ndims;
+    long max_state;
     long total_points;
     long max_level;
     long max_level_size;
     long *level_starts;   /* [max_level + 2] */
     long *level_offsets;  /* [total_points] offsets row-major groupés par niveau */
+    int n_threads;
+    float *scratch_thread; /* [n_threads * max_state] reusable thread-local scratch */
+    long  *coords_thread;  /* [n_threads * ndims] reusable thread-local coords */
 } KMWavefrontPlan;
 
+typedef void (*KMWavefrontPlanIterCallback)(long offset, long level, void *userdata);
+
 /* Construit un plan pour une grille ND bornée. Retourne NULL si invalide. */
-KMWavefrontPlan *km_wavefront_plan_create(const long *dims, long ndims);
+KMWavefrontPlan *km_wavefront_plan_create(const long *dims, long ndims, long max_state);
 
 /* Libère le plan et tous ses buffers. */
 void km_wavefront_plan_free(KMWavefrontPlan *plan);
@@ -50,6 +56,16 @@ long km_wavefront_plan_level_size(const KMWavefrontPlan *plan, long level);
 
 /* Pointeur vers les offsets row-major du niveau donné, ou NULL si invalide. */
 const long *km_wavefront_plan_level_offsets(const KMWavefrontPlan *plan, long level);
+
+/* Iterate level-by-level from 0 to max_level. */
+int km_wavefront_plan_iter_forward(const KMWavefrontPlan *plan,
+                                   KMWavefrontPlanIterCallback callback,
+                                   void *userdata);
+
+/* Iterate level-by-level from max_level down to 0. */
+int km_wavefront_plan_iter_reverse(const KMWavefrontPlan *plan,
+                                   KMWavefrontPlanIterCallback callback,
+                                   void *userdata);
 
 #ifdef __cplusplus
 }

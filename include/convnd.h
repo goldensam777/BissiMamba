@@ -50,6 +50,8 @@ typedef struct {
     float **kernel_axes;    /* [ndims] pointers to 1D kernels [K] each */
     const float *bias;      /* Bias [D] or NULL */
     long *dims;             /* Spatial shape [ndims] */
+    long *pad_left;         /* [ndims] left padding per axis (NULL => default) */
+    long *pad_right;        /* [ndims] right padding per axis (NULL => default) */
     long ndims;             /* Number of spatial dimensions */
     long D;                 /* Depth/channels */
     long K;                 /* Kernel size along every axis */

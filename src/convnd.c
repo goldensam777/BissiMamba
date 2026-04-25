@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "wavefront_plan.h"
 #include "km_topology.h"
@@ -91,6 +94,8 @@ static void convnd_separable_1d_wavefront(
     float *output,
     const float *kernel_1d,  /* [K] */
     long axis,               /* axe de convolution (0..ndims-1) */
+    const long *pad_left,
+    const long *pad_right,
     long *dims,
     long ndims,
     long D,
@@ -103,7 +108,10 @@ static void convnd_separable_1d_wavefront(
     convnd_make_row_major_strides(dims, ndims, strides);
 
     long axis_stride = strides[axis];
-    long kernel_radius = K / 2;  /* K impair assumé pour causalité centrée */
+    long default_pad = (K - 1) / 2;
+    long pad_left_axis = pad_left ? pad_left[axis] : default_pad;
+    long pad_right_axis = pad_right ? pad_right[axis] : default_pad;
+    (void)pad_right_axis; /* reserved for asymmetry checks; left shift drives index mapping */
 
     /* Wavefront: chaque niveau = positions indépendantes le long de l'axe */
     for (long level = 0; level <= plan->max_level; level++) {
@@ -116,7 +124,11 @@ static void convnd_separable_1d_wavefront(
 #endif
         for (long point = 0; point < level_size; point++) {
             long linear = level_offsets[point];
-            long coords[KMAMBA_MAX_NDIMS];
+            int tid = 0;
+#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
+            tid = omp_get_thread_num();
+#endif
+            long *coords = plan->coords_thread + (size_t)tid * (size_t)ndims;
 
             /* Unravel index pour trouver coordonnées */
             long tmp = linear;
@@ -125,23 +137,17 @@ static void convnd_separable_1d_wavefront(
                 tmp /= dims[d];
             }
 
-            /* Vérifier que la coordonnée sur l'axe actuel est valide pour conv */
             long coord_axis = coords[axis];
-            if (coord_axis < kernel_radius || coord_axis >= dims[axis] - kernel_radius) {
-                /* Bord: copie directe ou zero padding selon politique */
-                for (long c = 0; c < D; c++) {
-                    output[linear * D + c] = input[linear * D + c];
-                }
-                continue;
-            }
-
-            /* Convolution 1D le long de l'axe */
             for (long c = 0; c < D; c++) {
                 float sum = 0.0f;
                 for (long k = 0; k < K; k++) {
-                    long offset_k = (k - kernel_radius) * axis_stride;
-                    long src_idx = linear + offset_k;
-                    sum += input[src_idx * D + c] * kernel_1d[k];
+                    long src_coord_axis = coord_axis + k - pad_left_axis;
+                    if (src_coord_axis < 0 || src_coord_axis >= dims[axis]) continue;
+                    {
+                        long offset_k = (src_coord_axis - coord_axis) * axis_stride;
+                        long src_idx = linear + offset_k;
+                        sum += input[src_idx * D + c] * kernel_1d[k];
+                    }
                 }
                 output[linear * D + c] = sum;
             }
@@ -176,7 +182,7 @@ void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPla
         KMWavefrontPlan *plan = plans_per_axis ? plans_per_axis[axis] : NULL;
         if (!plan) {
             /* Fallback: créer plan si non fourni */
-            plan = km_wavefront_plan_create(p->dims, p->ndims);
+            plan = km_wavefront_plan_create(p->dims, p->ndims, 0);
             if (!plan) { free(temp_buffer); return; }
         }
 
@@ -185,6 +191,8 @@ void convnd_separable_forward_wavefront(ConvNDSeparableParams *p, KMWavefrontPla
             current_output,
             p->kernel_axes[axis],
             axis,
+            p->pad_left,
+            p->pad_right,
             p->dims,
             p->ndims,
             p->D,
@@ -237,6 +245,8 @@ static void convnd_separable_1d_backward_wavefront(
     float *dinput_out,     /* grad w.r.t input [spatial*D] (accumulate) */
     float *dkernel_out,    /* grad w.r.t kernel [K] (accumulate) */
     long axis,
+    const long *pad_left,
+    const long *pad_right,
     long *dims,
     long ndims,
     long D,
@@ -249,7 +259,10 @@ static void convnd_separable_1d_backward_wavefront(
     convnd_make_row_major_strides(dims, ndims, strides);
 
     long axis_stride = strides[axis];
-    long kernel_radius = K / 2;
+    long default_pad = (K - 1) / 2;
+    long pad_left_axis = pad_left ? pad_left[axis] : default_pad;
+    long pad_right_axis = pad_right ? pad_right[axis] : default_pad;
+    (void)pad_right_axis;
 
     /* Init dkernel accumulation */
     memset(dkernel_out, 0, (size_t)K * sizeof(float));
@@ -265,7 +278,11 @@ static void convnd_separable_1d_backward_wavefront(
 #endif
         for (long point = 0; point < level_size; point++) {
             long linear = level_offsets[point];
-            long coords[KMAMBA_MAX_NDIMS];
+            int tid = 0;
+#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
+            tid = omp_get_thread_num();
+#endif
+            long *coords = plan->coords_thread + (size_t)tid * (size_t)ndims;
 
             long tmp = linear;
             for (long d = ndims; d-- > 0;) {
@@ -274,25 +291,20 @@ static void convnd_separable_1d_backward_wavefront(
             }
 
             long coord_axis = coords[axis];
-            if (coord_axis < kernel_radius || coord_axis >= dims[axis] - kernel_radius) {
-                continue;  /* Skip borders */
-            }
 
             for (long c = 0; c < D; c++) {
                 float grad = dy[linear * D + c];
 
                 /* Accumulate dkernel */
                 for (long k = 0; k < K; k++) {
-                    long offset_k = (k - kernel_radius) * axis_stride;
-                    long src_idx = linear + offset_k;
-                    dkernel_out[k] += grad * input[src_idx * D + c];
-                }
-
-                /* Accumulate dinput */
-                for (long k = 0; k < K; k++) {
-                    long offset_k = (k - kernel_radius) * axis_stride;
-                    long src_idx = linear + offset_k;
-                    dinput_out[src_idx * D + c] += grad * kernel_1d[k];
+                    long src_coord_axis = coord_axis + k - pad_left_axis;
+                    if (src_coord_axis < 0 || src_coord_axis >= dims[axis]) continue;
+                    {
+                        long offset_k = (src_coord_axis - coord_axis) * axis_stride;
+                        long src_idx = linear + offset_k;
+                        dkernel_out[k] += grad * input[src_idx * D + c];
+                        dinput_out[src_idx * D + c] += grad * kernel_1d[k];
+                    }
                 }
             }
         }
@@ -327,7 +339,7 @@ void convnd_separable_backward_wavefront(
     for (long axis = forward_p->ndims - 1; axis >= 0; axis--) {
         KMWavefrontPlan *plan = plans_per_axis ? plans_per_axis[axis] : NULL;
         if (!plan) {
-            plan = km_wavefront_plan_create(forward_p->dims, forward_p->ndims);
+            plan = km_wavefront_plan_create(forward_p->dims, forward_p->ndims, 0);
             if (!plan) { free(temp_grad); return; }
         }
 
@@ -343,6 +355,8 @@ void convnd_separable_backward_wavefront(
             dinput_axis,
             grad_p->dkernel_axes[axis],
             axis,
+            forward_p->pad_left,
+            forward_p->pad_right,
             forward_p->dims,
             forward_p->ndims,
             grad_p->D,
@@ -542,7 +556,7 @@ void convnd(ConvNDParams *p, ConvNDMode mode) {
 #endif
 
     /* CPU implementation */
-    plan = km_wavefront_plan_create(p->dims, p->ndims);
+    plan = km_wavefront_plan_create(p->dims, p->ndims, 0);
     if (!plan) return;
 
     if (mode & CONVND_FORWARD) {

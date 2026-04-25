@@ -51,13 +51,19 @@ static int test_ssm_1d(void) {
 
     /* Small config for testing */
     MBConfig cfg = {
+        .max_ndims = 8,
+        .max_state = 64,
+        .use_fast_exp = 0,
         .dim = 8,
         .state_size = 4,
         .seq_len = 16,
         .mimo_rank = 1,
         .dt_scale = 0.1f,
         .dt_min = 1e-3f,
-        .dt_max = 1.0f
+        .dt_max = 1.0f,
+        .default_lambda = 0.5f,
+        .use_a_log_clamp = 1,
+        .a_log_min = -1e-5f
     };
 
     MambaBlock *block = mamba_block_create(&cfg);
@@ -200,7 +206,11 @@ static int test_scan_nd_2d(void) {
         .D = D,
         .M = M,
         .lambda = NULL,
-        .theta = NULL
+        .theta = NULL,
+        .default_lambda = 0.5f,
+        .use_a_log_clamp = 1,
+        .a_log_min = -1e-5f,
+        .use_fast_exp = 0
     };
 
     int rc = scannd(&p);

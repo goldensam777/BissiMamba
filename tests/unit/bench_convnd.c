@@ -117,7 +117,7 @@ int main(int argc, char *argv[]) {
     for (i = 0; i < D; i++) bias[i] = frand() * 0.1f;
 
     /* Create wavefront plan */
-    plan = km_wavefront_plan_create(dims, ndims);
+    plan = km_wavefront_plan_create(dims, ndims, 0);
     if (!plan) {
         fprintf(stderr, "Failed to create wavefront plan\n");
         return 1;

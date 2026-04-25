@@ -111,7 +111,7 @@ __global__ void convnd_level_kernel(
     long out_linear = ordered_offsets[slot];
 
     /* Unravel output coordinates */
-    long out_coords[KMAMBA_MAX_NDIMS];
+    long out_coords[KMAMBA_CONFIG_MAX_NDIMS];
     d_unravel_index(out_linear, dims, ndims, strides, out_coords);
 
     float sum = (bias) ? bias[d] : 0.0f;
@@ -169,7 +169,7 @@ __global__ void convnd_bwd_input_kernel(
     long slot = level_start + point_ordinal;
     long out_linear = ordered_offsets[slot];
 
-    long out_coords[KMAMBA_MAX_NDIMS];
+    long out_coords[KMAMBA_CONFIG_MAX_NDIMS];
     d_unravel_index(out_linear, dims, ndims, strides, out_coords);
 
     float grad_out = dy[out_linear * D + d];
@@ -225,7 +225,7 @@ __global__ void convnd_bwd_kernel_kernel(
     long slot = level_start + point_ordinal;
     long out_linear = ordered_offsets[slot];
 
-    long out_coords[KMAMBA_MAX_NDIMS];
+    long out_coords[KMAMBA_CONFIG_MAX_NDIMS];
     d_unravel_index(out_linear, dims, ndims, strides, out_coords);
 
     float grad_out = dy[out_linear * D + d];
@@ -267,7 +267,7 @@ int om_convnd_forward(ConvNDParams *p) {
     if (!convnd_validate_params(p)) return -1;
 
     /* Create wavefront plan on host */
-    plan = km_wavefront_plan_create(p->dims, p->ndims);
+    plan = km_wavefront_plan_create(p->dims, p->ndims, 0);
     if (!plan) return -1;
 
     /* Validate plan matches dims */
@@ -351,7 +351,7 @@ int om_convnd_backward(ConvNDParams *p) {
     kernel_volume = convnd_power_long(p->K, p->ndims);
 
     /* Create plan */
-    plan = km_wavefront_plan_create(p->dims, p->ndims);
+    plan = km_wavefront_plan_create(p->dims, p->ndims, 0);
     if (!plan) return -1;
 
     /* Init gradient buffers */

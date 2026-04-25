@@ -37,6 +37,9 @@ int main(void) {
 
     /* Configuration Mamba-3 */
     MBConfig cfg = {
+        .max_ndims = 8,
+        .max_state = 64,
+        .use_fast_exp = 0,
         .dim = TEST_DIM,
         .state_size = TEST_STATE,
         .seq_len = TEST_SEQ_LEN,
@@ -44,6 +47,9 @@ int main(void) {
         .dt_scale = 0.01f,
         .dt_min = 1e-3f,
         .dt_max = 0.1f,
+        .default_lambda = 0.5f,
+        .use_a_log_clamp = 1,
+        .a_log_min = -1e-5f,
         .spatial_ndims = 0,
         .use_convnd = 0
     };

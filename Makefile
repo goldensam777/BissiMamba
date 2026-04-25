@@ -81,9 +81,6 @@ SRCS = src/kmamba.c \
        kernels/optimizer_f32.c \
        kernels/init_f32.c
 
-ASM_SRCS = cpu/scan1d.asm \
-           cpu/scan2d.asm
-
 CUDA_SRCS = cuda/scan1d.cu \
             cuda/scan1d_backward.cu \
             cuda/scan_nd.cu \
@@ -100,7 +97,6 @@ CUDA_SRCS = cuda/scan1d.cu \
 # Objets et cibles
 # ═══════════════════════════════════════════════════════════════
 OBJS = $(SRCS:.c=.o)
-ASM_OBJS = $(ASM_SRCS:.asm=.o)
 CUDA_OBJS = $(patsubst %.cu,cuda/%.o,$(notdir $(CUDA_SRCS)))
 
 TARGET = libkmamba.a
@@ -190,16 +186,12 @@ endif
 # Compilation de la lib
 # ═══════════════════════════════════════════════════════════════
 
-$(TARGET): $(OBJS) $(ASM_OBJS) $(CUDA_OBJS)
+$(TARGET): $(OBJS) $(CUDA_OBJS)
 	ar rcs $@ $^
 
 # C files (always use gcc, not nvcc)
 %.o: %.c
 	gcc $(CFLAGS) -c $< -o $@
-
-# ASM files
-%.o: %.asm
-	nasm -f elf64 -O3 -I./include $< -o $@
 
 # CUDA files
 ifeq ($(CUDA_AVAILABLE),1)
@@ -305,8 +297,8 @@ test-gemm-atb-determinism: tests/unit/test_gemm_atb_determinism.c kernels/gemm_f
 	$(CC) $(CFLAGS) -o /tmp/test_gemm_atb_determinism tests/unit/test_gemm_atb_determinism.c kernels/gemm_f32.c $(LDFLAGS)
 	/tmp/test_gemm_atb_determinism
 
-test-scan-nd-regression: tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c cpu/scan1d.o cpu/scan2d.o
-	$(CC) -no-pie $(CFLAGS) -o /tmp/test_scan_nd tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c cpu/scan1d.o cpu/scan2d.o $(LDFLAGS)
+test-scan-nd-regression: tests/unit/test_scan_nd.c lib
+	$(CC) -no-pie $(CFLAGS) -o /tmp/test_scan_nd tests/unit/test_scan_nd.c libkmamba.a $(LDFLAGS) $(CUDA_LDFLAGS)
 	/tmp/test_scan_nd
 
 test-gradient: tests/test_gradient.c lib
@@ -344,7 +336,7 @@ endif
 # ═══════════════════════════════════════════════════════════════
 
 clean:
-	rm -f $(OBJS) $(ASM_OBJS)
+	rm -f $(OBJS)
 	rm -f src/*.o kernels/*.o cpu/*.o
 	rm -f test_mamba3 test_mamba3_gpu
 	$(MAKE) -C $(KSER_DIR) clean 2>/dev/null || true

@@ -38,6 +38,9 @@ extern "C" {
  * ============================================================================ */
 
 typedef struct {
+    long         max_ndims; /* runtime ND cap for validation/scratch */
+    long         max_state; /* runtime state cap for validation/scratch */
+    int          use_fast_exp; /* 0 = expf, 1 = polynomial approximation */
     const long  *dims;
     long         ndims;
     long         D;
@@ -52,6 +55,9 @@ typedef struct {
     /* Mamba-3 extensions: rotation angles and exp-trapezoidal lambda */
     const float *theta;   /* [D/2] rotation angles per channel pair (may be NULL) */
     const float *lambda;  /* [prod(dims)] per-point lambda for exp-trapezoidal (may be NULL) */
+    float default_lambda; /* fallback lambda if lambda == NULL (recommended [0,1]) */
+    int   use_a_log_clamp; /* 1 = clamp A with a_log_min, 0 = no clamp */
+    float a_log_min;       /* lower bound for A when use_a_log_clamp=1 */
 } ScanNDParams;
 
 /* Vérifie que les pointeurs / tailles sont valides. */

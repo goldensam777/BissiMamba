@@ -120,12 +120,18 @@ static int test_muon_block(void) {
     SECTION("MUON sur MambaBlock");
 
     MBConfig cfg = {
+        .max_ndims  = 8,
+        .max_state  = 64,
+        .use_fast_exp = 0,
         .dim        = 32,
         .state_size = 16,
         .seq_len    = 8,
         .dt_scale   = 1.0f,
         .dt_min     = 0.001f,
         .dt_max     = 1.0f,
+        .default_lambda = 0.5f,
+        .use_a_log_clamp = 1,
+        .a_log_min  = -1e-5f,
         .use_convnd = 0,
     };
     MBOptimConfig opt = {
@@ -225,9 +231,11 @@ static int test_adam_embedding(void) {
 
     /* Verifier que KMamba alloue bien les moments embed apres enable_training */
     KMambaConfig kcfg = {
+        .max_ndims = 8, .max_state = 64, .use_fast_exp = 0,
         .vocab_size = 16, .dim = 8, .state_size = 8,
         .seq_len = 4, .n_layers = 1,
         .dt_scale = 1.0f, .dt_min = 0.001f, .dt_max = 1.0f,
+        .default_lambda = 0.5f, .use_a_log_clamp = 1, .a_log_min = -1e-5f,
     };
     MBOptimConfig opt = {1e-3f, 0.9f, 0.999f, 1e-8f, 1.0f, 0.0f};
 
@@ -311,8 +319,10 @@ static int test_adamw_no_double_wd(void) {
     /* Verifier que le bloc Adam CPU applique la formule correcte.
      * Apres un step avec wd>0, le parametre doit correspondre a p_correct. */
     MBConfig cfg = {
+        .max_ndims = 8, .max_state = 64, .use_fast_exp = 0,
         .dim=8, .state_size=4, .seq_len=4,
         .dt_scale=1.0f, .dt_min=0.001f, .dt_max=1.0f,
+        .default_lambda = 0.5f, .use_a_log_clamp = 1, .a_log_min = -1e-5f,
         .use_convnd=0,
     };
     MBOptimConfig opt = {lr, mu, b2, eps, 0.0f, wd};

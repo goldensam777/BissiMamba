@@ -43,7 +43,7 @@ __global__ void separable_1d_kernel(
     long linear = ordered_offsets[slot];
 
     /* Unravel to get coordinates */
-    long coords[KMAMBA_MAX_NDIMS];
+    long coords[KMAMBA_CONFIG_MAX_NDIMS];
     convnd_d_unravel_index(linear, dims, ndims, strides, coords);
 
     long axis_stride = strides[axis];
@@ -93,7 +93,7 @@ int om_convnd_separable_forward(ConvNDSeparableParams *p) {
     if (!plans) goto cleanup;
 
     for (long axis = 0; axis < p->ndims; axis++) {
-        plans[axis] = km_wavefront_plan_create(p->dims, p->ndims);
+        plans[axis] = km_wavefront_plan_create(p->dims, p->ndims, 0);
         if (!plans[axis]) goto cleanup;
     }
 

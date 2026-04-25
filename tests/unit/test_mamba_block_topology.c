@@ -8,6 +8,8 @@
 
 static int test_block_builds_implicit_1d_plan(void) {
     MBConfig cfg = {
+        .max_ndims = 8,
+        .max_state = 64,
         .dim = 8,
         .state_size = 4,
         .seq_len = 12,
@@ -60,6 +62,8 @@ static int test_block_builds_implicit_1d_plan(void) {
 
 static int test_block_rejects_shape_mismatch(void) {
     MBConfig cfg = {
+        .max_ndims = 8,
+        .max_state = 64,
         .dim = 8,
         .state_size = 4,
         .seq_len = 12,
@@ -87,22 +91,23 @@ static int test_block_rejects_shape_mismatch(void) {
 }
 
 static int test_kmamba_propagates_topology_and_conv_config(void) {
-    KMambaConfig cfg = {
-        .vocab_size = 256,
-        .dim = 8,
-        .state_size = 4,
-        .seq_len = 12,
-        .n_layers = 1,
-        .mimo_rank = 1,
-        .dt_scale = 1.0f,
-        .dt_min = 0.001f,
-        .dt_max = 0.1f,
-        .spatial_ndims = 2,
-        .spatial_dims = {3, 4},
-        .use_convnd = 1,
-        .convnd_K = 3,
-        .convnd_ndims = 0
-    };
+    KMambaConfig cfg;
+    kmamba_config_set_defaults(&cfg);
+    cfg.vocab_size = 256;
+    cfg.dim = 8;
+    cfg.state_size = 4;
+    cfg.seq_len = 12;
+    cfg.n_layers = 1;
+    cfg.mimo_rank = 1;
+    cfg.dt_scale = 1.0f;
+    cfg.dt_min = 0.001f;
+    cfg.dt_max = 0.1f;
+    cfg.spatial_ndims = 2;
+    cfg.spatial_dims[0] = 3; cfg.spatial_dims[1] = 4;
+    cfg.use_convnd = 1;
+    cfg.convnd_K = 3;
+    cfg.convnd_ndims = 0;
+
     KMamba *model;
     MambaBlock *block;
     int ok = 1;

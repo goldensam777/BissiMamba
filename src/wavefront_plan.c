@@ -2,6 +2,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 typedef struct {
     const long *dims;
@@ -32,7 +35,7 @@ static int wavefront_plan_collect_offsets(const long *idx,
     return 0;
 }
 
-KMWavefrontPlan *km_wavefront_plan_create(const long *dims, long ndims) {
+KMWavefrontPlan *km_wavefront_plan_create(const long *dims, long ndims, long max_state) {
     KMWavefrontPlan *plan;
     long total_points;
     long max_level;
@@ -58,6 +61,7 @@ KMWavefrontPlan *km_wavefront_plan_create(const long *dims, long ndims) {
 
     memcpy(plan->dims, dims, (size_t)ndims * sizeof(long));
     plan->ndims = ndims;
+    plan->max_state = max_state;
     plan->total_points = total_points;
     plan->max_level = max_level;
     plan->max_level_size = 0;
@@ -97,6 +101,26 @@ KMWavefrontPlan *km_wavefront_plan_create(const long *dims, long ndims) {
     }
 
     plan->level_starts[max_level + 1] = total_points;
+
+#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
+    plan->n_threads = omp_get_max_threads();
+#else
+    plan->n_threads = 1;
+#endif
+    if (plan->n_threads <= 0) plan->n_threads = 1;
+
+    if (plan->max_state > 0) {
+        plan->scratch_thread = (float *)calloc((size_t)plan->n_threads * (size_t)plan->max_state, sizeof(float));
+        if (!plan->scratch_thread) {
+            km_wavefront_plan_free(plan);
+            return NULL;
+        }
+    }
+    plan->coords_thread = (long *)calloc((size_t)plan->n_threads * (size_t)plan->ndims, sizeof(long));
+    if (!plan->coords_thread) {
+        km_wavefront_plan_free(plan);
+        return NULL;
+    }
     return plan;
 }
 
@@ -105,6 +129,8 @@ void km_wavefront_plan_free(KMWavefrontPlan *plan) {
     free(plan->dims);
     free(plan->level_starts);
     free(plan->level_offsets);
+    free(plan->scratch_thread);
+    free(plan->coords_thread);
     free(plan);
 }
 
@@ -129,4 +155,38 @@ long km_wavefront_plan_level_size(const KMWavefrontPlan *plan, long level) {
 const long *km_wavefront_plan_level_offsets(const KMWavefrontPlan *plan, long level) {
     if (!plan || level < 0 || level > plan->max_level) return NULL;
     return plan->level_offsets + plan->level_starts[level];
+}
+
+int km_wavefront_plan_iter_forward(const KMWavefrontPlan *plan,
+                                   KMWavefrontPlanIterCallback callback,
+                                   void *userdata) {
+    long level;
+    if (!plan || !callback) return -1;
+    for (level = 0; level <= plan->max_level; level++) {
+        const long *offsets = km_wavefront_plan_level_offsets(plan, level);
+        long level_size = km_wavefront_plan_level_size(plan, level);
+        long i;
+        if (!offsets || level_size < 0) return -1;
+        for (i = 0; i < level_size; i++) {
+            callback(offsets[i], level, userdata);
+        }
+    }
+    return 0;
+}
+
+int km_wavefront_plan_iter_reverse(const KMWavefrontPlan *plan,
+                                   KMWavefrontPlanIterCallback callback,
+                                   void *userdata) {
+    long level;
+    if (!plan || !callback) return -1;
+    for (level = plan->max_level; level >= 0; level--) {
+        const long *offsets = km_wavefront_plan_level_offsets(plan, level);
+        long level_size = km_wavefront_plan_level_size(plan, level);
+        long i;
+        if (!offsets || level_size < 0) return -1;
+        for (i = 0; i < level_size; i++) {
+            callback(offsets[i], level, userdata);
+        }
+    }
+    return 0;
 }

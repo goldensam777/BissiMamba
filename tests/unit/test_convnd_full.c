@@ -207,7 +207,7 @@ static int test_convnd_full_with_plan_matches_plain_ref(void) {
     p_plan = p_ref;
     p_plan.output = output_plan;
 
-    plan = km_wavefront_plan_create(dims, 2);
+    plan = km_wavefront_plan_create(dims, 2, 0);
     if (!plan) {
         printf("%s création du plan wavefront\n", FAIL_TAG);
         return 0;

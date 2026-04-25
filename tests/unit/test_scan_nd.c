@@ -19,6 +19,9 @@ static int test_scannd_validate_rejects_invalid(void) {
     const long dims[2] = {2, 0};
     float one = 1.0f;
     ScanNDParams p = {
+        .max_ndims = 8,
+        .max_state = 64,
+        .use_fast_exp = 0,
         .dims = dims,
         .ndims = 2,
         .D = 1,
@@ -29,7 +32,12 @@ static int test_scannd_validate_rejects_invalid(void) {
         .C = &one,
         .delta = &one,
         .h = &one,
-        .y = &one
+        .y = &one,
+        .lambda = NULL,
+        .theta = NULL,
+        .default_lambda = 0.5f,
+        .use_a_log_clamp = 1,
+        .a_log_min = -1e-5f
     };
 
     printf("\n--- Validation paramètres invalides ---\n");
@@ -51,7 +59,8 @@ static int test_scannd_ref_matches_expected_2d(void) {
     float delta[8];
     float h[4] = {0.f, 0.f, 0.f, 0.f};
     float y[4] = {0.f, 0.f, 0.f, 0.f};
-    const float expected[4] = {1.f, 4.f, 3.f, 18.f};
+    /* Mamba-3 exp-trapezoidal formula results (lambda=0.5 default) */
+    const float expected[4] = {1.f, 2.99998f, 2.99998f, 7.99989f};
     ScanNDParams p;
     int ok = 1;
 
@@ -60,6 +69,9 @@ static int test_scannd_ref_matches_expected_2d(void) {
         delta[4 + i] = 1.f;
     }
 
+    p.max_ndims = 8;
+    p.max_state = 64;
+    p.use_fast_exp = 0;
     p.dims = dims;
     p.ndims = 2;
     p.D = 1;
@@ -71,6 +83,11 @@ static int test_scannd_ref_matches_expected_2d(void) {
     p.delta = delta;
     p.h = h;
     p.y = y;
+    p.lambda = NULL;
+    p.theta = NULL;
+    p.default_lambda = 0.5f;
+    p.use_a_log_clamp = 1;
+    p.a_log_min = -1e-5f;
 
     printf("\n--- scannd_ref 2D attendu ---\n");
 
@@ -100,7 +117,8 @@ static int test_scannd_ref_matches_expected_3d(void) {
     float delta[24];
     float h[8];
     float y[8];
-    const float expected[8] = {1.f, 2.f, 2.f, 5.f, 2.f, 5.f, 5.f, 16.f};
+    /* Mamba-3 exp-trapezoidal formula results (lambda=0.5 default) */
+    const float expected[8] = {1.5f, 4.49997f, 4.49997f, 11.99984f, 4.49997f, 11.99984f, 11.99984f, 38.99913f};
     ScanNDParams p;
     int ok = 1;
 
@@ -113,6 +131,9 @@ static int test_scannd_ref_matches_expected_3d(void) {
     }
     for (int i = 0; i < 24; i++) delta[i] = 1.f;
 
+    p.max_ndims = 8;
+    p.max_state = 64;
+    p.use_fast_exp = 0;
     p.dims = dims;
     p.ndims = 3;
     p.D = 1;
@@ -124,6 +145,11 @@ static int test_scannd_ref_matches_expected_3d(void) {
     p.delta = delta;
     p.h = h;
     p.y = y;
+    p.lambda = NULL;
+    p.theta = NULL;
+    p.default_lambda = 0.5f;
+    p.use_a_log_clamp = 1;
+    p.a_log_min = -1e-5f;
 
     printf("\n--- scannd_ref 3D attendu ---\n");
 
@@ -159,6 +185,9 @@ static int test_scannd_dispatch_matches_ref_1d(void) {
     ScanNDParams p_fast;
     int ok = 1;
 
+    p_ref.max_ndims = 8;
+    p_ref.max_state = 64;
+    p_ref.use_fast_exp = 0;
     p_ref.dims = dims;
     p_ref.ndims = 1;
     p_ref.D = 1;
@@ -170,6 +199,11 @@ static int test_scannd_dispatch_matches_ref_1d(void) {
     p_ref.delta = delta;
     p_ref.h = h_ref;
     p_ref.y = y_ref;
+    p_ref.lambda = NULL;
+    p_ref.theta = NULL;
+    p_ref.default_lambda = 0.5f;
+    p_ref.use_a_log_clamp = 1;
+    p_ref.a_log_min = -1e-5f;
 
     p_fast = p_ref;
     p_fast.h = h_fast;
@@ -213,6 +247,9 @@ static int test_scannd_dispatch_matches_ref_2d(void) {
         delta[4 + i] = 1.f;
     }
 
+    p_ref.max_ndims = 8;
+    p_ref.max_state = 64;
+    p_ref.use_fast_exp = 0;
     p_ref.dims = dims;
     p_ref.ndims = 2;
     p_ref.D = 1;
@@ -224,6 +261,11 @@ static int test_scannd_dispatch_matches_ref_2d(void) {
     p_ref.delta = delta;
     p_ref.h = h_ref;
     p_ref.y = y_ref;
+    p_ref.lambda = NULL;
+    p_ref.theta = NULL;
+    p_ref.default_lambda = 0.5f;
+    p_ref.use_a_log_clamp = 1;
+    p_ref.a_log_min = -1e-5f;
 
     p_fast = p_ref;
     p_fast.h = h_fast;
@@ -270,6 +312,9 @@ static int test_scannd_ref_with_plan_matches_plain_ref(void) {
     }
     for (int i = 0; i < 24; i++) delta[i] = 1.f;
 
+    p_ref.max_ndims = 8;
+    p_ref.max_state = 64;
+    p_ref.use_fast_exp = 0;
     p_ref.dims = dims;
     p_ref.ndims = 3;
     p_ref.D = 1;
@@ -281,6 +326,11 @@ static int test_scannd_ref_with_plan_matches_plain_ref(void) {
     p_ref.delta = delta;
     p_ref.h = h_ref;
     p_ref.y = y_ref;
+    p_ref.lambda = NULL;
+    p_ref.theta = NULL;
+    p_ref.default_lambda = 0.5f;
+    p_ref.use_a_log_clamp = 1;
+    p_ref.a_log_min = -1e-5f;
 
     p_plan = p_ref;
     p_plan.h = h_plan;
@@ -288,7 +338,7 @@ static int test_scannd_ref_with_plan_matches_plain_ref(void) {
 
     printf("\n--- scannd_ref_with_plan() vs scannd_ref() ---\n");
 
-    plan = km_wavefront_plan_create(dims, 3);
+    plan = km_wavefront_plan_create(dims, 3, p_ref.M);
     if (!plan) {
         printf("%s création du plan wavefront\n", FAIL_TAG);
         return 0;
@@ -335,6 +385,9 @@ static int test_scannd_ref_with_plan_multithread_deterministic(void) {
     }
     for (int i = 0; i < 24; i++) delta[i] = 1.f;
 
+    p_ref.max_ndims = 8;
+    p_ref.max_state = 64;
+    p_ref.use_fast_exp = 0;
     p_ref.dims = dims;
     p_ref.ndims = 3;
     p_ref.D = 1;
@@ -346,13 +399,18 @@ static int test_scannd_ref_with_plan_multithread_deterministic(void) {
     p_ref.delta = delta;
     p_ref.h = h_ref;
     p_ref.y = y_ref;
+    p_ref.lambda = NULL;
+    p_ref.theta = NULL;
+    p_ref.default_lambda = 0.5f;
+    p_ref.use_a_log_clamp = 1;
+    p_ref.a_log_min = -1e-5f;
 
     p_mt = p_ref;
     p_mt.h = h_mt;
     p_mt.y = y_mt;
 
     printf("\n--- scannd_ref_with_plan() déterminisme multi-thread ---\n");
-    plan = km_wavefront_plan_create(dims, 3);
+    plan = km_wavefront_plan_create(dims, 3, p_ref.M);
     if (!plan) {
         printf("%s création du plan wavefront\n", FAIL_TAG);
         return 0;
@@ -395,6 +453,7 @@ int main(void) {
     printf("=== Tests scan_nd ===\n");
 
     total++; passed += test_scannd_validate_rejects_invalid();
+    /* NOTE: 2D/3D tests use Mamba-3 exp-trapezoidal formula - expected values updated */
     total++; passed += test_scannd_ref_matches_expected_2d();
     total++; passed += test_scannd_ref_matches_expected_3d();
     total++; passed += test_scannd_dispatch_matches_ref_1d();

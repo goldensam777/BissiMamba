@@ -1,6 +1,7 @@
 #include "kmamba.h"
 #include "kmamba_kernels.h"
 #include "mamba_scan.h"
+#include "km_memory_pool.h"
 
 #ifdef KMAMBA_BUILD_CUDA
 #include <cuda_runtime.h>
@@ -121,7 +122,7 @@ static void project_controller_full(const MambaBlock *block, const float *x_t, f
     if (block->lambda_proj.rows > 0 && block->lambda_proj.data) {
         float lambda_raw; gemv_f32(block->lambda_proj.data, x_t, &lambda_raw, 1, (int)D);
         ctrl->lambda = 1.0f / (1.0f + expf(-lambda_raw));
-    } else { ctrl->lambda = 0.5f; }
+    } else { ctrl->lambda = block->config.default_lambda; }
 }
 
 MambaBlock* mamba_block_create(const MBConfig *config) {
@@ -129,12 +130,42 @@ MambaBlock* mamba_block_create(const MBConfig *config) {
     MambaBlock *block = (MambaBlock *)calloc(1, sizeof(MambaBlock));
     if (!block) return NULL;
     block->config = *config;
-    if (block->config.mimo_rank == 0) block->config.mimo_rank = 1;
+    if (block->config.max_ndims <= 0 || block->config.max_ndims > KMAMBA_CONFIG_MAX_NDIMS) {
+        fprintf(stderr, "mamba_block_create: invalid max_ndims=%ld (1..%d required)\n",
+                block->config.max_ndims, KMAMBA_CONFIG_MAX_NDIMS);
+        free(block);
+        return NULL;
+    }
+    if (block->config.max_state <= 0) {
+        fprintf(stderr, "mamba_block_create: invalid max_state=%ld (>0 required)\n", block->config.max_state);
+        free(block);
+        return NULL;
+    }
+    if (block->config.mimo_rank == 0) {
+        fprintf(stderr, "mamba_block_create: mimo_rank must be >= 1\n");
+        free(block);
+        return NULL;
+    }
+    if (block->config.default_lambda < 0.0f || block->config.default_lambda > 1.0f) {
+        fprintf(stderr, "mamba_block_create: invalid default_lambda=%f (expected in [0,1])\n",
+                block->config.default_lambda);
+        free(block);
+        return NULL;
+    }
+    if (block->config.use_a_log_clamp && block->config.a_log_min == 0.0f) {
+        fprintf(stderr, "mamba_block_create: a_log_min must be set when use_a_log_clamp=1\n");
+        free(block);
+        return NULL;
+    }
     if (km_normalize_spatial_topology(&block->config.spatial_ndims, block->config.spatial_dims, block->config.seq_len, block->config.use_convnd, &block->config.convnd_ndims, block->config.convnd_K) != 0) { free(block); return NULL; }
+    if (block->config.spatial_ndims > block->config.max_ndims) { free(block); return NULL; }
     size_t R = _mimo_R(&block->config), N = block->config.state_size, D = block->config.dim;
     if (matrix_init_owned(&block->W_in, R, D) != 0 || matrix_init_owned(&block->W_out, D, R) != 0 || matrix_init_owned(&block->A_log, N, 1) != 0 || matrix_init_owned(&block->W_B, N * R, D) != 0 || matrix_init_owned(&block->W_C, N * R, D) != 0 || matrix_init_owned(&block->delta_proj, 1, D) != 0 || matrix_init_owned(&block->lambda_proj, 1, D) != 0) { mamba_block_free(block); return NULL; }
     block->b_B = malloc(N * R * sizeof(float)); block->b_C = malloc(N * R * sizeof(float)); block->theta = malloc((N / 2 > 0 ? N / 2 : 1) * sizeof(float)); block->hidden = malloc(N * sizeof(float)); block->delta = malloc(block->config.seq_len * sizeof(float)); block->scan_B = malloc(block->config.seq_len * N * R * sizeof(float)); block->scan_C = malloc(block->config.seq_len * N * R * sizeof(float)); block->scan_delta = malloc(block->config.seq_len * N * sizeof(float)); block->scan_h = malloc(N * sizeof(float));
-    block->wavefront_plan = km_wavefront_plan_create(block->config.spatial_dims, block->config.spatial_ndims);
+    block->wavefront_plan = km_wavefront_plan_create(
+        block->config.spatial_dims,
+        block->config.spatial_ndims,
+        (block->config.max_state > 0) ? block->config.max_state : (long)block->config.state_size);
     if (!block->b_B || !block->b_C || !block->theta || !block->hidden || !block->delta || !block->scan_B || !block->scan_C || !block->scan_delta || !block->scan_h || !block->wavefront_plan) { mamba_block_free(block); return NULL; }
     if (block->config.use_convnd && block->config.convnd_K > 0) {
         long kernel_size = block->config.convnd_ndims * block->config.convnd_K * (long)block->config.dim;
@@ -265,9 +296,18 @@ float mamba_block_grad_sqnorm(const MambaBlock *block) {
 }
 
 void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
-    if (!block || !block->opt_state) return;
+    if (!block || !block->opt_state || !conf) return;
+    if (conf->mu <= 0.0f || conf->mu >= 1.0f ||
+        conf->beta2 <= 0.0f || conf->beta2 >= 1.0f ||
+        conf->eps <= 0.0f) {
+        fprintf(stderr, "mamba_optimizer_step: invalid optimizer config (mu,beta2 in (0,1), eps>0 required)\n");
+        return;
+    }
     MBOptimState *s = (MBOptimState *)block->opt_state; s->step++;
     size_t D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R, TS = N/2 > 0 ? N/2 : 1;
+    const float adam_beta1 = conf->mu;
+    const float adam_beta2 = conf->beta2;
+    const float adam_eps = conf->eps;
     if (s->type == OPTIMIZER_MUON) {
         muon_update_mat_f32(block->W_in.data, s->g_W_in, s->m_W_in, R, D, conf, (int)s->step);
         muon_update_mat_f32(block->W_out.data, s->g_W_out, s->m_W_out, D, R, conf, (int)s->step);
@@ -280,27 +320,104 @@ void mamba_optimizer_step(MambaBlock *block, const MBOptimConfig *conf) {
         muon_update_vec_f32(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, D, conf, (int)s->step);
         muon_update_vec_f32(block->theta, s->g_theta, s->m_theta, TS, conf, (int)s->step);
     } else {
-        adamw_step_f32(block->W_in.data, s->g_W_in, s->m_W_in, s->v_W_in, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)(R*D), (int)s->step);
-        adamw_step_f32(block->W_out.data, s->g_W_out, s->m_W_out, s->v_W_out, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)(D*R), (int)s->step);
-        adamw_step_f32(block->A_log.data, s->g_A_log, s->m_A_log, s->v_A_log, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)N, (int)s->step);
-        adamw_step_f32(block->W_B.data, s->g_W_B, s->m_W_B, s->v_W_B, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)(NR*D), (int)s->step);
-        adamw_step_f32(block->W_C.data, s->g_W_C, s->m_W_C, s->v_W_C, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)(NR*D), (int)s->step);
-        adamw_step_f32(block->b_B, s->g_b_B, s->m_b_B, s->v_b_B, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)NR, (int)s->step);
-        adamw_step_f32(block->b_C, s->g_b_C, s->m_b_C, s->v_b_C, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)NR, (int)s->step);
-        adamw_step_f32(block->delta_proj.data, s->g_delta_proj, s->m_delta_proj, s->v_delta_proj, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)D, (int)s->step);
-        adamw_step_f32(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, s->v_lambda_proj, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)D, (int)s->step);
-        adamw_step_f32(block->theta, s->g_theta, s->m_theta, s->v_theta, conf->lr, 0.9f, 0.999f, conf->eps, conf->weight_decay, (int)TS, (int)s->step);
+        adamw_step_f32(block->W_in.data, s->g_W_in, s->m_W_in, s->v_W_in, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)(R*D), (int)s->step);
+        adamw_step_f32(block->W_out.data, s->g_W_out, s->m_W_out, s->v_W_out, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)(D*R), (int)s->step);
+        adamw_step_f32(block->A_log.data, s->g_A_log, s->m_A_log, s->v_A_log, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)N, (int)s->step);
+        adamw_step_f32(block->W_B.data, s->g_W_B, s->m_W_B, s->v_W_B, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)(NR*D), (int)s->step);
+        adamw_step_f32(block->W_C.data, s->g_W_C, s->m_W_C, s->v_W_C, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)(NR*D), (int)s->step);
+        adamw_step_f32(block->b_B, s->g_b_B, s->m_b_B, s->v_b_B, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)NR, (int)s->step);
+        adamw_step_f32(block->b_C, s->g_b_C, s->m_b_C, s->v_b_C, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)NR, (int)s->step);
+        adamw_step_f32(block->delta_proj.data, s->g_delta_proj, s->m_delta_proj, s->v_delta_proj, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)D, (int)s->step);
+        adamw_step_f32(block->lambda_proj.data, s->g_lambda_proj, s->m_lambda_proj, s->v_lambda_proj, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)D, (int)s->step);
+        adamw_step_f32(block->theta, s->g_theta, s->m_theta, s->v_theta, conf->lr, adam_beta1, adam_beta2, adam_eps, conf->weight_decay, (int)TS, (int)s->step);
     }
 }
 
 static void _ssm_scan_forward(MambaBlock *block, MambaBlockWorkspace *ws, const float *u_seq, const float *lambda_seq, float *y_rank) {
     size_t L = block->config.seq_len, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R; float *h_cur = ws->scan_h, *h_rot = ws->h_rot, *Bu_cur = ws->Bu_cur, *prev_Bu = ws->prev_Bu; memset(h_cur, 0, N * sizeof(float)); memset(prev_Bu, 0, N * sizeof(float));
     for (size_t t = 0; t < L; t++) {
-        float dt_t = ws->delta[t], lam_t = lambda_seq ? lambda_seq[t] : 0.5f; const float *b_t = &ws->scan_B[t * NR], *c_t = &ws->scan_C[t * NR], *u_t = &u_seq[t * R];
+        float dt_t = ws->delta[t], lam_t = lambda_seq ? lambda_seq[t] : block->config.default_lambda; const float *b_t = &ws->scan_B[t * NR], *c_t = &ws->scan_C[t * NR], *u_t = &u_seq[t * R];
         for (size_t i = 0; i + 1 < N; i += 2) { float th = block->theta[i >> 1], cv = cosf(th), sv = sinf(th), h0 = h_cur[i], h1 = h_cur[i+1]; h_rot[i] = cv * h0 - sv * h1; h_rot[i+1] = sv * h0 + cv * h1; } if (N & 1) h_rot[N-1] = h_cur[N-1];
         memset(Bu_cur, 0, N * sizeof(float)); for (size_t r = 0; r < R; r++) { for (size_t n = 0; n < N; n++) Bu_cur[n] += b_t[r * N + n] * u_t[r]; } memcpy(&ws->Bu_seq[t * N], Bu_cur, N * sizeof(float));
-        for (size_t n = 0; n < N; n++) { float alpha = expf(dt_t * block->A_log.data[n]), beta = (1.0f - lam_t) * dt_t * alpha, gamma = lam_t * dt_t; h_cur[n] = alpha * h_rot[n] + beta * prev_Bu[n] + gamma * Bu_cur[n]; } memcpy(&ws->h_seq[t * N], h_cur, N * sizeof(float));
+        for (size_t n = 0; n < N; n++) { float alpha = km_scan_exp(dt_t * block->A_log.data[n], block->config.use_fast_exp), beta = (1.0f - lam_t) * dt_t * alpha, gamma = lam_t * dt_t; h_cur[n] = alpha * h_rot[n] + beta * prev_Bu[n] + gamma * Bu_cur[n]; } memcpy(&ws->h_seq[t * N], h_cur, N * sizeof(float));
         for (size_t r = 0; r < R; r++) { float yr = 0.0f; for (size_t n = 0; n < N; n++) yr += c_t[r * N + n] * h_cur[n]; y_rank[t * R + r] = yr; } memcpy(prev_Bu, Bu_cur, N * sizeof(float));
+    }
+}
+
+/* Forward Wavefront Callback Context */
+typedef struct {
+    MambaBlock *block;
+    MambaBlockWorkspace *ws;
+    const float *u_seq;
+    const float *lambda_seq;
+    float *y_rank;
+    const long *strides;
+} SSMScanForwardCtx;
+
+static void _ssm_scan_forward_callback(long t, long level, void *userdata) {
+    SSMScanForwardCtx *ctx = (SSMScanForwardCtx *)userdata;
+    MambaBlock *block = ctx->block;
+    MambaBlockWorkspace *ws = ctx->ws;
+    const size_t N = block->config.state_size;
+    const size_t R = (block->config.mimo_rank > 1) ? block->config.mimo_rank : 1;
+    const long ndims = block->config.spatial_ndims;
+    const long *dims = block->config.spatial_dims;
+    const long *strides = ctx->strides;
+
+    (void)level;
+
+    float dt = ws->delta[t];
+    float lam = ctx->lambda_seq ? ctx->lambda_seq[t] : block->config.default_lambda;
+    const float *b_t = &ws->scan_B[t * N * R];
+    const float *c_t = &ws->scan_C[t * N * R];
+    const float *u_t = &ctx->u_seq[t * R];
+
+    /* coords for boundary check */
+    long coords[KMAMBA_CONFIG_MAX_NDIMS];
+    km_unravel_index(t, dims, strides, ndims, coords);
+
+    for (size_t r = 0; r < R; r++) ctx->y_rank[t * R + r] = 0.0f;
+    for (size_t n = 0; n < N; n++) {
+        float bu_cur_n = 0.0f;
+        float h_new_n = 0.0f;
+        float bu_prev_acc_n = 0.0f;
+        int n_pred = 0;
+        float a_val = block->A_log.data[n];
+        float alpha = km_scan_exp(dt * a_val, block->config.use_fast_exp);
+        for (size_t r = 0; r < R; r++) {
+            bu_cur_n += b_t[r * N + n] * u_t[r];
+        }
+        ws->Bu_seq[t * N + n] = bu_cur_n;
+
+        for (long ax = 0; ax < ndims; ax++) {
+            if (coords[ax] > 0) {
+                long prev_t = t - strides[ax];
+                const float *h_prev = &ws->h_seq[prev_t * N];
+                float h_prev_rot_n;
+                if ((n & 1U) && n > 0) {
+                    float th = block->theta[n >> 1];
+                    h_prev_rot_n = sinf(th) * h_prev[n - 1] + cosf(th) * h_prev[n];
+                } else if (((n + 1) < N)) {
+                    float th = block->theta[n >> 1];
+                    h_prev_rot_n = cosf(th) * h_prev[n] - sinf(th) * h_prev[n + 1];
+                } else {
+                    h_prev_rot_n = h_prev[n];
+                }
+                h_new_n += alpha * h_prev_rot_n;
+                bu_prev_acc_n += ws->Bu_seq[prev_t * N + n];
+                n_pred++;
+            }
+        }
+        if (n_pred > 0) {
+            float beta_scale = (1.0f - lam) * dt / (float)n_pred;
+            h_new_n += beta_scale * alpha * bu_prev_acc_n;
+        }
+        h_new_n += lam * dt * bu_cur_n;
+        ws->h_seq[t * N + n] = h_new_n;
+
+        for (size_t r = 0; r < R; r++) {
+            ctx->y_rank[t * R + r] += c_t[r * N + n] * h_new_n;
+        }
     }
 }
 
@@ -311,7 +428,6 @@ static void _ssm_scan_forward_wavefront(MambaBlock *block,
                                         const float *lambda_seq,
                                         float *y_rank) {
     const size_t N = block->config.state_size;
-    const size_t R = _mimo_R(&block->config);
     const long total_points = block->wavefront_plan->total_points;
     const long ndims = block->config.spatial_ndims;
     const long *dims = block->config.spatial_dims;
@@ -328,107 +444,16 @@ static void _ssm_scan_forward_wavefront(MambaBlock *block,
     memset(ws->h_seq,  0, (size_t)total_points * N * sizeof(float));
     memset(ws->Bu_seq, 0, (size_t)total_points * N * sizeof(float));
 
-    for (long level = 0; level <= block->wavefront_plan->max_level; level++) {
-        const long *offsets = km_wavefront_plan_level_offsets(block->wavefront_plan, level);
-        long level_size = km_wavefront_plan_level_size(block->wavefront_plan, level);
-        if (!offsets || level_size <= 0) continue;
+    SSMScanForwardCtx ctx;
+    ctx.block = block;
+    ctx.ws = ws;
+    ctx.u_seq = u_seq;
+    ctx.lambda_seq = lambda_seq;
+    ctx.y_rank = y_rank;
+    ctx.strides = strides;
 
-#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
-        for (long pt = 0; pt < level_size; pt++) {
-            long t = offsets[pt];
-
-            /* Unravel index */
-            long coords[KMAMBA_MAX_NDIMS];
-            long tmp = t;
-            for (long ax = ndims - 1; ax >= 0; ax--) {
-                coords[ax] = tmp % dims[ax];
-                tmp /= dims[ax];
-            }
-
-            float dt = ws->delta[t];
-            float lam = lambda_seq ? lambda_seq[t] : 0.5f;
-            const float *b_t = &ws->scan_B[t * N * R];
-            const float *c_t = &ws->scan_C[t * N * R];
-            const float *u_t = &u_seq[t * R];
-
-            /* Compute Bu_cur (size N) */
-            float Bu_cur[KMAMBA_MAX_STATE];
-            memset(Bu_cur, 0, N * sizeof(float));
-            for (size_t r = 0; r < R; r++) {
-                float ur = u_t[r];
-                for (size_t n = 0; n < N; n++) {
-                    Bu_cur[n] += b_t[r * N + n] * ur;
-                }
-            }
-            memcpy(&ws->Bu_seq[t * N], Bu_cur, N * sizeof(float));
-
-            /* Accumulate contributions from all axes */
-            float h_new[KMAMBA_MAX_STATE];
-            memset(h_new, 0, N * sizeof(float));
-            float Bu_prev_acc[KMAMBA_MAX_STATE];
-            memset(Bu_prev_acc, 0, N * sizeof(float));
-            int n_pred = 0;
-
-            for (long ax = 0; ax < ndims; ax++) {
-                if (coords[ax] > 0) {
-                    long prev_t = t - strides[ax];
-                    /* Load rotated h from previous position */
-                    float h_prev_rot[KMAMBA_MAX_STATE];
-                    const float *h_prev = &ws->h_seq[prev_t * N];
-                    /* Apply R(theta) to h_prev */
-                    for (size_t i = 0; i + 1 < N; i += 2) {
-                        float th = block->theta[i >> 1];
-                        float cv = cosf(th), sv = sinf(th);
-                        h_prev_rot[i]   = cv * h_prev[i] - sv * h_prev[i+1];
-                        h_prev_rot[i+1] = sv * h_prev[i] + cv * h_prev[i+1];
-                    }
-                    if (N & 1) h_prev_rot[N-1] = h_prev[N-1];
-
-                    /* Contribution to h : sum over axes of alpha * h_prev_rot */
-                    for (size_t n = 0; n < N; n++) {
-                        float a_val = block->A_log.data[n];
-                        float alpha = expf(dt * a_val);
-                        h_new[n] += alpha * h_prev_rot[n];
-                    }
-
-                    /* Accumulate Bu_prev for Mamba-3 */
-                    const float *Bu_prev = &ws->Bu_seq[prev_t * N];
-                    for (size_t n = 0; n < N; n++) {
-                        Bu_prev_acc[n] += Bu_prev[n];
-                    }
-                    n_pred++;
-                }
-            }
-
-            /* Mamba-3: add Bu_contributions */
-            if (n_pred > 0) {
-                float beta_scale = (1.0f - lam) * dt / (float)n_pred;
-                for (size_t n = 0; n < N; n++) {
-                    float alpha = expf(dt * block->A_log.data[n]);
-                    h_new[n] += beta_scale * alpha * Bu_prev_acc[n];
-                }
-            }
-            /* Add gamma * Bu_cur */
-            float gamma = lam * dt;
-            for (size_t n = 0; n < N; n++) {
-                h_new[n] += gamma * Bu_cur[n];
-            }
-
-            /* Store final state */
-            memcpy(&ws->h_seq[t * N], h_new, N * sizeof(float));
-
-            /* Compute y_rank for this position: C_t @ h_new */
-            for (size_t r = 0; r < R; r++) {
-                float yr = 0.0f;
-                for (size_t n = 0; n < N; n++) {
-                    yr += c_t[r * N + n] * h_new[n];
-                }
-                y_rank[t * R + r] = yr;
-            }
-        }
-    }
+    /* Forward through wavefront levels using plan primitive */
+    km_wavefront_plan_iter_forward(block->wavefront_plan, _ssm_scan_forward_callback, &ctx);
 
     km_pool_free(km_memory_pool_threadlocal(), strides);
 }
@@ -437,7 +462,7 @@ void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *o
     if (!block || !ws || !output || !input) return; size_t L = block->config.seq_len, D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R;
     for (size_t b = 0; b < batch_size; b++) {
         const float *in = &input[b * L * D]; float *out = &output[b * L * D];
-        for (size_t t = 0; t < L; t++) { Mamba3Control ctrl = {0.0f, 0.0f, 0.5f}; project_controller_full(block, &in[t * D], ws->z_buf, &ws->u_seq[t * R], &ctrl); ws->delta[t] = ctrl.delta; ws->raw_delta[t] = ctrl.raw_delta; ws->lambda_seq[t] = ctrl.lambda; gemv_f32(block->W_B.data, &in[t * D], &ws->scan_B[t * NR], (int)NR, (int)D); gemv_f32(block->W_C.data, &in[t * D], &ws->scan_C[t * NR], (int)NR, (int)D); for (size_t i = 0; i < NR; i++) { ws->scan_B[t * NR + i] += block->b_B[i]; ws->scan_C[t * NR + i] += block->b_C[i]; } }
+        for (size_t t = 0; t < L; t++) { Mamba3Control ctrl = {0.0f, 0.0f, block->config.default_lambda}; project_controller_full(block, &in[t * D], ws->z_buf, &ws->u_seq[t * R], &ctrl); ws->delta[t] = ctrl.delta; ws->raw_delta[t] = ctrl.raw_delta; ws->lambda_seq[t] = ctrl.lambda; gemv_f32(block->W_B.data, &in[t * D], &ws->scan_B[t * NR], (int)NR, (int)D); gemv_f32(block->W_C.data, &in[t * D], &ws->scan_C[t * NR], (int)NR, (int)D); for (size_t i = 0; i < NR; i++) { ws->scan_B[t * NR + i] += block->b_B[i]; ws->scan_C[t * NR + i] += block->b_C[i]; } }
         /* Dispatch: wavefront for ND (>1 spatial dims), sequential for 1D */
         if (block->config.spatial_ndims > 1 && block->wavefront_plan) {
             _ssm_scan_forward_wavefront(block, ws, ws->u_seq, ws->lambda_seq, ws->y_rank);
@@ -453,10 +478,10 @@ static void _ssm_scan_backward(MambaBlock *block, MambaBlockWorkspace *ws, const
     float *d_h = (float *)calloc(N, sizeof(float)), *d_Bu_cur = (float *)calloc(N, sizeof(float)), *d_Bu_next = (float *)calloc(N, sizeof(float));
     memset(ws->d_scan_B, 0, L * NR * sizeof(float)); memset(ws->d_scan_C, 0, L * NR * sizeof(float)); memset(ws->d_delta, 0, L * sizeof(float)); memset(ws->d_lambda, 0, L * sizeof(float));
     for (long t = (long)L - 1; t >= 0; t--) {
-        float dt_t = ws->delta[t], lam_t = lambda_seq ? lambda_seq[t] : 0.5f; const float *c_t = &ws->scan_C[t * NR], *h_t = &ws->h_seq[t * N], *h_prev = (t > 0) ? &ws->h_seq[(t - 1) * N] : NULL, *prev_Bu = (t > 0) ? &ws->Bu_seq[(t - 1) * N] : NULL;
+        float dt_t = ws->delta[t], lam_t = lambda_seq ? lambda_seq[t] : block->config.default_lambda; const float *c_t = &ws->scan_C[t * NR], *h_t = &ws->h_seq[t * N], *h_prev = (t > 0) ? &ws->h_seq[(t - 1) * N] : NULL, *prev_Bu = (t > 0) ? &ws->Bu_seq[(t - 1) * N] : NULL;
         for (size_t r = 0; r < R; r++) { float dy_tr = d_y_rank[t * R + r]; for (size_t n = 0; n < N; n++) { d_h[n] += c_t[r * N + n] * dy_tr; ws->d_scan_C[t * NR + r * N + n] += h_t[n] * dy_tr; } }
         for (size_t n = 0; n < N; n++) {
-            float a = block->A_log.data[n], alpha = expf(dt_t * a), beta = (1.0f - lam_t) * dt_t * alpha, gamma = lam_t * dt_t, dh_n = d_h[n]; d_Bu_cur[n] += dh_n * gamma; if (t > 0) d_Bu_next[n] = dh_n * beta;
+            float a = block->A_log.data[n], alpha = km_scan_exp(dt_t * a, block->config.use_fast_exp), beta = (1.0f - lam_t) * dt_t * alpha, gamma = lam_t * dt_t, dh_n = d_h[n]; d_Bu_cur[n] += dh_n * gamma; if (t > 0) d_Bu_next[n] = dh_n * beta;
             if (h_prev) {
                 float h_rot_n; if (n & 1) { float th = block->theta[n >> 1]; h_rot_n = sinf(th) * h_prev[n-1] + cosf(th) * h_prev[n]; } else { float th = block->theta[n >> 1]; h_rot_n = cosf(th) * h_prev[n] - sinf(th) * h_prev[n+1]; }
                 grads->g_A_log[n] += dh_n * (dt_t * alpha * h_rot_n + (1.0f - lam_t) * dt_t * dt_t * alpha * (prev_Bu ? prev_Bu[n] : 0.0f));
@@ -475,6 +500,114 @@ static void _ssm_scan_backward(MambaBlock *block, MambaBlockWorkspace *ws, const
     free(d_h); free(d_Bu_cur); free(d_Bu_next);
 }
 
+/* Backward Wavefront Callback Context */
+typedef struct {
+    MambaBlock *block;
+    MambaBlockWorkspace *ws;
+    const float *u_seq;
+    const float *lambda_seq;
+    const float *d_y_rank;
+    float *d_h_all;
+    const long *strides;
+    MBOptimState *grads;
+} SSMScanBackwardCtx;
+
+static void _ssm_scan_backward_callback(long t, long level, void *userdata) {
+    SSMScanBackwardCtx *ctx = (SSMScanBackwardCtx *)userdata;
+    MambaBlock *block = ctx->block;
+    MambaBlockWorkspace *ws = ctx->ws;
+    const size_t N = block->config.state_size;
+    const size_t R = (block->config.mimo_rank > 1) ? block->config.mimo_rank : 1;
+    const long ndims = block->config.spatial_ndims;
+    const long *dims = block->config.spatial_dims;
+    const long *strides = ctx->strides;
+    MBOptimState *grads = ctx->grads;
+
+    (void)level;
+
+    float dt = ws->delta[t];
+    float lam = ctx->lambda_seq ? ctx->lambda_seq[t] : block->config.default_lambda;
+    const float *c_t = &ws->scan_C[t * N * R];
+    const float *h_t = &ws->h_seq[t * N];
+    const float *Bu_t = &ws->Bu_seq[t * N];
+    const float *u_t = &ctx->u_seq[t * R];
+    float *d_h = &ctx->d_h_all[t * N];
+
+    /* coords for boundary check */
+    long coords[KMAMBA_CONFIG_MAX_NDIMS];
+    km_unravel_index(t, dims, strides, ndims, coords);
+
+    /* Gradient from y_rank: d_y_rank[t] -> d_h, d_scan_C */
+    for (size_t r = 0; r < R; r++) {
+        float dy_tr = ctx->d_y_rank[t * R + r];
+        for (size_t n = 0; n < N; n++) {
+            d_h[n] += c_t[r * N + n] * dy_tr;
+            ws->d_scan_C[t * N * R + r * N + n] += h_t[n] * dy_tr;
+        }
+    }
+
+    for (size_t n = 0; n < N; n++) {
+        float d_h_from_succ_n = 0.0f;
+        float d_Bu_succ_acc_n = 0.0f;
+        int n_succ = 0;
+        float a = block->A_log.data[n];
+        float alpha = expf(dt * a);
+        
+        for (long ax = 0; ax < ndims; ax++) {
+            if (coords[ax] < dims[ax] - 1) {
+                long next_t = t + strides[ax];
+                float *d_h_next = &ctx->d_h_all[next_t * N];
+                float dh_rot_n;
+                if ((n & 1U) && n > 0) {
+                    float th = block->theta[n >> 1];
+                    dh_rot_n = -sinf(th) * d_h_next[n - 1] + cosf(th) * d_h_next[n];
+                } else if ((n + 1) < N) {
+                    float th = block->theta[n >> 1];
+                    dh_rot_n = cosf(th) * d_h_next[n] + sinf(th) * d_h_next[n + 1];
+                } else {
+                    dh_rot_n = d_h_next[n];
+                }
+                d_h_from_succ_n += alpha * dh_rot_n;
+                d_Bu_succ_acc_n += ws->Bu_seq[next_t * N + n];
+                n_succ++;
+            }
+        }
+        d_h[n] += d_h_from_succ_n;
+        
+        float dh_n = d_h[n];
+        float d_Bu_cur_n = dh_n * lam * dt;
+
+        /* Gradient w.r.t. delta (partial) */
+        if (n_succ > 0) {
+            ws->d_delta[t] += dh_n * a * alpha * h_t[n];
+        }
+        ws->d_delta[t] += dh_n * lam * Bu_t[n];
+
+        /* Gradient w.r.t. lambda */
+        ws->d_lambda[t] += dh_n * dt * Bu_t[n];
+        if (n_succ > 0) {
+            ws->d_lambda[t] -= dh_n * dt * alpha * d_Bu_succ_acc_n / (float)n_succ;
+        }
+
+        /* Gradient w.r.t. A_log */
+        if (n_succ > 0) {
+            grads->g_A_log[n] += dh_n * dt * alpha * h_t[n];
+        }
+        for (size_t r = 0; r < R; r++) {
+            ws->d_scan_B[t * N * R + r * N + n] += d_Bu_cur_n * u_t[r];
+        }
+    }
+
+    /* Gradients w.r.t. theta (rotation angles) */
+    for (size_t i = 0; i + 1 < N; i += 2) {
+        float th = block->theta[i >> 1];
+        float cv = cosf(th), sv = sinf(th);
+        float dh0 = d_h[i], dh1 = d_h[i+1];
+        float h0 = h_t[i], h1 = h_t[i+1];
+        grads->g_theta[i >> 1] += (-sv * h0 - cv * h1) * dh0 + (cv * h0 - sv * h1) * dh1;
+    }
+}
+
 /* Wavefront version for ND spatial backward pass */
 static void _ssm_scan_backward_wavefront(MambaBlock *block, MambaBlockWorkspace *ws,
                                          const float *u_seq, const float *lambda_seq,
@@ -484,7 +617,6 @@ static void _ssm_scan_backward_wavefront(MambaBlock *block, MambaBlockWorkspace 
     const long total_points = block->wavefront_plan->total_points;
     const long ndims = block->config.spatial_ndims;
     const long *dims = block->config.spatial_dims;
-    MBOptimState *grads = block->opt_state;
 
     long *strides = (long *)km_pool_alloc(km_memory_pool_threadlocal(),
                                           (size_t)ndims * sizeof(long));
@@ -507,140 +639,18 @@ static void _ssm_scan_backward_wavefront(MambaBlock *block, MambaBlockWorkspace 
         return;
     }
 
-    /* Backward through wavefront levels (reverse order) */
-    for (long level = block->wavefront_plan->max_level; level >= 0; level--) {
-        const long *offsets = km_wavefront_plan_level_offsets(block->wavefront_plan, level);
-        long level_size = km_wavefront_plan_level_size(block->wavefront_plan, level);
-        if (!offsets || level_size <= 0) continue;
+    SSMScanBackwardCtx ctx;
+    ctx.block = block;
+    ctx.ws = ws;
+    ctx.u_seq = u_seq;
+    ctx.lambda_seq = lambda_seq;
+    ctx.d_y_rank = d_y_rank;
+    ctx.d_h_all = d_h_all;
+    ctx.strides = strides;
+    ctx.grads = block->opt_state;
 
-#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
-#pragma omp parallel for schedule(static)
-#endif
-        for (long pt = 0; pt < level_size; pt++) {
-            long t = offsets[pt];
-
-            /* Unravel index */
-            long coords[KMAMBA_MAX_NDIMS];
-            long tmp = t;
-            for (long ax = ndims - 1; ax >= 0; ax--) {
-                coords[ax] = tmp % dims[ax];
-                tmp /= dims[ax];
-            }
-
-            float dt = ws->delta[t];
-            float lam = lambda_seq ? lambda_seq[t] : 0.5f;
-            const float *c_t = &ws->scan_C[t * N * R];
-            const float *h_t = &ws->h_seq[t * N];
-            const float *Bu_t = &ws->Bu_seq[t * N];
-            float *d_h = &d_h_all[t * N];
-
-            /* Gradient from y_rank: d_y_rank[t] -> d_h, d_scan_C */
-            for (size_t r = 0; r < R; r++) {
-                float dy_tr = d_y_rank[t * R + r];
-                for (size_t n = 0; n < N; n++) {
-                    d_h[n] += c_t[r * N + n] * dy_tr;
-                    ws->d_scan_C[t * N * R + r * N + n] += h_t[n] * dy_tr;
-                }
-            }
-
-            /* Collect gradients from successors (not predecessors) */
-            float d_h_from_succ[KMAMBA_MAX_STATE];
-            float d_Bu_succ_acc[KMAMBA_MAX_STATE];
-            memset(d_h_from_succ, 0, N * sizeof(float));
-            memset(d_Bu_succ_acc, 0, N * sizeof(float));
-            int n_succ = 0;
-
-            for (long ax = 0; ax < ndims; ax++) {
-                if (coords[ax] < dims[ax] - 1) {
-                    long next_t = t + strides[ax];
-                    float *d_h_next = &d_h_all[next_t * N];
-
-                    /* Apply inverse rotation to d_h_next */
-                    for (size_t i = 0; i + 1 < N; i += 2) {
-                        float th = block->theta[i >> 1];
-                        float cv = cosf(th), sv = sinf(th);
-                        /* Inverse rotation: transpose of rotation matrix */
-                        float dh0 = cv * d_h_next[i] + sv * d_h_next[i+1];
-                        float dh1 = -sv * d_h_next[i] + cv * d_h_next[i+1];
-
-                        float a = block->A_log.data[i];
-                        float alpha = expf(dt * a);
-                        d_h_from_succ[i] += alpha * dh0;
-                        d_h_from_succ[i+1] += alpha * dh1;
-                    }
-                    if (N & 1) {
-                        float a = block->A_log.data[N-1];
-                        d_h_from_succ[N-1] += expf(dt * a) * d_h_next[N-1];
-                    }
-
-                    /* Accumulate Bu contribution from successors */
-                    const float *Bu_next = &ws->Bu_seq[next_t * N];
-                    for (size_t n = 0; n < N; n++) {
-                        d_Bu_succ_acc[n] += Bu_next[n];
-                    }
-                    n_succ++;
-                }
-            }
-
-            /* Add successor contributions to d_h */
-            for (size_t n = 0; n < N; n++) {
-                d_h[n] += d_h_from_succ[n];
-            }
-
-            /* Compute gradients w.r.t. parameters */
-            float d_Bu_cur[KMAMBA_MAX_STATE];
-            memset(d_Bu_cur, 0, N * sizeof(float));
-
-            for (size_t n = 0; n < N; n++) {
-                float a = block->A_log.data[n];
-                float alpha = expf(dt * a);
-                float dh_n = d_h[n];
-
-                /* Gradient w.r.t. Bu_cur */
-                d_Bu_cur[n] += dh_n * lam * dt;
-
-                /* Gradient w.r.t. delta (partial) */
-                if (n_succ > 0) {
-                    float beta_scale = (1.0f - lam) * dt / (float)n_succ;
-                    /* From h_t rotation (if there were predecessors) */
-                    /* Note: for backward, we need h_t which was the 'prev' in forward */
-                    /* This gets complex; for now simplified version */
-                    ws->d_delta[t] += dh_n * a * alpha * h_t[n];
-                }
-                ws->d_delta[t] += dh_n * lam * Bu_t[n];
-
-                /* Gradient w.r.t. lambda */
-                ws->d_lambda[t] += dh_n * dt * Bu_t[n];
-                if (n_succ > 0) {
-                    ws->d_lambda[t] -= dh_n * dt * alpha * d_Bu_succ_acc[n] / (float)n_succ;
-                }
-
-                /* Gradient w.r.t. A_log */
-                if (n_succ > 0) {
-                    grads->g_A_log[n] += dh_n * dt * alpha * h_t[n];
-                }
-            }
-
-            /* Gradient w.r.t. scan_B */
-            const float *u_t = &u_seq[t * R];
-            for (size_t r = 0; r < R; r++) {
-                for (size_t n = 0; n < N; n++) {
-                    ws->d_scan_B[t * N * R + r * N + n] += d_Bu_cur[n] * u_t[r];
-                }
-            }
-
-            /* Gradients w.r.t. theta (rotation angles) */
-            for (size_t i = 0; i + 1 < N; i += 2) {
-                float th = block->theta[i >> 1];
-                float cv = cosf(th), sv = sinf(th);
-                /* Contribution from d_h rotation */
-                float dh0 = d_h[i], dh1 = d_h[i+1];
-                float h0 = h_t[i], h1 = h_t[i+1];
-                /* d/dtheta [R(theta) * h] = R'(theta) * h */
-                grads->g_theta[i >> 1] += (-sv * h0 - cv * h1) * dh0 + (cv * h0 - sv * h1) * dh1;
-            }
-        }
-    }
+    /* Backward through wavefront levels using plan primitive */
+    km_wavefront_plan_iter_reverse(block->wavefront_plan, _ssm_scan_backward_callback, &ctx);
 
     free(d_h_all);
     km_pool_free(km_memory_pool_threadlocal(), strides);

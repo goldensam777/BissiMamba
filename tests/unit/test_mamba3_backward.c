@@ -14,6 +14,9 @@ int main(void) {
     printf("=== Test Mamba-3 Backward (CPU) ===\n");
 
     MBConfig cfg = {
+        .max_ndims = 8,
+        .max_state = 64,
+        .use_fast_exp = 0,
         .dim = TEST_DIM,
         .state_size = TEST_STATE,
         .seq_len = TEST_SEQ_LEN,
@@ -21,14 +24,24 @@ int main(void) {
         .dt_scale = 0.01f,
         .dt_min = 1e-3f,
         .dt_max = 0.1f,
+        .default_lambda = 0.5f,
+        .use_a_log_clamp = 1,
+        .a_log_min = -1e-5f,
         .spatial_ndims = 0,
         .use_convnd = 0
     };
 
     MambaBlock *block = mamba_block_create(&cfg);
     mamba_block_init(block);
-    
-    MBOptimConfig opt_cfg = { .lr = 0.1f, .eps = 1e-8f, .weight_decay = 0.0f };
+
+    MBOptimConfig opt_cfg = {
+        .lr = 0.1f,
+        .mu = 0.9f,
+        .beta2 = 0.999f,
+        .eps = 1e-8f,
+        .clip_norm = 1.0f,
+        .weight_decay = 0.0f
+    };
     mamba_attach_optimizer(block, OPTIMIZER_ADAMW, &opt_cfg);
 
     float *input = (float *)malloc(TEST_SEQ_LEN * TEST_DIM * sizeof(float));

@@ -222,7 +222,6 @@ static int g_cublas_initialized = 0;
 
 static cublasHandle_t get_cublas_handle(void) {
     if (!g_cublas_initialized) {
-        cudaSetDevice(0);
         cublasCreate(&g_cublas_handle);
         g_cublas_initialized = 1;
     }
@@ -232,6 +231,7 @@ static cublasHandle_t get_cublas_handle(void) {
 /* Initialize GPU memory for KMamba (embedding, head, and layers) */
 int kmamba_gpu_init(KMamba *m) {
     if (!m) return -1;
+    if (m->cfg.gpu_device >= 0) cudaSetDevice(m->cfg.gpu_device);
     size_t V = m->cfg.vocab_size;
     size_t D = m->cfg.dim;
 
@@ -299,25 +299,96 @@ void kmamba_gpu_sync_to_host(KMamba *m) {
  * KMamba API Implementation (CPU Reference)
  * ═════════════════════════════════════════════════════════════════════════════ */
 
-static size_t _mimo_R(const KMambaConfig *cfg) {
-    return (cfg->mimo_rank > 1) ? cfg->mimo_rank : 1;
+static size_t _mimo_R(size_t mimo_rank) {
+    return (mimo_rank > 1) ? mimo_rank : 1;
+}
+
+void kmamba_config_set_defaults(KMambaConfig *cfg) {
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->max_ndims = 8;
+    cfg->max_state = 64;
+    cfg->use_fast_exp = 0;
+    cfg->vocab_size = 32768;
+    cfg->dim = 512;
+    cfg->state_size = 64;
+    cfg->seq_len = 1024;
+    cfg->n_layers = 12;
+    cfg->mimo_rank = 1;
+    cfg->dt_scale = 1.0f;
+    cfg->dt_min = 0.001f;
+    cfg->dt_max = 0.1f;
+    cfg->default_lambda = 0.5f;
+    cfg->use_a_log_clamp = 1;
+    cfg->a_log_min = -1e-5f;
+    cfg->d_conv = 4;
+    cfg->expand_factor = 2.0f;
+    cfg->gpu_device = -1;
+    cfg->weight_tying = 1;
+    for (int i = 0; i < KMAMBA_CONFIG_MAX_NDIMS; i++) {
+        cfg->pad_left[i] = -1;
+        cfg->pad_right[i] = -1;
+    }
+}
+
+void kmamba_optim_config_set_defaults(MBOptimConfig *opt_cfg) {
+    if (!opt_cfg) return;
+    opt_cfg->lr = 1e-3f;
+    opt_cfg->mu = 0.9f;
+    opt_cfg->beta2 = 0.999f;
+    opt_cfg->eps = 1e-8f;
+    opt_cfg->clip_norm = 1.0f;
+    opt_cfg->weight_decay = 0.01f;
 }
 
 KMamba* kmamba_create(const KMambaConfig *cfg) {
     if (!cfg) return NULL;
+    
+    /* Mandatory field validation - No hidden fallbacks */
+    if (cfg->vocab_size == 0 || cfg->dim == 0 || cfg->state_size == 0 || cfg->seq_len == 0 || cfg->n_layers == 0) {
+        fprintf(stderr, "kmamba_create: missing mandatory config (vocab_size, dim, state_size, seq_len, n_layers)\n");
+        return NULL;
+    }
+    if (cfg->max_ndims <= 0 || cfg->max_ndims > KMAMBA_CONFIG_MAX_NDIMS) {
+        fprintf(stderr, "kmamba_create: invalid max_ndims=%ld\n", cfg->max_ndims);
+        return NULL;
+    }
+    if (cfg->max_state <= 0) {
+        fprintf(stderr, "kmamba_create: invalid max_state=%ld\n", cfg->max_state);
+        return NULL;
+    }
+
     KMamba *m = (KMamba *)calloc(1, sizeof(KMamba));
     if (!m) return NULL;
     m->cfg = *cfg;
-    if (m->cfg.vocab_size == 0) m->cfg.vocab_size = 32768;
+    
+    if (m->cfg.convnd_K > 0) {
+        long default_pad = (m->cfg.convnd_K - 1) / 2;
+        for (long ax = 0; ax < KMAMBA_CONFIG_MAX_NDIMS; ax++) {
+            if (m->cfg.pad_left[ax] < 0) m->cfg.pad_left[ax] = default_pad;
+            if (m->cfg.pad_right[ax] < 0) m->cfg.pad_right[ax] = default_pad;
+        }
+    }
     
     size_t V = m->cfg.vocab_size;
     size_t D = m->cfg.dim;
     
     m->embedding = (float *)malloc(V * D * sizeof(float));
     m->head = (float *)malloc(D * V * sizeof(float));
+    if (!m->embedding || !m->head) {
+        kmamba_free(m);
+        return NULL;
+    }
     m->layers = (MambaBlock **)malloc(m->cfg.n_layers * sizeof(MambaBlock *));
+    if (!m->layers) {
+        kmamba_free(m);
+        return NULL;
+    }
     
     MBConfig lcfg = {0};
+    lcfg.max_ndims = m->cfg.max_ndims;
+    lcfg.max_state = m->cfg.max_state;
+    lcfg.use_fast_exp = m->cfg.use_fast_exp;
     lcfg.dim = D;
     lcfg.state_size = m->cfg.state_size;
     lcfg.seq_len = m->cfg.seq_len;
@@ -325,6 +396,9 @@ KMamba* kmamba_create(const KMambaConfig *cfg) {
     lcfg.dt_scale = m->cfg.dt_scale;
     lcfg.dt_min = m->cfg.dt_min;
     lcfg.dt_max = m->cfg.dt_max;
+    lcfg.default_lambda = m->cfg.default_lambda;
+    lcfg.use_a_log_clamp = m->cfg.use_a_log_clamp;
+    lcfg.a_log_min = m->cfg.a_log_min;
     lcfg.d_conv = m->cfg.d_conv;
     lcfg.expand_factor = m->cfg.expand_factor;
     lcfg.spatial_ndims = m->cfg.spatial_ndims;
@@ -332,9 +406,17 @@ KMamba* kmamba_create(const KMambaConfig *cfg) {
     lcfg.use_convnd = m->cfg.use_convnd;
     lcfg.convnd_K = m->cfg.convnd_K;
     lcfg.convnd_ndims = m->cfg.convnd_ndims;
+    memcpy(lcfg.pad_left, m->cfg.pad_left, sizeof(lcfg.pad_left));
+    memcpy(lcfg.pad_right, m->cfg.pad_right, sizeof(lcfg.pad_right));
     
     for (size_t i = 0; i < m->cfg.n_layers; i++) {
         m->layers[i] = mamba_block_create(&lcfg);
+        if (!m->layers[i]) {
+            fprintf(stderr, "kmamba_create: failed to create layer %zu\n", i);
+            m->cfg.n_layers = i; /* for proper cleanup in kmamba_free */
+            kmamba_free(m);
+            return NULL;
+        }
     }
     
     return m;
@@ -397,6 +479,7 @@ int kmamba_enable_training(KMamba *m, const MBOptimConfig *opt_blocks, float lr_
 float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_size) {
 #ifdef KMAMBA_BUILD_CUDA
     if (!m || !batch_tokens || batch_size == 0) return NAN;
+    if (m->cfg.gpu_device >= 0) cudaSetDevice(m->cfg.gpu_device);
     if (!m->gpu.gpu_ready && kmamba_gpu_init(m) != 0) return NAN;
     
     cublasHandle_t handle = get_cublas_handle();
@@ -407,6 +490,15 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
     size_t n_layers = m->cfg.n_layers;
     float invB = 1.0f / (float)batch_size;
     float invL = 1.0f / (float)L;
+
+    /* No hidden fallbacks for optimizer params */
+    if (m->opt_blocks.mu == 0.0f || m->opt_blocks.beta2 == 0.0f || m->opt_blocks.eps == 0.0f) {
+        fprintf(stderr, "kmamba_train_batch: optimizer parameters (mu, beta2, eps) must be non-zero\n");
+        return NAN;
+    }
+    float adam_beta1 = m->opt_blocks.mu;
+    float adam_beta2 = m->opt_blocks.beta2;
+    float adam_eps = m->opt_blocks.eps;
 
     /* Device temp buffers for current batch */
     float *d_acts, *d_logits, *d_dlogits, *d_dhidden, *d_loss;
@@ -439,7 +531,7 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
                                l->gpu.d_B_exp, l->gpu.d_C_exp, NULL,
                                l->gpu.d_h_store, l->gpu.d_y_scan, l->gpu.d_y_proj,
                                l->gpu.d_lambda_raw, l->gpu.d_lambda,
-                               (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(&l->config));
+                               (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(l->config.mimo_rank));
         }
         cuda_head_forward(handle, m->gpu.d_head, d_acts + n_layers * L * D, d_logits, (int)L, (int)D, (int)V);
         
@@ -472,7 +564,7 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
                                 l->gpu.d_B_exp, l->gpu.d_C_exp, NULL,
                                 l->gpu.d_h_store, l->gpu.d_y_scan,
                                 l->gpu.d_lambda, l->gpu.d_lambda_raw, /* Add missing workspace if needed */
-                                (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(&l->config));
+                                (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(l->config.mimo_rank));
         }
         
         /* Embedding gradient accumulation on GPU */
@@ -485,9 +577,9 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
         gpu_optimizer_step(m->layers[i], &m->opt_blocks);
     }
     cuda_adamw_step_wrapper(m->gpu.d_embedding, m->gpu.d_g_embed, m->gpu.d_m_embed, m->gpu.d_v_embed,
-                          m->lr_embed_head, 0.9f, 0.999f, 1e-8f, m->weight_decay, (int)(V * D), (int)m->step_embed_head);
+                          m->lr_embed_head, adam_beta1, adam_beta2, adam_eps, m->weight_decay, (int)(V * D), (int)m->step_embed_head);
     cuda_adamw_step_wrapper(m->gpu.d_head, m->gpu.d_g_head, m->gpu.d_m_head, m->gpu.d_v_head,
-                          m->lr_embed_head, 0.9f, 0.999f, 1e-8f, m->weight_decay, (int)(D * V), (int)m->step_embed_head);
+                          m->lr_embed_head, adam_beta1, adam_beta2, adam_eps, m->weight_decay, (int)(D * V), (int)m->step_embed_head);
 
     cudaFree(d_acts); cudaFree(d_logits); cudaFree(d_dlogits); cudaFree(d_dhidden); cudaFree(d_loss); cudaFree(d_batch_tokens);
     return total_loss * invB;
@@ -500,3 +592,148 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
 const KMambaConfig* kmamba_get_config(const KMamba *m) { return m ? &m->cfg : NULL; }
 size_t kmamba_step_count(const KMamba *m) { return m ? m->step_embed_head : 0; }
 void kmamba_update_lr(KMamba *m, float lb, float le) { if(m){ m->opt_blocks.lr=lb; m->lr_embed_head=le; } }
+
+int kmamba_enable_training_with_optimizer(KMamba *m, OptimizerType opt_type,
+                                          const MBOptimConfig *opt_blocks,
+                                          float lr_embed_head, float weight_decay) {
+    if (!m || !opt_blocks) return -1;
+    if (kmamba_enable_training(m, opt_blocks, lr_embed_head, weight_decay) != 0) return -1;
+    for (size_t i = 0; i < m->cfg.n_layers; i++) {
+        mamba_attach_optimizer(m->layers[i], opt_type, opt_blocks);
+    }
+    return 0;
+}
+
+int kmamba_forward(KMamba *m, const uint32_t *tokens, float *logits_out) {
+    if (!m || !tokens || !logits_out) return -1;
+    const size_t L = m->cfg.seq_len;
+    const size_t D = m->cfg.dim;
+    const size_t V = m->cfg.vocab_size;
+    const size_t hidden_elems = L * D;
+
+    float *acts_cur = (float *)malloc(hidden_elems * sizeof(float));
+    float *acts_next = (float *)malloc(hidden_elems * sizeof(float));
+    if (!acts_cur || !acts_next) {
+        free(acts_cur);
+        free(acts_next);
+        return -1;
+    }
+
+    for (size_t t = 0; t < L; t++) {
+        size_t tok = (size_t)tokens[t];
+        if (tok >= V) tok = 0;
+        memcpy(&acts_cur[t * D], &m->embedding[tok * D], D * sizeof(float));
+    }
+
+    for (size_t i = 0; i < m->cfg.n_layers; i++) {
+        mamba_block_forward(m->layers[i], acts_next, acts_cur, 1);
+        {
+            float *tmp = acts_cur;
+            acts_cur = acts_next;
+            acts_next = tmp;
+        }
+    }
+
+    gemm_f32(acts_cur, m->head, logits_out, (int)L, (int)D, (int)V);
+    free(acts_cur);
+    free(acts_next);
+    return 0;
+}
+
+float kmamba_train_step(KMamba *m, const uint32_t *tokens_plus1) {
+    return kmamba_train_batch(m, tokens_plus1, 1);
+}
+
+int kmamba_save(const KMamba *m, const char *path) {
+    if (!m || !path) return -1;
+    return kmamba_save_ser((KMamba *)m, path, KSER_FP32);
+}
+
+KMamba* kmamba_load(const char *path, int for_training,
+                    const MBOptimConfig *opt_blocks,
+                    float lr_embed_head, float weight_decay) {
+    KMamba *m;
+    if (!path) return NULL;
+    m = kmamba_load_ser(path, 0);
+    if (!m) return NULL;
+    if (for_training && opt_blocks) {
+        if (kmamba_enable_training(m, opt_blocks, lr_embed_head, weight_decay) != 0) {
+            kmamba_free(m);
+            return NULL;
+        }
+    }
+    return m;
+}
+
+float* kmamba_get_tensor(KMamba *m, const char *name) {
+    size_t li;
+    if (!m || !name) return NULL;
+    if (strcmp(name, "embedding") == 0) return m->embedding;
+    if (strcmp(name, "head") == 0) return m->head;
+
+    if (sscanf(name, "layers.%zu.W_in", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->W_in.data;
+    if (sscanf(name, "layers.%zu.W_out", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->W_out.data;
+    if (sscanf(name, "layers.%zu.A_log", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->A_log.data;
+    if (sscanf(name, "layers.%zu.W_B", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->W_B.data;
+    if (sscanf(name, "layers.%zu.W_C", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->W_C.data;
+    if (sscanf(name, "layers.%zu.delta_proj", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->delta_proj.data;
+    if (sscanf(name, "layers.%zu.lambda_proj", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->lambda_proj.data;
+    if (sscanf(name, "layers.%zu.b_B", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->b_B;
+    if (sscanf(name, "layers.%zu.b_C", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->b_C;
+    if (sscanf(name, "layers.%zu.theta", &li) == 1 && li < m->cfg.n_layers) return m->layers[li]->theta;
+    return NULL;
+}
+
+static int kmamba_tensor_size(const KMamba *m, const char *name, size_t *n_out) {
+    size_t li, D, N, R;
+    if (!m || !name || !n_out) return -1;
+    D = m->cfg.dim;
+    N = m->cfg.state_size;
+    R = _mimo_R(m->cfg.mimo_rank);
+
+    if (strcmp(name, "embedding") == 0) { *n_out = m->cfg.vocab_size * D; return 0; }
+    if (strcmp(name, "head") == 0) { *n_out = D * m->cfg.vocab_size; return 0; }
+
+    if (sscanf(name, "layers.%zu.W_in", &li) == 1 && li < m->cfg.n_layers) { *n_out = R * D; return 0; }
+    if (sscanf(name, "layers.%zu.W_out", &li) == 1 && li < m->cfg.n_layers) { *n_out = D * R; return 0; }
+    if (sscanf(name, "layers.%zu.A_log", &li) == 1 && li < m->cfg.n_layers) { *n_out = N; return 0; }
+    if (sscanf(name, "layers.%zu.W_B", &li) == 1 && li < m->cfg.n_layers) { *n_out = N * R * D; return 0; }
+    if (sscanf(name, "layers.%zu.W_C", &li) == 1 && li < m->cfg.n_layers) { *n_out = N * R * D; return 0; }
+    if (sscanf(name, "layers.%zu.delta_proj", &li) == 1 && li < m->cfg.n_layers) { *n_out = D; return 0; }
+    if (sscanf(name, "layers.%zu.lambda_proj", &li) == 1 && li < m->cfg.n_layers) { *n_out = D; return 0; }
+    if (sscanf(name, "layers.%zu.b_B", &li) == 1 && li < m->cfg.n_layers) { *n_out = N * R; return 0; }
+    if (sscanf(name, "layers.%zu.b_C", &li) == 1 && li < m->cfg.n_layers) { *n_out = N * R; return 0; }
+    if (sscanf(name, "layers.%zu.theta", &li) == 1 && li < m->cfg.n_layers) { *n_out = (N / 2 > 0 ? N / 2 : 1); return 0; }
+    return -1;
+}
+
+int kmamba_set_tensor(KMamba *m, const char *name, const float *data) {
+    float *dst;
+    size_t n;
+    if (!m || !name || !data) return -1;
+    dst = kmamba_get_tensor(m, name);
+    if (!dst) return -1;
+    if (kmamba_tensor_size(m, name, &n) != 0) return -1;
+    memcpy(dst, data, n * sizeof(float));
+    return 0;
+}
+
+int kmamba_set_vocab(KMamba *m, uint32_t id, const char *token, uint16_t len) {
+    (void)token;
+    (void)len;
+    if (!m) return -1;
+    if (id >= m->cfg.vocab_size) return -1;
+    return 0;
+}
+
+float kmamba_last_grad_norm(const KMamba *m) {
+    return m ? m->last_grad_norm : 0.0f;
+}
+
+float kmamba_last_grad_over_clip(const KMamba *m) {
+    return m ? m->last_grad_over_clip : 0.0f;
+}
+
+int kmamba_last_grad_would_clip(const KMamba *m) {
+    return m ? m->last_grad_would_clip : 0;
+}

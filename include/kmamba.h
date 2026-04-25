@@ -29,6 +29,9 @@ typedef struct {
  * MambaBlock Configuration
  * ============================================================================ */
 typedef struct {
+    long max_ndims;      /* runtime ND cap for this block */
+    long max_state;      /* runtime state cap for scratch/state buffers */
+    int use_fast_exp;    /* 0 = expf, 1 = polynomial approximation */
     size_t dim;         /* model dimension */
     size_t state_size;  /* mamba state size (N) */
     size_t seq_len;     /* context length */
@@ -37,6 +40,9 @@ typedef struct {
     float dt_scale;
     float dt_min;
     float dt_max;
+    float default_lambda; /* fallback lambda when not projected, typically in [0,1] */
+    int   use_a_log_clamp; /* 1 = clamp A_log in ND scan helper, 0 = no clamp */
+    float a_log_min;       /* minimum A_log value when clamp enabled */
 
     /* Mixed precision configuration for 1B+ models */
     int use_fp16;       /* 1 = use FP16 (Tensor Cores), 0 = FP32 (default) */
@@ -46,12 +52,14 @@ typedef struct {
     /* Shared ND topology for scanND / convND.
      * spatial_ndims == 0 means the implicit 1D shape [seq_len]. */
     long   spatial_ndims;
-    long   spatial_dims[KMAMBA_MAX_NDIMS];
+    long   spatial_dims[KMAMBA_CONFIG_MAX_NDIMS];
 
     /* ConvND parameters */
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND locale */
     long   convnd_K;       /* Conv kernel_size (K>=1), distinct du state_size */
     long   convnd_ndims;   /* 0 => dérivé de spatial_ndims ; sinon doit matcher */
+    long   pad_left[KMAMBA_CONFIG_MAX_NDIMS];  /* separable conv padding left per axis */
+    long   pad_right[KMAMBA_CONFIG_MAX_NDIMS]; /* separable conv padding right per axis */
     uint32_t d_conv;        /* Standard 1D conv width */
     float    expand_factor; /* SSM expansion factor */
 } MBConfig;
@@ -228,6 +236,9 @@ typedef struct {
  * KMamba Configuration
  * ============================================================================ */
 typedef struct {
+    long max_ndims;      /* runtime ND cap for this model */
+    long max_state;      /* runtime state cap for scratch/state buffers */
+    int use_fast_exp;    /* 0 = expf, 1 = polynomial approximation */
     size_t vocab_size;   /* default: 32768 (BPE tokenizer) */
     size_t dim;          /* model dimension */
     size_t state_size;   /* mamba state size (N) */
@@ -238,22 +249,28 @@ typedef struct {
     float dt_scale;
     float dt_min;
     float dt_max;
+    float default_lambda; /* fallback lambda when not projected, typically in [0,1] */
+    int   use_a_log_clamp; /* 1 = clamp A_log in ND scan helper, 0 = no clamp */
+    float a_log_min;       /* minimum A_log value when clamp enabled */
 
     /* Shared ND topology for scanND / convND.
      * spatial_ndims == 0 means the implicit 1D shape [seq_len]. */
     long   spatial_ndims;
-    long   spatial_dims[KMAMBA_MAX_NDIMS];
+    long   spatial_dims[KMAMBA_CONFIG_MAX_NDIMS];
 
     /* ConvND parameters (optionnel) */
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND locale */
     long   convnd_K;       /* Conv kernel_size (K>=1), distinct du state_size */
     long   convnd_ndims;   /* 0 => dérivé de spatial_ndims ; sinon doit matcher */
+    long   pad_left[KMAMBA_CONFIG_MAX_NDIMS];  /* separable conv padding left per axis */
+    long   pad_right[KMAMBA_CONFIG_MAX_NDIMS]; /* separable conv padding right per axis */
     
     /* Model metadata for serialization */
     uint32_t d_conv;        /* Standard 1D conv width */
     float    expand_factor; /* SSM expansion factor */
     char     model_name[64];
     const char **vocab_data; /* String tokens for cl100k_base or BPE */
+    int      gpu_device;     /* -1: keep current/default CUDA device, >=0: explicit device id */
 
     /* Weight tying: share embedding with output head (saves VRAM) */
     int    weight_tying;   /* 1 = tie weights, 0 = separate matrices */
@@ -356,6 +373,9 @@ void mb_compute_delta(float *delta_out, const MambaBlock *block,
 /* ============================================================================
  * KMamba API
  * ============================================================================ */
+void kmamba_config_set_defaults(KMambaConfig *cfg);
+void kmamba_optim_config_set_defaults(MBOptimConfig *opt_cfg);
+
 KMamba* kmamba_create(const KMambaConfig *cfg);
 void        kmamba_free(KMamba *m);
 

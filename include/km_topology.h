@@ -2,13 +2,15 @@
 #define KMAMBA_TOPOLOGY_H
 
 #include <stddef.h>
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define KMAMBA_MAX_NDIMS 8
-#define KMAMBA_MAX_STATE 64  /* Maximum state size for SSM */
+/* Max ND slots stored in public config fixed arrays.
+ * Execution ND/state limits are runtime-configurable (max_ndims/max_state). */
+#define KMAMBA_CONFIG_MAX_NDIMS 32
 
 /* Produit des dimensions avec vérification overflow */
 int km_spatial_dims_product(const long *dims, long ndims, size_t *product_out);
@@ -45,6 +47,17 @@ int km_normalize_spatial_topology(long *spatial_ndims,
                                   int use_convnd,
                                   long *convnd_ndims,
                                   long convnd_K);
+
+/* Runtime-selectable fast exp approximation (3rd-order polynomial). */
+static inline float km_fast_expf(float x) {
+    if (x > 8.0f) x = 8.0f;
+    if (x < -8.0f) x = -8.0f;
+    return 1.0f + x + 0.5f * x * x + (1.0f / 6.0f) * x * x * x;
+}
+
+static inline float km_scan_exp(float x, int use_fast_exp) {
+    return use_fast_exp ? km_fast_expf(x) : expf(x);
+}
 
 #ifdef __cplusplus
 }

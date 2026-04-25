@@ -32,7 +32,7 @@ int kmamba_save_ser(KMamba* m, const char* path, KSerDtype dtype) {
         .dtype = dtype,
         .model_name = {0}
     };
-    strncpy(ser_cfg.model_name, cfg->model_name, 63);
+    snprintf(ser_cfg.model_name, sizeof(ser_cfg.model_name), "%s", cfg->model_name);
     
     /* Create writer */
     KSerWriter* w = kser_writer_create(path, &ser_cfg);
@@ -59,93 +59,90 @@ int kmamba_save_ser(KMamba* m, const char* path, KSerDtype dtype) {
         if (ret != KSER_OK) goto cleanup;
     }
     
-    /* Add layer weights */
+    /* Add layer weights (single canonical naming) */
     for (uint32_t layer = 0; layer < cfg->n_layers; layer++) {
         char name[64];
+        uint32_t R = (cfg->mimo_rank > 1) ? (uint32_t)cfg->mimo_rank : 1;
+        uint32_t N = (uint32_t)cfg->state_size;
+        uint32_t D = (uint32_t)cfg->dim;
         
-        /* SSM weights */
-        snprintf(name, sizeof(name), "layers.%d.ssm.A", layer);
-        float* A = kmamba_get_tensor(m, name);
-        if (A) {
-            uint32_t shape[4] = {cfg->dim, cfg->state_size, 0, 0};
-            ret = kser_writer_add_tensor(w, name, A, shape, KSER_FP32, dtype);
+        snprintf(name, sizeof(name), "layers.%u.W_in", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {R, D, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        snprintf(name, sizeof(name), "layers.%d.ssm.B", layer);
-        float* B = kmamba_get_tensor(m, name);
-        if (B) {
-            uint32_t shape[4] = {cfg->dim, cfg->state_size, 0, 0};
-            ret = kser_writer_add_tensor(w, name, B, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.W_out", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {D, R, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        snprintf(name, sizeof(name), "layers.%d.ssm.C", layer);
-        float* C = kmamba_get_tensor(m, name);
-        if (C) {
-            uint32_t shape[4] = {cfg->dim, cfg->state_size, 0, 0};
-            ret = kser_writer_add_tensor(w, name, C, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.A_log", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {N, 0, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        snprintf(name, sizeof(name), "layers.%d.ssm.D", layer);
-        float* D = kmamba_get_tensor(m, name);
-        if (D) {
-            uint32_t shape[4] = {cfg->dim, 0, 0, 0};
-            ret = kser_writer_add_tensor(w, name, D, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.W_B", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {N * R, D, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        /* Projections */
-        snprintf(name, sizeof(name), "layers.%d.in_proj", layer);
-        float* in_proj = kmamba_get_tensor(m, name);
-        if (in_proj) {
-            uint32_t shape[4] = {cfg->dim, cfg->dim * 2, 0, 0};
-            ret = kser_writer_add_tensor(w, name, in_proj, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.W_C", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {N * R, D, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        snprintf(name, sizeof(name), "layers.%d.out_proj", layer);
-        float* out_proj = kmamba_get_tensor(m, name);
-        if (out_proj) {
-            uint32_t shape[4] = {cfg->dim, cfg->dim, 0, 0};
-            ret = kser_writer_add_tensor(w, name, out_proj, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.delta_proj", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {D, 0, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        /* MLP */
-        snprintf(name, sizeof(name), "layers.%d.mlp.up", layer);
-        float* mlp_up = kmamba_get_tensor(m, name);
-        if (mlp_up) {
-            uint32_t hidden = (uint32_t)(cfg->dim * cfg->expand_factor);
-            uint32_t shape[4] = {cfg->dim, hidden, 0, 0};
-            ret = kser_writer_add_tensor(w, name, mlp_up, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.lambda_proj", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {D, 0, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        snprintf(name, sizeof(name), "layers.%d.mlp.down", layer);
-        float* mlp_down = kmamba_get_tensor(m, name);
-        if (mlp_down) {
-            uint32_t hidden = (uint32_t)(cfg->dim * cfg->expand_factor);
-            uint32_t shape[4] = {hidden, cfg->dim, 0, 0};
-            ret = kser_writer_add_tensor(w, name, mlp_down, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.b_B", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {N * R, 0, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        /* Conv1d */
-        snprintf(name, sizeof(name), "layers.%d.conv.weight", layer);
-        float* conv_w = kmamba_get_tensor(m, name);
-        if (conv_w) {
-            uint32_t shape[4] = {cfg->dim, cfg->d_conv, 0, 0};
-            ret = kser_writer_add_tensor(w, name, conv_w, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.b_C", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {N * R, 0, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
-        
-        snprintf(name, sizeof(name), "layers.%d.conv.bias", layer);
-        float* conv_b = kmamba_get_tensor(m, name);
-        if (conv_b) {
-            uint32_t shape[4] = {cfg->dim, 0, 0, 0};
-            ret = kser_writer_add_tensor(w, name, conv_b, shape, KSER_FP32, dtype);
+
+        snprintf(name, sizeof(name), "layers.%u.theta", layer);
+        {
+            float* t = kmamba_get_tensor(m, name);
+            uint32_t shape[4] = {(N / 2 > 0 ? N / 2 : 1), 0, 0, 0};
+            ret = kser_writer_add_tensor(w, name, t, shape, KSER_FP32, dtype);
             if (ret != KSER_OK) goto cleanup;
         }
     }
@@ -197,18 +194,19 @@ KMamba* kmamba_load_ser(const char* path, int flags) {
         return NULL;
     }
     
-    /* Build k-mamba config */
-    KMambaConfig cfg = {
-        .vocab_size = scfg->vocab_size,
-        .dim = scfg->dim,
-        .state_size = scfg->state_size,
-        .n_layers = scfg->n_layers,
-        .seq_len = scfg->seq_len,
-        .d_conv = scfg->d_conv,
-        .expand_factor = scfg->expand_factor,
-        .model_name = {0}
-    };
-    strncpy(cfg.model_name, scfg->model_name, 63);
+    /* Build k-mamba config - start with defaults for new runtime fields */
+    KMambaConfig cfg;
+    kmamba_config_set_defaults(&cfg);
+
+    /* Override with values from file (legacy fields) */
+    cfg.vocab_size = scfg->vocab_size;
+    cfg.dim = scfg->dim;
+    cfg.state_size = scfg->state_size;
+    cfg.n_layers = scfg->n_layers;
+    cfg.seq_len = scfg->seq_len;
+    cfg.d_conv = scfg->d_conv;
+    cfg.expand_factor = scfg->expand_factor;
+    snprintf(cfg.model_name, sizeof(cfg.model_name), "%s", scfg->model_name);
     
     /* Create model */
     KMamba* m = kmamba_create(&cfg);
