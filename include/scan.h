@@ -132,25 +132,10 @@ typedef struct {
 
 void scan2d(Scan2DParams *p);
 
-/* ── CUDA API (scan 1D GPU) ─────────────────────────────────── */
-#ifdef __CUDACC__
-void om_scan1d_forward(
-    const float *d_x,  const float *d_A,
-    const float *d_B,  const float *d_C,
-    const float *d_dt,
-    float *d_y, float *d_h,
-    int L, int D, int M
-);
-
-void om_scan1d_backward(
-    const float *d_dy,
-    const float *d_x,  const float *d_A,
-    const float *d_B,  const float *d_C,
-    const float *d_dt, const float *d_h,
-    float *d_dx, float *d_dA,
-    float *d_dB, float *d_dC, float *d_ddt,
-    int L, int D, int M
-);
-#endif
+/* ── CUDA API (scan ND GPU) ───────────────────────────────────
+ * Note: 1D scans now use unified om_scannd_forward with ndims=1.
+ * The separate 1D CUDA kernels have been removed in favor of
+ * the wavefront-based ND implementation using Mamba-3 formula.
+ */
 
 #endif /* KMAMBA_SCAN_H */

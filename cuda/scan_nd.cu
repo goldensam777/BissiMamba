@@ -267,6 +267,8 @@ __global__ void scannd_level_kernel(const float *x,
                                     const float *A,
                                     const float *B,
                                     const float *delta,
+                                    const float *lambda,
+                                    float default_lambda,
                                     const long *ordered_offsets,
                                     const long *prev_offsets,
                                     long level_start,
@@ -275,7 +277,8 @@ __global__ void scannd_level_kernel(const float *x,
                                     int ndims,
                                     int D,
                                     int M,
-                                    float *h) {
+                                    float *h,
+                                    float *Bu_prev) {
     long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total_threads = level_size * (long)D * M;
 
@@ -296,18 +299,43 @@ __global__ void scannd_level_kernel(const float *x,
     for (int axis = 0; axis < ndims; axis++) {
         dt_bar += delta[((long)axis * total_points + offset) * D + d];
     }
-    dt_bar /= (float)ndims;
+    /* Note: pas de division par ndims (conforme Eq 10 du papier) */
 
-    h_new = dt_bar * B[pdm] * x_val;
+    /* Mamba-3: lambda per point for exp-trapezoidal */
+    float lambda_n = lambda ? lambda[offset] : default_lambda;
+
+    /* Compute Bu_t = B_t * x_t */
+    float bu_t = B[pdm] * x_val;
+
+    /* Mamba-3 exp-trapezoidal formula */
+    float bu_prev_acc = 0.0f;
+    float decay_acc = 0.0f;
+    float h_decay_acc = 0.0f;
+    int n_pred = 0;
+
+    /* Single pass: compute all alphas, accumulate Bu and h contributions */
     for (int axis = 0; axis < ndims; axis++) {
         long prev_offset = prev_offsets[slot * ndims + axis];
         if (prev_offset >= 0) {
             float dt_axis = delta[((long)axis * total_points + offset) * D + d];
             float a_val = A[((long)axis * D + d) * M + m];
+            float alpha = expf(dt_axis * a_val);
             long prev_pdm = prev_offset * ((long)D * M) + dm;
-            h_new += expf(dt_axis * a_val) * h[prev_pdm];
+
+            bu_prev_acc += Bu_prev[prev_pdm];
+            decay_acc += alpha;
+            h_decay_acc += alpha * h[prev_pdm];
+            n_pred++;
         }
     }
+
+    float bu_prev_avg = (n_pred > 0) ? (bu_prev_acc / n_pred) : 0.0f;
+    float alpha_avg = (n_pred > 0) ? (decay_acc / n_pred) : 0.0f;
+    float beta = (1.0f - lambda_n) * dt_bar * alpha_avg;
+    float gamma = lambda_n * dt_bar;
+
+    h_new = bu_prev_avg * beta + bu_t * gamma + h_decay_acc;
+    Bu_prev[pdm] = bu_t;  /* Store for next level */
 
     h[pdm] = h_new;
 }
@@ -342,6 +370,7 @@ int om_scannd_forward(ScanNDParams *p) {
     long max_level;
     long *d_ordered_offsets = NULL;
     long *d_prev_offsets = NULL;
+    float *d_Bu_prev = NULL;
     int rc = -1;
 
     if (!p || !scannd_dims_valid_host(p->dims, p->ndims) || p->D <= 0 || p->M <= 0 ||
@@ -355,8 +384,12 @@ int om_scannd_forward(ScanNDParams *p) {
         return -1;
     }
 
+    /* Mamba-3: Allocate Bu_prev buffer for exp-trapezoidal formula */
+    size_t bu_prev_size = (size_t)total_points * p->D * p->M * sizeof(float);
     SCANND_CUDA_CHECK(cudaMalloc(&d_ordered_offsets, (size_t)total_points * sizeof(long)));
     SCANND_CUDA_CHECK(cudaMalloc(&d_prev_offsets, (size_t)(total_points * p->ndims) * sizeof(long)));
+    SCANND_CUDA_CHECK(cudaMalloc(&d_Bu_prev, bu_prev_size));
+    SCANND_CUDA_CHECK(cudaMemset(d_Bu_prev, 0, bu_prev_size)); /* Zero Bu_prev */
     SCANND_CUDA_CHECK(cudaMemcpy(d_ordered_offsets, h_ordered_offsets,
                                  (size_t)total_points * sizeof(long),
                                  cudaMemcpyHostToDevice));
@@ -373,10 +406,10 @@ int om_scannd_forward(ScanNDParams *p) {
         if (level_size <= 0) continue;
 
         scannd_level_kernel<<<blocks, 256>>>(
-            p->x, p->A, p->B, p->delta,
+            p->x, p->A, p->B, p->delta, p->lambda, p->default_lambda,
             d_ordered_offsets, d_prev_offsets,
             level_start, level_size, total_points,
-            (int)p->ndims, (int)p->D, (int)p->M, p->h);
+            (int)p->ndims, (int)p->D, (int)p->M, p->h, d_Bu_prev);
         SCANND_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -393,6 +426,7 @@ int om_scannd_forward(ScanNDParams *p) {
 
     cudaFree(d_ordered_offsets);
     cudaFree(d_prev_offsets);
+    cudaFree(d_Bu_prev);
     free(h_level_offsets);
     free(h_ordered_offsets);
     free(h_prev_offsets);

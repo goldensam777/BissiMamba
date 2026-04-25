@@ -81,9 +81,7 @@ SRCS = src/kmamba.c \
        kernels/optimizer_f32.c \
        kernels/init_f32.c
 
-CUDA_SRCS = cuda/scan1d.cu \
-            cuda/scan1d_backward.cu \
-            cuda/scan_nd.cu \
+CUDA_SRCS = cuda/scan_nd.cu \
             cuda/convnd.cu \
             cuda/convnd_separable.cu \
             cuda/mamba_scan.cu \
