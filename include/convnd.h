@@ -87,9 +87,8 @@ void convnd_separable_backward_wavefront(
 void convnd_separable(ConvNDSeparableParams *p, ConvNDSeparableMode mode, KMWavefrontPlan **plans_per_axis);
 
 /* ============================================================================
- * CUDA Backend (optional — compile with nvcc)
+ * CUDA Backend (optional — requires linking with cuda/convnd.o)
  * ============================================================================ */
-#ifdef __CUDACC__
 /* Forward pass on GPU. Returns 0 on success, -1 on error. */
 int om_convnd_forward(ConvNDParams *p);
 
@@ -98,6 +97,5 @@ int om_convnd_backward(ConvNDParams *p);
 
 /* Separable forward pass on GPU. Returns 0 on success, -1 on error. */
 int om_convnd_separable_forward(ConvNDSeparableParams *p);
-#endif
 
 #endif

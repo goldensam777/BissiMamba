@@ -66,7 +66,6 @@ SRCS = src/kmamba.c \
        src/mamba_block.c \
        src/kmamba_cuda_utils.c \
        src/kmamba_mixed_precision.c \
-       src/kmamba_checkpoint.c \
        src/kmamba_distributed.c \
        src/km_topology.c \
        src/wavefront_nd.c \
@@ -84,11 +83,9 @@ SRCS = src/kmamba.c \
 CUDA_SRCS = cuda/scan_nd.cu \
             cuda/convnd.cu \
             cuda/convnd_separable.cu \
-            cuda/mamba_scan.cu \
             cuda/mamba_block.cu \
             cuda/kmamba_cuda_utils.cu \
             cuda/kmamba_mixed_precision.cu \
-            cuda/kmamba_checkpoint.cu \
             cuda/kmamba_distributed.cu
 
 # ═══════════════════════════════════════════════════════════════

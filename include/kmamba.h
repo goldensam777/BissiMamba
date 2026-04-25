@@ -354,22 +354,6 @@ void          mamba_local_grad_reduce(MambaBlock *block, const MBOptimState *loc
 void          mamba_local_grad_free(MBOptimState *local);
 
 /* ============================================================================
- * Matrix Operations
- * ============================================================================ */
-MBMatrix* mb_matrix_create(size_t rows, size_t cols);
-void      mb_matrix_free(MBMatrix *m);
-void      mb_matrix_zero(MBMatrix *m);
-void      mb_matrix_copy(MBMatrix *dst, const MBMatrix *src);
-void      mb_matrix_print(const MBMatrix *m);
-
-void mb_matrix_vec_mult(float *out, const MBMatrix *m, const float *v);
-void mb_vec_add(float *y, const float *x, size_t n);
-void mb_vec_scale(float *v, float alpha, size_t n);
-
-void mb_compute_delta(float *delta_out, const MambaBlock *block,
-                      const float *delta_in, size_t seq_len);
-
-/* ============================================================================
  * KMamba API
  * ============================================================================ */
 void kmamba_config_set_defaults(KMambaConfig *cfg);

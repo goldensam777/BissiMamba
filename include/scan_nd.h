@@ -58,6 +58,14 @@ typedef struct {
     float default_lambda; /* fallback lambda if lambda == NULL (recommended [0,1]) */
     int   use_a_log_clamp; /* 1 = clamp A with a_log_min, 0 = no clamp */
     float a_log_min;       /* lower bound for A when use_a_log_clamp=1 */
+
+    /* Gradients (for backward pass) */
+    float *dA;     /* [ndims, D, M] */
+    float *dB;     /* [prod(dims), D, M] */
+    float *dC;     /* [prod(dims), D, M] */
+    float *ddelta; /* [ndims, prod(dims), D] */
+    float *dlambda;/* [prod(dims)] */
+    float *dtheta; /* [D/2] */
 } ScanNDParams;
 
 /* Vérifie que les pointeurs / tailles sont valides. */
@@ -76,6 +84,7 @@ int scannd(ScanNDParams *p);
 /* Backend CUDA générique piloté par wavefronts. Les pointeurs x/A/B/C/delta/h/y
  * doivent être des device pointers ; dims reste côté hôte. */
 int om_scannd_forward(ScanNDParams *p);
+int om_scannd_backward(ScanNDParams *p);
 #endif
 
 #ifdef __cplusplus
