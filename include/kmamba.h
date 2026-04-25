@@ -134,6 +134,9 @@ typedef struct {
     float *d_scan_C;       /* [seq_len x NR] */
     float *d_delta;        /* [seq_len] */
     float *d_lambda;       /* [seq_len] */
+
+    /* Forward stored values for backward */
+    float *raw_delta;      /* [seq_len] - raw delta before softplus/clamp */
 } MambaBlockWorkspace;
 
 /* ============================================================================

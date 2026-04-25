@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #define KMAMBA_MAX_NDIMS 8
+#define KMAMBA_MAX_STATE 64  /* Maximum state size for SSM */
 
 /* Produit des dimensions avec vérification overflow */
 int km_spatial_dims_product(const long *dims, long ndims, size_t *product_out);

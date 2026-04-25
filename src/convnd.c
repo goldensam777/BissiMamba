@@ -111,7 +111,7 @@ static void convnd_separable_1d_wavefront(
         long level_size = km_wavefront_plan_level_size(plan, level);
         if (!level_offsets || level_size < 0) break;
 
-#ifdef _OPENMP
+#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
         for (long point = 0; point < level_size; point++) {
@@ -260,7 +260,7 @@ static void convnd_separable_1d_backward_wavefront(
         long level_size = km_wavefront_plan_level_size(plan, level);
         if (!level_offsets || level_size < 0) break;
 
-#ifdef _OPENMP
+#if defined(_OPENMP) && !defined(KMAMBA_NO_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
         for (long point = 0; point < level_size; point++) {

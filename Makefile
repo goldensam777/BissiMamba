@@ -11,7 +11,7 @@
 #   make tests            # Tests unitaires
 #   make clean            # Nettoyage
 
-.PHONY: all lib cpu cuda models cpu_lm_model cuda_lm_model hybrid_lm_model all_models tests test-gemm-atb-determinism test-scan-nd-regression bench-gates clean distclean help
+.PHONY: all lib cpu cuda models cpu_lm_model cuda_lm_model hybrid_lm_model vision_model all_models tests test-gemm-atb-determinism test-scan-nd-regression test-gradient bench-gates clean distclean help
 
 # ═══════════════════════════════════════════════════════════════
 # Compilateurs et flags
@@ -108,6 +108,7 @@ TARGET = libkmamba.a
 MODEL_CPU = models/kmamba_cpu
 MODEL_CUDA = models/kmamba_cuda
 MODEL_AZURE = models/kmamba_azure
+MODEL_VISION = models/kmamba_vision
 
 # ═══════════════════════════════════════════════════════════════
 # Cibles principales (cpu / cuda / all)
@@ -168,7 +169,7 @@ else
 endif
 
 # Tous les modèles (selon disponibilité CUDA)
-all_models: cpu_lm_model
+all_models: cpu_lm_model vision_model
 ifeq ($(CUDA_AVAILABLE),1)
 	@echo "Compilation modèles CUDA..."
 	@$(MAKE) $(MODEL_CUDA) $(MODEL_AZURE)
@@ -251,6 +252,17 @@ ifeq ($(CUDA_AVAILABLE),1)
 	@echo "Built: $@ (Azure 7.5B params, cl100k 100K)"
 endif
 
+# Modèle Vision 2D (K-Mamba 2D pour CIFAR-10)
+$(MODEL_VISION): models/kmamba_vision.c models/kmamba_vision.h $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
+	$(CC) $(CFLAGS) -no-pie -o $@ $< $(MODEL_LDFLAGS)
+	@echo "Built: $@ (K-Mamba 2D Vision, 96 dim, 192 state, 5 layers)"
+
+vision_model: lib $(MODEL_VISION)
+	@echo "✓ Modèle Vision 2D prêt: $(MODEL_VISION)"
+
+# Alias pour kmamba_vision
+kmamba_vision: vision_model
+
 # ═══════════════════════════════════════════════════════════════
 # Vérifications
 # ═══════════════════════════════════════════════════════════════
@@ -296,6 +308,10 @@ test-gemm-atb-determinism: tests/unit/test_gemm_atb_determinism.c kernels/gemm_f
 test-scan-nd-regression: tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c cpu/scan1d.o cpu/scan2d.o
 	$(CC) -no-pie $(CFLAGS) -o /tmp/test_scan_nd tests/unit/test_scan_nd.c src/scan_nd.c src/wavefront_plan.c src/wavefront_nd.c src/km_topology.c src/km_memory_pool.c src/kmamba_cuda_utils.c cpu/scan1d.o cpu/scan2d.o $(LDFLAGS)
 	/tmp/test_scan_nd
+
+test-gradient: tests/test_gradient.c lib
+	$(CC) $(CFLAGS) -no-pie -o /tmp/test_gradient tests/test_gradient.c libkmamba.a $(LDFLAGS) $(CUDA_LDFLAGS)
+	/tmp/test_gradient
 
 bench-gates:
 	bash scripts/bench_cpu_gates.sh
