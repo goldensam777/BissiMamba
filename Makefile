@@ -222,6 +222,12 @@ ifeq ($(CUDA_AVAILABLE),1)
 MODEL_LDFLAGS += $(CUDA_LDFLAGS)
 endif
 
+# K-Mamba Training CLI
+K_MAMBA_TRAIN_OBJS = models/main.o models/config_presets.o models/cifar10.o models/moving_mnist.o models/synthetic_2d.o
+k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) libs/train_set/libtrainer.a | models_dir
+	$(CC) $(CFLAGS) -o $@ $(K_MAMBA_TRAIN_OBJS) $(MODEL_LDFLAGS) -Llibs/train_set -ltrainer
+	@echo "Built: $@ (K-Mamba Training CLI)"
+
 # Modèle CPU
 $(MODEL_CPU): models/kmamba_cpu.c $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
 	$(CC) $(CFLAGS) -o $@ $< $(MODEL_LDFLAGS)
