@@ -139,6 +139,7 @@ k-mamba/
 ├── kernels/                   # Kernels inline C pur
 ├── cpu/                       # ASM AVX2
 ├── cuda/                      # CUDA (optionnel)
+├── libs/train_set/            # Trainer avec Gradient Checkpointing
 ├── Makefile
 └── build.sh
 ```

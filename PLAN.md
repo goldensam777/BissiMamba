@@ -31,6 +31,8 @@
 - [x] Remove DEBUG statements from scan_nd.c.
 - [x] Implement `libs/train_set/Trainer` for Gradient Checkpointing (GC).
 - [x] Unify CUDA backend with Mamba-3 ND formulation and implement full GPU backward.
+- [x] Create GPU kernels for embedding, head, and loss (cuda/kmamba_kernels.cu).
+- [x] Validate Trainer GC numerical equivalence with unit tests.
 
 ## Upcoming Tasks (Serialization & Large Scale Training)
 - [ ] **Full Optimizer Serialization**: Save Adam momentum `m` and `v` buffers in `.ser` format (critical for Resume Training).

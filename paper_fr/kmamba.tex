@@ -356,18 +356,20 @@ est prévue pour des $L$ arbitrairement grands.
 \section{Implémentation}
 \label{sec:implementation}
 
-\subsection{Architecture : Volontés/Puissance}
+\subsection{Architecture : Orchestration/Topologie/Kernels}
 
-K-Mamba est organisé autour d'une stricte séparation à deux niveaux :
+K-Mamba est organisé autour d'une stricte séparation en trois couches :
 
 \begin{itemize}
-  \item \textbf{k-mamba (Volontés)} : orchestration du modèle —
+  \item \textbf{Orchestration (src/)} : logique modèle, API, boucle d'entraînement —
         recherche d'embedding, empilement des blocs Mamba, tête de langage,
-        boucle d'entraînement, entrées/sorties de points de contrôle.
+        entrées/sorties de points de contrôle.
         Tout en C trivial ($\leq$10 lignes par opération).
-  \item \textbf{kernels/ (Puissance)} : moteur de calcul —
+  \item \textbf{Topologie (src/km\_topology.c)} : indexation ND, scheduling wavefront —
+        primitives communes pour les strides ND et l'ordonnancement causal. Réutilisable par scan et convolution.
+  \item \textbf{Kernels (kernels/, cuda/, cpu/)} : moteur de calcul —
         GEMM/GEMV en C pur inline, activations, Conv1D/ND, optimiseurs (AdamW, MUON),
-        noyaux CPU et CUDA. Toutes les boucles critiques.
+        noyaux CPU (ASM AVX2) et CUDA. Toutes les boucles critiques.
 \end{itemize}
 
 Cette séparation garantit que changer le backend de calcul (par ex., portage

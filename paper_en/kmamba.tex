@@ -350,17 +350,19 @@ is planned for arbitrarily large $L$.
 \section{Implementation}
 \label{sec:implementation}
 
-\subsection{Architecture: Volontés/Puissance}
+\subsection{Architecture: Orchestration/Topology/Kernels}
 
-K-Mamba is organized around a strict two-tier separation:
+K-Mamba is organized around a strict three-layer separation of concerns:
 
 \begin{itemize}
-  \item \textbf{k-mamba (Volontés)}: model orchestration —
+  \item \textbf{Orchestration (src/)}: model logic, API, training loop —
         embedding lookup, MambaBlock stacking, LM head,
-        training loop, checkpoint I/O. All trivial C code ($\leq$10 lines per operation).
-  \item \textbf{kernels/ (Puissance)}: compute engine —
+        checkpoint I/O. All trivial C code ($\leq$10 lines per operation).
+  \item \textbf{Topology (src/km\_topology.c)}: ND indexing, wavefront scheduling —
+        common primitives for ND strides and causal ordering. Reusable by scan and convolution.
+  \item \textbf{Kernels (kernels/, cuda/, cpu/)}: compute engine —
         GEMM/GEMV pure C inline, activations, Conv1D/ND, optimizers (AdamW, MUON),
-        CPU and CUDA kernels. All hot-path loops.
+        CPU (ASM AVX2) and CUDA kernels. All hot-path loops.
 \end{itemize}
 
 This separation ensures that changing the compute backend

@@ -143,8 +143,9 @@ The project follows a clean separation of concerns across three layers:
 | **Orchestration** | Model logic, API, training loop | `src/kmamba.c`, `src/mamba_block.c` |
 | **Topology** | ND indexing, wavefront scheduling | `src/km_topology.c`, `src/wavefront_*.c` |
 | **Kernels** | Compute-intensive operations | `kernels/*.c`, `cuda/*.cu`, `cpu/*.asm` |
+| **Training** | Gradient Checkpointing, trainer logic | `libs/train_set/trainer.h` |
 
-**Design Principle**: High-level model code (5-10 lines per operation) stays in `src/`. Performance-critical loops (millions of iterations) go in `kernels/`.
+**Design Principle**: High-level model code (5-10 lines per operation) stays in `src/`. Performance-critical loops (millions of iterations) go in `kernels/`. Gradient Checkpointing is handled by the Trainer in `libs/train_set/`.
 
 ---
 

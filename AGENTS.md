@@ -10,51 +10,49 @@ Une **bibliothèque C zero-dependency** pour State Space Models Mamba en dimensi
 
 **Philosophie** : Aucune dépendance externe — juste `gcc`, `nasm` et `libc/libm`.
 
-**Innovations** : 
+**Innovations** :
 1. **Scan Mamba-ND natif** (N-dimensionnel) avec ordonnancement wavefront
-2. **Générateur de wavefront ND** — primitive topologique générique réutilisable par scanND et convND
-3. **Couche topologique commune** — normalisation des dimensions, strides, indexation ND
-4. **Kernels inline** — GEMM, activations, MUON/AdamW en C pur (pas de BLAS externe)
+2. **Architecture en trois couches** — Orchestration (modèle), Topologie (ND indexing), Kernels (compute)
+3. **Kernels inline** — GEMM, activations, MUON/AdamW en C pur (pas de BLAS externe)
+4. **Trainer avec Gradient Checkpointing** — gestion mémoire pour grands modèles
 
 ---
 
-## Architecture (zero-dependency)
+## Architecture en trois couches (zero-dependency)
+
+Séparation des responsabilités par couche :
+- **Orchestration (src/)** : logique modèle, API, boucle d'entraînement — embedding lookup, stacking MambaBlock, LM head, checkpoint I/O. Code C trivial (≤10 lignes par opération).
+- **Topologie (src/km_topology.c, src/wavefront_*.c)** : indexation ND, scheduling wavefront — primitives communes pour strides ND et ordonnancement causal.
+- **Kernels (kernels/, cuda/, cpu/)** : opérations compute-intensive — GEMM, activations, ConvND, optimizers, kernels CPU (C/ASM) et CUDA.
 
 ```
 k-mamba/
 ├── include/
 │   ├── kmamba.h              # API publique
-│   ├── kmamba_kernels.h      # Kernels zero-dependency (GEMM, activations, optimizers)
-│   ├── km_topology.h         # Couche topologique ND
+│   ├── kmamba_kernels.h      # Kernels zero-dependency
 │   ├── wavefront_nd.h        # Générateur wavefront ND
 │   ├── wavefront_plan.h      # Plans exécutables
 │   ├── scan_nd.h             # Interface scan ND
 │   └── convnd.h              # Interface convND
-├── src/
+├── src/                      # Orchestration — Logique modèle
 │   ├── kmamba.c              # Forward, backward, training loop
 │   ├── mamba_block.c         # Bloc SSM (projections, scan dispatch)
-│   ├── km_topology.c         # Normalisation topologique
-│   ├── wavefront_nd.c        # Générateur wavefront
-│   ├── wavefront_plan.c      # Plans wavefront
-│   ├── scan_nd.c             # Scan ND
-│   └── convnd.c              # Convolution ND
-├── kernels/                  # Kernels compute zero-dependency
+│   └── kmamba_ser.c          # Sérialisation
+├── kernels/                  # Kernels — Compute engine CPU
 │   ├── gemm_f32.c            # GEMM/GEMV en C pur
 │   ├── activations_f32.c     # SiLU, ReLU, Sigmoid, Softplus
 │   ├── elementwise_f32.c     # Hadamard, vector ops
 │   ├── optimizer_f32.c       # Gradient clip, Newton-Schulz, MUON, AdamW
 │   └── init_f32.c            # Xavier/Kaiming init
-├── cpu/                      # Scan SSM en assembleur
-│   ├── scan1d.asm            # Scan 1D AVX2
-│   ├── scan2d.asm            # Scan 2D wavefront
-│   └── mamba_scan.c          # Dispatch CPU
-├── cuda/                     # GPU optimizations (optionnel)
-│   ├── scan1d.cu             # Parallel scan (Blelloch)
-│   ├── scan1d_backward.cu    # Backward parallel scan
+├── cuda/                     # Kernels — Compute engine GPU
+│   ├── scan_nd.cu            # Scan ND forward/backward unifié
 │   ├── mamba_block.cu        # Full GPU forward/backward
+│   ├── kmamba_kernels.cu     # Embedding, head, loss GPU
 │   ├── kmamba_mixed_precision.cu   # FP16/BF16 Tensor Cores
-│   ├── kmamba_checkpoint.cu        # Gradient checkpointing
-│   └── kmamba_distributed.cu       # Multi-GPU NCCL (optional)
+│   └── kmamba_distributed.cu       # Multi-GPU NCCL
+├── libs/train_set/           # Trainer avec Gradient Checkpointing
+│   ├── trainer.h             # Interface Trainer
+│   └── src/trainer.c         # Implémentation GC
 ├── Makefile                  # Build simple (pas de CMake)
 └── build.sh                  # Script build style Karpathy
 ```
@@ -117,13 +115,15 @@ float loss = kmamba_train_step(m, tokens_plus1);
 
 ---
 
-## Séparation Volontés/Puissance
+## Séparation des responsabilités
 
-| Couche | Rôle | Localisation |
-|--------|------|--------------|
-| **Volontés** | Orchestration modèle | `src/kmamba.c`, `src/mamba_block.c` |
-| **Topologie** | ND indexing, wavefront | `src/km_topology.c`, `src/wavefront_*.c` |
-| **Puissance** | Kernels compute | `kernels/*.c`, `cpu/*.asm` |
+| Couche | Rôle | Localisation | Complexité |
+|--------|------|--------------|------------|
+| **Orchestration** | Logique modèle, I/O | `src/kmamba.c`, `src/mamba_block.c` | Triviale (5-10 lignes) |
+| **Topologie** | Indexation ND, wavefront scheduling | `src/km_topology.c`, `src/wavefront_*.c` | Géométrie ND |
+| **Kernels** | Compute engine, math pure | `kernels/*.c`, `cuda/*.cu`, `cpu/*.asm` | Intensive (millions d'itérations) |
+
+**Règle d'or** : Si c'est trivial, ça va dans `src/`. Si ça boucle des millions de fois, ça va dans `kernels/`.
 
 ---
 
@@ -364,7 +364,37 @@ Devise : **"Optima, Immo Absoluta Perfectio"**
 **Fichiers modifiés** :
 - `libs/train_set/include/trainer.h` & `libs/train_set/src/trainer.c` — Nouveau Trainer.
 - `cuda/scan_nd.cu` & `cuda/mamba_block.cu` — Backend Mamba-3 GPU.
+- `cuda/kmamba_kernels.cu` — Kernels embedding/head/loss GPU.
 - `include/kmamba.h` & `src/kmamba.c` — Alignement et API Trainer.
-- `Makefile` — Intégration de `libs/train_set`.
+- `Makefile` — Intégration de `libs/train_set` et `cuda/kmamba_kernels.cu`.
 
 **État** : ✅ Compilation parfaite, backend Mamba-3 unifié, Trainer prêt.
+
+
+
+### Session 26 Avril 2026 — Consolidation : Suppression PGF & Nouvelle Architecture
+
+**Objectif** : Abandonner l'approche PGF (Phase Gradient Flow) trop complexe et consolider l'architecture en trois couches (Orchestration/Topologie/Kernels).
+
+**Changements majeurs** :
+
+1. **Suppression PGF** :
+   - Retrait du kernel `scannd_backward_pgf_1d_kernel` et des champs `use_pgf`, `pgf_block_size`.
+   - Suppression de `test_pgf_gradient.cu`.
+   - Le backward GPU utilise uniquement le mode stocké (wavefront-based) qui est fiable et validé.
+
+2. **Architecture consolidée en trois couches** :
+   - **Orchestration** (`src/`) : logique modèle, API, boucle d'entraînement — embedding lookup, stacking MambaBlock, LM head, checkpoint I/O. Code C trivial.
+   - **Topologie** (`src/km_topology.c`, `src/wavefront_*.c`) : indexation ND, scheduling wavefront — primitives communes réutilisables par scan et convolution.
+   - **Kernels** (`kernels/`, `cuda/`, `cpu/`) : opérations compute-intensive — GEMM, activations, ConvND, optimizers, kernels CPU (C/ASM AVX2) et CUDA.
+
+3. **Ajouts CUDA** :
+   - `cuda/kmamba_kernels.cu` : kernels GPU pour embedding forward, head forward, softmax loss.
+   - Intégration dans le Makefile pour build complet.
+
+4. **Mise à jour Documentation** :
+   - `paper_en/kmamba.tex` et `paper_fr/kmamba.tex` : mise à jour de la description d'architecture.
+
+**Résultat** : Codebase simplifiée, plus maintenable, sans perte de fonctionnalités (le Gradient Checkpointing est géré par le Trainer, pas par PGF).
+
+**État** : ✅ Consolidation terminée, codebase stable.
