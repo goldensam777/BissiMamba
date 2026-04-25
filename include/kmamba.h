@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "km_topology.h"
-#include "scan.h"
 #include "scan_nd.h"
 #include "convnd.h"
 #include "wavefront_plan.h"

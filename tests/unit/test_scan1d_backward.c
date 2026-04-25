@@ -19,7 +19,7 @@
 #include <string.h>
 #include <math.h>
 
-#include "scan.h"
+#include "scan_nd.h"
 
 #define PASS_TAG "  [PASS]"
 #define FAIL_TAG "  [FAIL]"

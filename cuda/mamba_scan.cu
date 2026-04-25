@@ -1,5 +1,4 @@
 #include "mamba_scan_cuda.h"
-#include "scan.h"
 #include "scan_nd.h"
 
 /* ============================================================

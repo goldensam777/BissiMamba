@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "scan.h"
+#include "scan_nd.h"
 
 #define EPSILON_FWD  1e-4f
 #define EPSILON_BWD  1e-3f   /* backward accumule plus d'erreur float32 */
