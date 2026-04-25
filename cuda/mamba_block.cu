@@ -25,7 +25,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "scan_nd.h"
-#include "mamba_scan_cuda.h"
 
 /* ── Macro de vérification ────────────────────────────────────── */
 #define CUDA_CHECK(call) do { \

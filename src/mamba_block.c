@@ -6,7 +6,7 @@
 #ifdef KMAMBA_BUILD_CUDA
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include "mamba_scan_cuda.h"
+#include "scan_nd.h"
 
 void cuda_block_forward(
     cublasHandle_t cublas,

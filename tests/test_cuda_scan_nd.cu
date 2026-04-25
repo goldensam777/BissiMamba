@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mamba_scan_cuda.h"
 #include "scan_nd.h"
 
 #define EPSILON_ND 1e-4f
@@ -129,8 +128,8 @@ static int run_case(const long *dims, long ndims, int D, int M, const char *labe
     p_gpu.y = d_y;
 
     if (mamba_scannd_cuda_forward(&p_gpu) != 0) {
-        printf("  FAIL %s: mamba_scannd_cuda_forward failed\n", label);
-        ok = 0;
+        opf("  FAI mamba_scannd_cuda_forward failed\n", label);
+        ok = 0;o
         goto cleanup;
     }
 
