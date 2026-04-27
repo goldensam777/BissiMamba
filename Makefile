@@ -56,7 +56,7 @@ endif
 # ═══════════════════════════════════════════════════════════════
 KSER_DIR = libs/kser
 KSER_LIB = $(KSER_DIR)/libkser.a
-KSER_LDFLAGS = -L$(KSER_DIR) -lkser
+KSER_LDFLAGS = -L$(KSER_DIR) -lkser -Wl,-rpath,$(KSER_DIR)
 CFLAGS += -I$(KSER_DIR)/include
 
 # ═══════════════════════════════════════════════════════════════
@@ -98,33 +98,33 @@ CUDA_OBJS = $(patsubst %.cu,cuda/%.o,$(notdir $(CUDA_SRCS)))
 
 TARGET = libkmamba.a
 
-MODEL_CPU = models/kmamba_cpu
-MODEL_CUDA = models/kmamba_cuda
-MODEL_AZURE = models/kmamba_azure
-MODEL_VISION = models/kmamba_vision
+# Modèles obsolètes supprimés - utiliser k-mamba-train (CLI principal)
 
 # ═══════════════════════════════════════════════════════════════
 # Cibles principales (cpu / cuda / all)
 # ═══════════════════════════════════════════════════════════════
 
 # Compilation CPU uniquement (lib + tests CPU)
-cpu: lib
+cpu: lib k-mamba-train
 	@echo "=== Compilation CPU terminée ==="
 	@echo "Bibliothèque: $(TARGET)"
+	@echo "CLI: k-mamba-train"
 	@echo "Tests CPU: make tests"
 
 # Compilation CUDA (lib + tests GPU si disponible)
-cuda: lib
+cuda: lib k-mamba-train
 ifeq ($(CUDA_AVAILABLE),1)
 	@echo "=== Compilation CUDA terminée ==="
+	@echo "Bibliothèque: $(TARGET)"
+	@echo "CLI: k-mamba-train"
 	@$(MAKE) bench-convnd-cuda test-convnd-separable-cuda 2>/dev/null || true
 else
 	@echo "✗ CUDA non disponible - impossible de compiler les tests GPU"
 	@exit 1
 endif
 
-# Tout compiler (CPU + CUDA si dispo)
-all: lib all_models
+# Tout compiler (lib + CLI)
+all: lib k-mamba-train
 	@echo "=== Compilation complète terminée ==="
 
 # Juste la bibliothèque
@@ -141,33 +141,9 @@ $(KSER_LIB):
 # Tous les modèles
 models: all_models
 
-# Modèle CPU uniquement
-cpu_lm_model: lib $(MODEL_CPU)
-	@echo "✓ Modèle CPU prêt: $(MODEL_CPU)"
-
-# Modèle CUDA uniquement (si dispo)
-cuda_lm_model: lib $(MODEL_CUDA)
-ifeq ($(CUDA_AVAILABLE),1)
-	@echo "✓ Modèle CUDA prêt: $(MODEL_CUDA)"
-else
-	@echo "✗ CUDA non disponible — modèle CUDA ignoré"
-endif
-
-# Modèle Azure uniquement (si dispo)
-azure_lm_model: lib $(MODEL_AZURE)
-ifeq ($(CUDA_AVAILABLE),1)
-	@echo "✓ Modèle Azure prêt: $(MODEL_AZURE)"
-else
-	@echo "✗ CUDA non disponible — modèle Azure ignoré"
-endif
-
-# Tous les modèles (selon disponibilité CUDA)
-all_models: cpu_lm_model vision_model
-ifeq ($(CUDA_AVAILABLE),1)
-	@echo "Compilation modèles CUDA..."
-	@$(MAKE) $(MODEL_CUDA) $(MODEL_AZURE)
-	@echo "✓ Tous les modèles sont prêts"
-endif
+# Tous les modèles (uniquement k-mamba-train maintenant)
+all_models: k-mamba-train
+	@echo "✓ CLI k-mamba-train prêt"
 
 # Tests
 tests: lib
@@ -209,54 +185,32 @@ endif
 # Compilation des modèles
 # ═══════════════════════════════════════════════════════════════
 
-# Crée le répertoire models
+# Crée le répertoire models (pour les .o de la CLI)
 models_dir:
 	@mkdir -p models
 
-# Lien des libs
-MODEL_LDFLAGS = $(TARGET) $(KSER_LIB) $(LDFLAGS)
+# Lien des libs pour k-mamba-train
+K_MAMBA_TRAIN_LDFLAGS = $(TARGET) $(KSER_LIB) $(LDFLAGS)
 ifeq ($(RUST_AVAILABLE),1)
-MODEL_LDFLAGS += $(RUST_LIB) $(RUST_LDFLAGS)
+K_MAMBA_TRAIN_LDFLAGS += $(RUST_LIB) $(RUST_LDFLAGS)
 endif
 ifeq ($(CUDA_AVAILABLE),1)
-MODEL_LDFLAGS += $(CUDA_LDFLAGS)
+K_MAMBA_TRAIN_LDFLAGS += $(CUDA_LDFLAGS)
 endif
 
 # K-Mamba Training CLI
 K_MAMBA_TRAIN_OBJS = models/main.o models/config_presets.o models/cifar10.o models/moving_mnist.o models/synthetic_2d.o
-k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) libs/train_set/libtrainer.a | models_dir
-	$(CC) $(CFLAGS) -o $@ $(K_MAMBA_TRAIN_OBJS) $(MODEL_LDFLAGS) -Llibs/train_set -ltrainer
+
+ifeq ($(RUST_AVAILABLE),1)
+k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
+else
+k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) | models_dir
+endif
+	$(CC) $(CFLAGS) -o $@ $(K_MAMBA_TRAIN_OBJS) $(K_MAMBA_TRAIN_LDFLAGS)
 	@echo "Built: $@ (K-Mamba Training CLI)"
 
-# Modèle CPU
-$(MODEL_CPU): models/kmamba_cpu.c $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
-	$(CC) $(CFLAGS) -o $@ $< $(MODEL_LDFLAGS)
-	@echo "Built: $@ (CPU 500K params, BPE 32K)"
-
-# Modèle CUDA (fichier .cu compilé avec nvcc)
-$(MODEL_CUDA): models/kmamba_cuda.cu $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
-ifeq ($(CUDA_AVAILABLE),1)
-	$(NVCC) $(CUDA_FLAGS) -o $@ $< $(TARGET) $(KSER_LIB) $(CUDA_LDFLAGS) $(RUST_LIB) $(RUST_LDFLAGS) -Xcompiler "$(CFLAGS)"
-	@echo "Built: $@ (CUDA 350M params, BPE 32K)"
-endif
-
-# Modèle Azure
-$(MODEL_AZURE): models/kmamba_azure.cu $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
-ifeq ($(CUDA_AVAILABLE),1)
-	$(NVCC) $(CUDA_FLAGS) -o $@ $< $(TARGET) $(KSER_LIB) $(CUDA_LDFLAGS) $(RUST_LIB) $(RUST_LDFLAGS) -Xcompiler "$(CFLAGS)"
-	@echo "Built: $@ (Azure 7.5B params, cl100k 100K)"
-endif
-
-# Modèle Vision 2D (K-Mamba 2D pour CIFAR-10)
-$(MODEL_VISION): models/kmamba_vision.c models/kmamba_vision.h $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
-	$(CC) $(CFLAGS) -no-pie -o $@ $< $(MODEL_LDFLAGS)
-	@echo "Built: $@ (K-Mamba 2D Vision, 96 dim, 192 state, 5 layers)"
-
-vision_model: lib $(MODEL_VISION)
-	@echo "✓ Modèle Vision 2D prêt: $(MODEL_VISION)"
-
-# Alias pour kmamba_vision
-kmamba_vision: vision_model
+# Note: Les modèles standalone (cpu/cuda/azure/vision) ont été supprimés.
+# Utiliser k-mamba-train avec les presets de config appropriés.
 
 # ═══════════════════════════════════════════════════════════════
 # Vérifications
@@ -344,12 +298,11 @@ test-trainer-gc: $(TARGET) tests/unit/test_trainer_gc.c
 
 clean:
 	rm -f $(OBJS)
-	rm -f src/*.o kernels/*.o cpu/*.o
-	rm -f test_mamba3 test_mamba3_gpu
+	rm -f src/*.o kernels/*.o cpu/*.o models/*.o
+	rm -f cuda/*.o
+	rm -f test_mamba3 test_mamba3_gpu test_trainer_gc
+	rm -f tests/unit/bench_convnd tests/unit/bench_convnd_cuda tests/unit/test_convnd_separable_cuda
 	$(MAKE) -C $(KSER_DIR) clean 2>/dev/null || true
-ifeq ($(CUDA_AVAILABLE),1)
-	rm -f cuda/*.cu.o
-endif
 ifeq ($(RUST_AVAILABLE),1)
 	cd $(RUST_DIR) && cargo clean 2>/dev/null || true
 endif
@@ -357,7 +310,7 @@ endif
 distclean: clean
 	rm -f $(TARGET) $(RUST_LIB)
 	rm -rf models/
-	rm -f examples/train_500k examples/train_500m examples/train_1_5m examples/chat
+	rm -f k-mamba-train
 
 # ═══════════════════════════════════════════════════════════════
 # Help
@@ -367,12 +320,9 @@ help:
 	@echo "k-mamba Makefile maître"
 	@echo ""
 	@echo "Cibles principales:"
-	@echo "  make all              - Tout compiler (lib + modèles)"
+	@echo "  make all              - Tout compiler (lib + CLI)"
 	@echo "  make lib              - Juste la bibliothèque libkmamba.a"
-	@echo "  make cpu_lm_model     - Modèle CPU 500K params"
-	@echo "  make cuda_lm_model    - Modèle GPU 500M params (si CUDA)"
-	@echo "  make hybrid_lm_model  - Modèle Hybrid 1.5M params (si CUDA)"
-	@echo "  make all_models       - Tous les modèles disponibles"
+	@echo "  make k-mamba-train    - CLI d'entraînement principal"
 	@echo "  make tests            - Tests unitaires"
 	@echo "  make clean            - Nettoyage"
 	@echo "  make distclean        - Nettoyage complet"

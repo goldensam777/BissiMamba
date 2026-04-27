@@ -81,15 +81,13 @@ MambaBlockWorkspace* mamba_block_workspace_create(const MambaBlock *block) {
     MambaBlockWorkspace *ws = (MambaBlockWorkspace *)calloc(1, sizeof(*ws));
     if (!ws) return NULL;
     size_t N = block->config.state_size, L = block->config.seq_len, D = block->config.dim, R = _mimo_R(&block->config), NR = N * R;
-    /* scan_B/scan_C: layout pour scan_nd est [L, D, N] et non [L, NR] */
     ws->hidden = malloc(N * sizeof(float)); ws->delta = malloc(L * sizeof(float)); 
-    ws->scan_B = malloc(L * D * N * sizeof(float)); 
-    ws->scan_C = malloc(L * D * N * sizeof(float)); 
+    ws->scan_B = malloc(L * NR * sizeof(float)); 
+    ws->scan_C = malloc(L * NR * sizeof(float)); 
     ws->scan_delta = malloc(L * N * sizeof(float)); ws->scan_h = malloc(N * sizeof(float));
     ws->h_rot = malloc(N * sizeof(float)); ws->Bu_cur = malloc(N * sizeof(float)); ws->prev_Bu = malloc(N * sizeof(float)); ws->z_buf = malloc(D * sizeof(float)); ws->u_seq = malloc(L * R * sizeof(float)); ws->lambda_seq = malloc(L * sizeof(float)); ws->y_rank = malloc(L * R * sizeof(float)); ws->y_proj = malloc(D * sizeof(float)); 
-    /* h_seq/Bu_seq: layout pour scan_nd est [L, D, N] */
-    ws->h_seq = malloc(L * D * N * sizeof(float)); 
-    ws->Bu_seq = malloc(L * D * N * sizeof(float));
+    ws->h_seq = malloc(L * N * sizeof(float)); 
+    ws->Bu_seq = malloc(L * N * sizeof(float));
     ws->d_y_rank = malloc(L * R * sizeof(float)); ws->d_scan_B = malloc(L * NR * sizeof(float)); ws->d_scan_C = malloc(L * NR * sizeof(float)); ws->d_delta = malloc(L * sizeof(float)); ws->d_lambda = malloc(L * sizeof(float)); ws->raw_delta = malloc(L * sizeof(float));
     if (!ws->hidden || !ws->delta || !ws->scan_B || !ws->scan_C || !ws->scan_delta || !ws->scan_h || !ws->h_rot || !ws->Bu_cur || !ws->prev_Bu || !ws->z_buf || !ws->u_seq || !ws->lambda_seq || !ws->y_rank || !ws->y_proj || !ws->h_seq || !ws->Bu_seq || !ws->d_y_rank || !ws->d_scan_B || !ws->d_scan_C || !ws->d_delta || !ws->d_lambda || !ws->raw_delta) { mamba_block_workspace_free(ws); return NULL; }
     memset(ws->hidden, 0, N * sizeof(float)); memset(ws->delta, 0, L * sizeof(float)); memset(ws->scan_h, 0, N * sizeof(float));
@@ -460,6 +458,10 @@ static void _ssm_scan_forward_wavefront(MambaBlock *block,
 
 void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *output, const float *input, size_t batch_size) {
     if (!block || !ws || !output || !input) return; size_t L = block->config.seq_len, D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R;
+    /* Buffer size checks */
+    size_t scan_B_size = L * D * N;  /* Allocated size */
+    size_t scan_B_access_max = (L - 1) * NR + (NR - 1);  /* Max accessed index */
+    (void)scan_B_size; (void)scan_B_access_max;
     for (size_t b = 0; b < batch_size; b++) {
         const float *in = &input[b * L * D]; float *out = &output[b * L * D];
         for (size_t t = 0; t < L; t++) { Mamba3Control ctrl = {0.0f, 0.0f, block->config.default_lambda}; project_controller_full(block, &in[t * D], ws->z_buf, &ws->u_seq[t * R], &ctrl); ws->delta[t] = ctrl.delta; ws->raw_delta[t] = ctrl.raw_delta; ws->lambda_seq[t] = ctrl.lambda; gemv_f32(block->W_B.data, &in[t * D], &ws->scan_B[t * NR], (int)NR, (int)D); gemv_f32(block->W_C.data, &in[t * D], &ws->scan_C[t * NR], (int)NR, (int)D); for (size_t i = 0; i < NR; i++) { ws->scan_B[t * NR + i] += block->b_B[i]; ws->scan_C[t * NR + i] += block->b_C[i]; } }
@@ -481,10 +483,13 @@ static void _ssm_scan_backward(MambaBlock *block, MambaBlockWorkspace *ws, const
         float dt_t = ws->delta[t], lam_t = lambda_seq ? lambda_seq[t] : block->config.default_lambda; const float *c_t = &ws->scan_C[t * NR], *h_t = &ws->h_seq[t * N], *h_prev = (t > 0) ? &ws->h_seq[(t - 1) * N] : NULL, *prev_Bu = (t > 0) ? &ws->Bu_seq[(t - 1) * N] : NULL;
         for (size_t r = 0; r < R; r++) { float dy_tr = d_y_rank[t * R + r]; for (size_t n = 0; n < N; n++) { d_h[n] += c_t[r * N + n] * dy_tr; ws->d_scan_C[t * NR + r * N + n] += h_t[n] * dy_tr; } }
         for (size_t n = 0; n < N; n++) {
-            float a = block->A_log.data[n], alpha = km_scan_exp(dt_t * a, block->config.use_fast_exp), beta = (1.0f - lam_t) * dt_t * alpha, gamma = lam_t * dt_t, dh_n = d_h[n]; d_Bu_cur[n] += dh_n * gamma; if (t > 0) d_Bu_next[n] = dh_n * beta;
+            float a = block->A_log.data[n];
+            int clipped = (block->config.use_a_log_clamp && a > block->config.a_log_min);
+            if (clipped) a = block->config.a_log_min;
+            float alpha = km_scan_exp(dt_t * a, block->config.use_fast_exp), beta = (1.0f - lam_t) * dt_t * alpha, gamma = lam_t * dt_t, dh_n = d_h[n]; d_Bu_cur[n] += dh_n * gamma; if (t > 0) d_Bu_next[n] = dh_n * beta;
             if (h_prev) {
                 float h_rot_n; if (n & 1) { float th = block->theta[n >> 1]; h_rot_n = sinf(th) * h_prev[n-1] + cosf(th) * h_prev[n]; } else { float th = block->theta[n >> 1]; h_rot_n = cosf(th) * h_prev[n] - sinf(th) * h_prev[n+1]; }
-                grads->g_A_log[n] += dh_n * (dt_t * alpha * h_rot_n + (1.0f - lam_t) * dt_t * dt_t * alpha * (prev_Bu ? prev_Bu[n] : 0.0f));
+                if (!clipped) grads->g_A_log[n] += dh_n * (dt_t * alpha * h_rot_n + (1.0f - lam_t) * dt_t * dt_t * alpha * (prev_Bu ? prev_Bu[n] : 0.0f));
                 ws->d_delta[t] += dh_n * (a * alpha * h_rot_n + (1.0f - lam_t) * (alpha + dt_t * a * alpha) * (prev_Bu ? prev_Bu[n] : 0.0f) + lam_t * ws->Bu_seq[t * N + n]);
             } else { ws->d_delta[t] += dh_n * lam_t * ws->Bu_seq[t * N + n]; }
             ws->d_lambda[t] += dh_n * (prev_Bu ? -dt_t * alpha * prev_Bu[n] : 0.0f + dt_t * ws->Bu_seq[t * N + n]); d_h[n] = dh_n * alpha;
@@ -517,7 +522,7 @@ static void _ssm_scan_backward_callback(long t, long level, void *userdata) {
     MambaBlock *block = ctx->block;
     MambaBlockWorkspace *ws = ctx->ws;
     const size_t N = block->config.state_size;
-    const size_t R = (block->config.mimo_rank > 1) ? block->config.mimo_rank : 1;
+    const size_t R = _mimo_R(&block->config);
     const long ndims = block->config.spatial_ndims;
     const long *dims = block->config.spatial_dims;
     const long *strides = ctx->strides;
@@ -546,65 +551,95 @@ static void _ssm_scan_backward_callback(long t, long level, void *userdata) {
         }
     }
 
+    /* 1. Propagate d_h from successors */
     for (size_t n = 0; n < N; n++) {
-        float d_h_from_succ_n = 0.0f;
-        float d_Bu_succ_acc_n = 0.0f;
-        int n_succ = 0;
         float a = block->A_log.data[n];
-        float alpha = expf(dt * a);
-        
+        if (block->config.use_a_log_clamp && a > block->config.a_log_min) a = block->config.a_log_min;
+        float alpha = km_scan_exp(dt * a, block->config.use_fast_exp);
         for (long ax = 0; ax < ndims; ax++) {
             if (coords[ax] < dims[ax] - 1) {
                 long next_t = t + strides[ax];
                 float *d_h_next = &ctx->d_h_all[next_t * N];
                 float dh_rot_n;
-                if ((n & 1U) && n > 0) {
+                if (n & 1) {
                     float th = block->theta[n >> 1];
                     dh_rot_n = -sinf(th) * d_h_next[n - 1] + cosf(th) * d_h_next[n];
-                } else if ((n + 1) < N) {
+                } else {
                     float th = block->theta[n >> 1];
                     dh_rot_n = cosf(th) * d_h_next[n] + sinf(th) * d_h_next[n + 1];
-                } else {
-                    dh_rot_n = d_h_next[n];
                 }
-                d_h_from_succ_n += alpha * dh_rot_n;
-                d_Bu_succ_acc_n += ws->Bu_seq[next_t * N + n];
-                n_succ++;
+                d_h[n] += alpha * dh_rot_n;
             }
         }
-        d_h[n] += d_h_from_succ_n;
-        
+    }
+
+    /* 2. Gradients at t using predecessors */
+    for (size_t n = 0; n < N; n++) {
+        float a_raw = block->A_log.data[n];
+        int clipped = (block->config.use_a_log_clamp && a_raw > block->config.a_log_min);
+        float a = clipped ? block->config.a_log_min : a_raw;
+        float alpha = km_scan_exp(dt * a, block->config.use_fast_exp);
         float dh_n = d_h[n];
+        
+        float h_rot_acc_n = 0.0f;
+        float bu_prev_acc_n = 0.0f;
+        int n_prev = 0;
+        for (long ax = 0; ax < ndims; ax++) {
+            if (coords[ax] > 0) {
+                long prev_t = t - strides[ax];
+                const float *h_prev = &ws->h_seq[prev_t * N];
+                float hrp_n;
+                if (n & 1) {
+                    float th = block->theta[n >> 1];
+                    hrp_n = sinf(th) * h_prev[n-1] + cosf(th) * h_prev[n];
+                } else {
+                    float th = block->theta[n >> 1];
+                    hrp_n = cosf(th) * h_prev[n] - sinf(th) * h_prev[n + 1];
+                }
+                h_rot_acc_n += hrp_n;
+                bu_prev_acc_n += ws->Bu_seq[prev_t * N + n];
+                n_prev++;
+            }
+        }
+        float h_rot_n = (n_prev > 0) ? (h_rot_acc_n / (float)n_prev) : 0.0f;
+        float prev_bu_n = (n_prev > 0) ? (bu_prev_acc_n / (float)n_prev) : 0.0f;
+
+        /* A_log gradient */
+        if (!clipped) grads->g_A_log[n] += dh_n * (dt * alpha * h_rot_n + (1.0f - lam) * dt * dt * alpha * prev_bu_n);
+
+        /* delta gradient */
+        ws->d_delta[t] += dh_n * (a * alpha * h_rot_n + (1.0f - lam) * (alpha + dt * a * alpha) * prev_bu_n + lam * Bu_t[n]);
+
+        /* lambda gradient */
+        ws->d_lambda[t] += dh_n * (-dt * alpha * prev_bu_n + dt * Bu_t[n]);
+
+        /* scan_B gradient */
         float d_Bu_cur_n = dh_n * lam * dt;
-
-        /* Gradient w.r.t. delta (partial) */
-        if (n_succ > 0) {
-            ws->d_delta[t] += dh_n * a * alpha * h_t[n];
-        }
-        ws->d_delta[t] += dh_n * lam * Bu_t[n];
-
-        /* Gradient w.r.t. lambda */
-        ws->d_lambda[t] += dh_n * dt * Bu_t[n];
-        if (n_succ > 0) {
-            ws->d_lambda[t] -= dh_n * dt * alpha * d_Bu_succ_acc_n / (float)n_succ;
-        }
-
-        /* Gradient w.r.t. A_log */
-        if (n_succ > 0) {
-            grads->g_A_log[n] += dh_n * dt * alpha * h_t[n];
-        }
         for (size_t r = 0; r < R; r++) {
             ws->d_scan_B[t * N * R + r * N + n] += d_Bu_cur_n * u_t[r];
         }
     }
 
-    /* Gradients w.r.t. theta (rotation angles) */
+    /* 3. Gradients w.r.t. theta */
     for (size_t i = 0; i + 1 < N; i += 2) {
         float th = block->theta[i >> 1];
         float cv = cosf(th), sv = sinf(th);
         float dh0 = d_h[i], dh1 = d_h[i+1];
-        float h0 = h_t[i], h1 = h_t[i+1];
-        grads->g_theta[i >> 1] += (-sv * h0 - cv * h1) * dh0 + (cv * h0 - sv * h1) * dh1;
+        float h0_acc = 0.0f, h1_acc = 0.0f;
+        int n_prev = 0;
+        for (long ax = 0; ax < ndims; ax++) {
+            if (coords[ax] > 0) {
+                long prev_t = t - strides[ax];
+                h0_acc += ws->h_seq[prev_t * N + i];
+                h1_acc += ws->h_seq[prev_t * N + i + 1];
+                n_prev++;
+            }
+        }
+        if (n_prev > 0) {
+            float h0 = h0_acc / (float)n_prev;
+            float h1 = h1_acc / (float)n_prev;
+            grads->g_theta[i >> 1] += ((-sv * h0 - cv * h1) * dh0 + (cv * h0 - sv * h1) * dh1);
+        }
     }
 }
 

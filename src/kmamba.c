@@ -30,7 +30,8 @@ void cuda_block_forward(
     float *d_B_exp, float *d_C_exp, float *d_dt_exp,
     float *d_h_store, float *d_y_scan, float *d_y_proj,
     float *d_lambda_raw, float *d_lambda,
-    int L, int state, int dim, int R);
+    int L, int state, int dim, int R,
+    int spatial_ndims, const long *spatial_dims);
 
 void cuda_block_backward(
     cublasHandle_t cublas,
@@ -46,7 +47,8 @@ void cuda_block_backward(
     float *d_dB_scan, float *d_dC_scan, float *d_ddt_scan,
     float *d_dy_scan, float *d_dA_tmp,
     float *d_dlambda, float *d_dlambda_raw,
-    int L, int state, int dim, int R);
+    int L, int state, int dim, int R,
+    int spatial_ndims, const long *spatial_dims);
 
 void gpu_optimizer_step(MambaBlock *block, const MBOptimConfig *conf);
 
@@ -345,8 +347,9 @@ KMamba* kmamba_create(const KMambaConfig *cfg) {
     if (!cfg) return NULL;
     
     /* Mandatory field validation - No hidden fallbacks */
-    if (cfg->vocab_size == 0 || cfg->dim == 0 || cfg->state_size == 0 || cfg->seq_len == 0 || cfg->n_layers == 0) {
-        fprintf(stderr, "kmamba_create: missing mandatory config (vocab_size, dim, state_size, seq_len, n_layers)\n");
+    /* vocab_size=0 is valid for vision models (no vocabulary) */
+    if (cfg->dim == 0 || cfg->state_size == 0 || cfg->seq_len == 0 || cfg->n_layers == 0) {
+        fprintf(stderr, "kmamba_create: missing mandatory config (dim, state_size, seq_len, n_layers)\n");
         return NULL;
     }
     if (cfg->max_ndims <= 0 || cfg->max_ndims > KMAMBA_CONFIG_MAX_NDIMS) {
@@ -372,12 +375,19 @@ KMamba* kmamba_create(const KMambaConfig *cfg) {
     
     size_t V = m->cfg.vocab_size;
     size_t D = m->cfg.dim;
-    
-    m->embedding = (float *)malloc(V * D * sizeof(float));
-    m->head = (float *)malloc(D * V * sizeof(float));
-    if (!m->embedding || !m->head) {
-        kmamba_free(m);
-        return NULL;
+
+    /* Only allocate embedding and head for language models (vocab_size > 0) */
+    /* Vision models (vocab_size == 0) don't need these */
+    if (V > 0) {
+        m->embedding = (float *)malloc(V * D * sizeof(float));
+        m->head = (float *)malloc(D * V * sizeof(float));
+        if (!m->embedding || !m->head) {
+            kmamba_free(m);
+            return NULL;
+        }
+    } else {
+        m->embedding = NULL;
+        m->head = NULL;
     }
     m->layers = (MambaBlock **)malloc(m->cfg.n_layers * sizeof(MambaBlock *));
     if (!m->layers) {
@@ -531,7 +541,8 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
                                l->gpu.d_B_exp, l->gpu.d_C_exp, NULL,
                                l->gpu.d_h_store, l->gpu.d_y_scan, l->gpu.d_y_proj,
                                l->gpu.d_lambda_raw, l->gpu.d_lambda,
-                               (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(l->config.mimo_rank));
+                               (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(l->config.mimo_rank),
+                               l->config.spatial_ndims, l->config.spatial_dims);
         }
         cuda_head_forward(handle, m->gpu.d_head, d_acts + n_layers * L * D, d_logits, (int)L, (int)D, (int)V);
         
@@ -563,8 +574,9 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
                                 l->gpu.d_u_raw, l->gpu.d_u, l->gpu.d_dt_raw, l->gpu.d_dt,
                                 l->gpu.d_B_exp, l->gpu.d_C_exp, NULL,
                                 l->gpu.d_h_store, l->gpu.d_y_scan,
-                                l->gpu.d_lambda, l->gpu.d_lambda_raw, /* Add missing workspace if needed */
-                                (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(l->config.mimo_rank));
+                                l->gpu.d_lambda, l->gpu.d_lambda_raw,
+                                (int)L, (int)l->config.state_size, (int)D, (int)_mimo_R(l->config.mimo_rank),
+                                l->config.spatial_ndims, l->config.spatial_dims);
         }
         
         /* Embedding gradient accumulation on GPU */

@@ -27,7 +27,8 @@ int main(void) {
         .default_lambda = 0.5f,
         .use_a_log_clamp = 1,
         .a_log_min = -1e-5f,
-        .spatial_ndims = 0,
+        .spatial_ndims = 2,
+        .spatial_dims = {4, 4},
         .use_convnd = 0
     };
 

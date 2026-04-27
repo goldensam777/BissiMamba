@@ -240,7 +240,8 @@ extern "C" void cuda_block_forward(
     float *d_B_exp,   float *d_C_exp, float *d_dt_exp, /* [L, N*R] / [L, N*R] */
     float *d_h_store, float *d_y_scan, float *d_y_proj, /* [L,N] / [L,R] / [L,dim] */
     float *d_lambda_raw, float *d_lambda,  /* [L] workspace for lambda */
-    int L, int state, int dim, int R)  /* R = mimo_rank (1 = SISO) */
+    int L, int state, int dim, int R,  /* R = mimo_rank (1 = SISO) */
+    int spatial_ndims, const long *spatial_dims)
 {
     if (!cublas) return;
     const float a1 = 1.0f, b0 = 0.0f;
@@ -267,13 +268,12 @@ extern "C" void cuda_block_forward(
       cuda_sigmoid_fwd_kernel<<<blk_l, 256>>>(d_lambda_raw, d_lambda, L); }
 
     /* 5. SSM scan via unified ScanND backend */
-    long h_L = (long)L;
     ScanNDParams p;
     p.max_ndims = 8;
     p.max_state = 64;
     p.use_fast_exp = 0;
-    p.dims = &h_L; 
-    p.ndims = 1;
+    p.dims = spatial_dims;
+    p.ndims = spatial_ndims;
     p.D = (long)state;
     p.M = 1;
     p.x = d_u;
@@ -342,7 +342,8 @@ extern "C" void cuda_block_backward(
     float *d_dA_tmp,            /* [state]   scan gradient de A (tmp) */
     float *d_dlambda,           /* [L]       scan gradient of lambda */
     float *d_dlambda_raw,       /* [L]       grad through sigmoid */
-    int L, int state, int dim, int R)   /* R = mimo_rank */
+    int L, int state, int dim, int R,   /* R = mimo_rank */
+    int spatial_ndims, const long *spatial_dims)
 {
     const float a1 = 1.0f, b0 = 0.0f;
     int NR = state * R;
@@ -357,13 +358,12 @@ extern "C" void cuda_block_backward(
     gemm(cublas, L, R, dim, a1, d_dy, d_W_out, b0, d_dy_scan);
 
     /* ── Backward complex SSM (via ScanND) ─────────────────────── */
-    long h_L = (long)L;
     ScanNDParams p;
     p.max_ndims = 8;
     p.max_state = 64;
     p.use_fast_exp = 0;
-    p.dims = &h_L;
-    p.ndims = 1;
+    p.dims = spatial_dims;
+    p.ndims = spatial_ndims;
     p.D = (long)state;
     p.M = 1;
     p.x = d_u;
