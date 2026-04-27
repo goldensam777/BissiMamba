@@ -53,7 +53,6 @@ endif
 
 # ═══════════════════════════════════════════════════════════════
 # libkser Integration
-# ═══════════════════════════════════════════════════════════════
 KSER_DIR = libs/kser
 KSER_LIB = $(KSER_DIR)/libkser.a
 KSER_LDFLAGS = -L$(KSER_DIR) -lkser -Wl,-rpath,$(KSER_DIR)
@@ -98,7 +97,7 @@ CUDA_OBJS = $(patsubst %.cu,cuda/%.o,$(notdir $(CUDA_SRCS)))
 
 TARGET = libkmamba.a
 
-# Modèles obsolètes supprimés - utiliser k-mamba-train (CLI principal)
+# k-mamba-train (CLI principal)
 
 # ═══════════════════════════════════════════════════════════════
 # Cibles principales (cpu / cuda / all)
@@ -197,9 +196,6 @@ endif
 ifeq ($(CUDA_AVAILABLE),1)
 K_MAMBA_TRAIN_LDFLAGS += $(CUDA_LDFLAGS)
 endif
-
-# K-Mamba Training CLI
-K_MAMBA_TRAIN_OBJS = models/main.o models/config_presets.o models/cifar10.o models/moving_mnist.o models/synthetic_2d.o
 
 ifeq ($(RUST_AVAILABLE),1)
 k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
@@ -300,6 +296,7 @@ clean:
 	rm -f $(OBJS)
 	rm -f src/*.o kernels/*.o cpu/*.o models/*.o
 	rm -f cuda/*.o
+	rm -f model.o train.o
 	rm -f test_mamba3 test_mamba3_gpu test_trainer_gc
 	rm -f tests/unit/bench_convnd tests/unit/bench_convnd_cuda tests/unit/test_convnd_separable_cuda
 	$(MAKE) -C $(KSER_DIR) clean 2>/dev/null || true
@@ -309,8 +306,10 @@ endif
 
 distclean: clean
 	rm -f $(TARGET) $(RUST_LIB)
+	rm -f model train k-mamba-train
+	rm -f checkpoint.ser checkpoint.ser.opt checkpoint.ser.state
 	rm -rf models/
-	rm -f k-mamba-train
+	rm -rf logs/
 
 # ═══════════════════════════════════════════════════════════════
 # Help
@@ -330,3 +329,26 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  CPU_ONLY=1            - Forcer compilation CPU sans CUDA"
+
+# Config library
+CONFIGS_OBJ = src/configs.o
+
+# Model executable
+MODEL_OBJ = model.o $(CONFIGS_OBJ)
+model: $(MODEL_OBJ) libkmamba.a $(KSER_LIB)
+	$(CC) $(CFLAGS) -o $@ $(MODEL_OBJ) -L. -lkmamba $(KSER_LDFLAGS) -lm $(CUDA_LDFLAGS)
+
+src/configs.o: src/configs.c include/configs.h
+	$(CC) $(CFLAGS) -c src/configs.c -o src/configs.o
+
+model.o: model.c include/configs.h
+	$(CC) $(CFLAGS) -c model.c -o model.o
+
+# Training executable
+TRAIN_OBJ = train.o $(CONFIGS_OBJ)
+train: $(TRAIN_OBJ) libkmamba.a $(KSER_LIB)
+	$(CC) $(CFLAGS) -o $@ $(TRAIN_OBJ) -L. -lkmamba $(KSER_LDFLAGS) -lm $(CUDA_LDFLAGS)
+
+train.o: train.c include/configs.h libs/train_set/include/trainer.h
+	$(CC) $(CFLAGS) -Ilibs/train_set/include -c train.c -o train.o
+
