@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="figures/k_mamba_banner.svg" alt="K-Mamba banner" width="100%" />
-</p>
-
 # k-mamba
 
 **Bibliothèque C zero-dependency pour Mamba-ND natif.**
@@ -10,6 +6,10 @@ ScanND + ConvND unifiés sous un même squelette wavefront parallèle.
 
 [![Build](https://img.shields.io/badge/build-makefile-blue)](Makefile)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![Language](https://img.shields.io/badge/language-C-blue)
+![CUDA](https://img.shields.io/badge/CUDA-supported-green)
+![Zero-Dependency](https://img.shields.io/badge/zero--dependency-✓-success)
+![Platform](https://img.shields.io/badge/platform-Linux-blue)
 
 ---
 
