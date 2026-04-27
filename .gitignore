@@ -9,6 +9,9 @@
 mamba_demo
 mamba_advanced
 mamba_train
+model
+train
+k-mamba-train
 
 # Temporary files
 *.swp
@@ -64,3 +67,22 @@ CONCEPT.md
 
 # Rust Packages
 tokenizer_rs/target
+
+# Generated libraries at root
+/libkmamba.a
+
+# Checkpoints
+checkpoint.ser
+checkpoint.ser.opt
+checkpoint.ser.state
+*.ser
+*.ser.opt
+*.ser.state
+
+# Logs directory
+logs/
+
+# Papers and figures (generated artifacts)
+paper_fr/
+paper_en/
+figures/
