@@ -1,8 +1,8 @@
 # k-mamba
 
-**Zero-dependency C library for native N-dimensional Mamba.**
+**Zero-dependency C framework for Mamba-ND training.**
 
-Unified ScanND + ConvND. CLI model/train. Native Gradient Checkpointing.
+CLI model/train · Native Gradient Checkpointing · .ser serialization
 
 [![Build](https://img.shields.io/badge/build-makefile-blue)](Makefile)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -15,137 +15,144 @@ Unified ScanND + ConvND. CLI model/train. Native Gradient Checkpointing.
 
 ## Table of Contents
 
-- [Innovations](#innovations)
+- [Philosophy](#philosophy)
 - [Architecture](#architecture)
+- [CLI Workflow](#cli-workflow)
+- [JSON Configuration](#json-configuration)
 - [Build](#build)
-- [API](#api)
+- [Programmatic API](#programmatic-api)
 - [Documentation](#documentation)
-- [Benchmarks](#benchmarks)
 
 ---
 
-## Innovations
+## Philosophy
 
-### 1. Native Mamba-ND (N-dimensional)
+**Three-layer architecture** with clear separation of concerns:
 
-Native extension from Mamba 1D to N dimensions via **simultaneous recurrence**:
+| Layer | Role | Location | Complexity |
+|-------|------|----------|------------|
+| **Orchestration** | Model logic, API, CLI, training loop | `src/*.c`, `model.c`, `train.c` | Trivial (5-10 lines/op) |
+| **Topology** | ND indexing, wavefront scheduling | `src/km_topology.c`, `src/wavefront_*.c` | ND geometry |
+| **Kernels** | Compute engine, pure math | `kernels/*.c`, `cuda/*.cu` | Intensive (millions of iterations) |
 
-```math
-h(n) = Σ_{k=1}^{N} A_k · h(n − e_k) + B(n) · x(n)
-```
+**Golden rule**: If it's trivial, it goes in `src/`. If it loops millions of times, it goes in `kernels/`.
 
-| Operator | Implementation | Wavefront | Parallelism |
-|----------|---------------|-----------|--------------|
-| **Scan 1D** | ASM AVX2 | N/A | Sequential |
-| **Scan 2D** | ASM AVX2 | Anti-diagonal | Intra-diagonal |
-| **Scan ND** | Pure C | Implicit geometric | Optional OpenMP |
-| **ConvND Dense** | Pure C | Unified K^N wavefront | Optional OpenMP |
-| **ConvND Separable** | Pure C | 1D cascade wavefront | Optional OpenMP | **4–5× faster** |
+### Technical Innovations
 
-### 2. Wavefront Unification
-
-**ScanND** and **ConvND** share the same topological skeleton:
-
-- Same wavefront generator (`KMWavefrontPlan`)
-- Same level-by-level ordering
-- Same intra-level parallelism (OpenMP)
-
-```c
-// ConvND Dense — complete K^N kernel
-convnd_forward_wavefront(p, plan);
-
-// ConvND Separable — cascade of N 1D convolutions (Mamba-classic)
-convnd_separable_forward_wavefront(p, plans_per_axis);  // 4–5× faster
-```
-
-**Theorem**: For a $d \times d$ grid, wavefront scheduling requires $2d - 1$ sequential steps, each exposing up to $d$ parallel tasks:
-
-$$S(d) = \frac{d^2}{2d - 1} \approx \frac{d}{2} \quad (d \gg 1)$$
-
-Measured: **32.25×** speedup at $d = 64$ (Table `bench_paper.c`).
-
-**Benchmark** (2D grid 256×256, D=64, K=3): Dense 135ms → Separable 35ms = **3.9× speedup**. See `figures/convnd_dense_vs_separable.png` and section 8 of THEORY.md.
-
-### 3. Native CPU MUON
-
-Pure C implementation of the MUON optimizer:
-
-- Newton-Schulz (5 iterations)
-- Nesterov momentum + gradient clipping
-- AdamW with weight decay
-- **Zero dependency**
-
-### 4. GPU Optimizations (CUDA)
-
-#### Parallel Scan (Blelloch)
-
-Work-efficient parallel SSM scan using Blelloch's algorithm over the monoid $(\otimes, (1,0))$:
-
-$$h_t = A_t · h_{t-1} + B_t · x_t  → (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})$$
-
-**Complexity**: Depth $O(\log L)$, Work $O(L)$ — $51\times$ reduction at $L=1024$.
-
-| Method | Depth | Parallelism |
-|--------|-------|-------------|
-| CPU sequential | $O(L)$ | $O(1)$ |
-| CUDA sequential | $O(L)$ | $O(D \times M)$ |
-| **Blelloch CUDA** | $O(\log L)$ | $O(L \times D \times M)$ |
-
-Theoretical speedup: **790×** for $L=1024$, $D=128$, $M=16$.
-
-#### Mixed Precision FP16/BF16
-- **FP16**: Dynamic loss scaling (65536.0f) to prevent underflow
-- **BF16**: Native FP32 range, no scaling required
-- **Tensor Cores**: Accelerated GEMM via cuBLAS
-
-#### Gradient Checkpointing
-- Memory reduction O(L×N×D) → O(N×D)
-- Policies: `none`, `per-layer`, `per-block`
-- Recompute forward during backward
-
-#### Multi-GPU (Optional NCCL)
-- Data parallelism: split batch
-- Pipeline parallelism: split layers
-- **Zero dependency**: NCCL optional
-
-### 5. Separable vs Dense: CPU vs GPU
-
-Surprising finding from our benchmarks:
-
-| Platform | Winner | Speedup |
-|----------|--------|---------|
-| **CPU** | Separable | 3–4× faster |
-| **GPU** | Dense | 1.3× faster |
-
-**Why?** On GPU, the dense kernel exploits parallelism better (single kernel launch, better memory coalescing), while the separable cascade has overhead from multiple kernel launches and ping-pong buffers. On CPU, the reduced computational complexity (K^N vs N×K) dominates.
-
-See benchmark graphs:
-- CPU: `figures/convnd_dense_vs_separable.png`
-- GPU: `figures/convnd_cuda_dense_vs_separable.png`
-
-### 6. Zero Dependency
-
-- **CPU**: `gcc`, `nasm`, `libc`, `libm`
-- **Build**: Simple Makefile (no CMake)
-- **Kernels**: Pure inline C (no external BLAS)
-- **Optional**: OpenMP, CUDA, NCCL
+1. **Native Mamba-ND**: N-dimensional extension via simultaneous recurrence
+2. **Wavefront Unification**: ScanND and ConvND share the same topological skeleton
+3. **Zero Dependency**: Just `gcc`, `nasm`, `libc` — no BLAS, no CMake
 
 ---
 
 ## Architecture
 
-### Layered Design
+### Three-Layer Separation
 
-The project follows a clean separation of concerns across three layers:
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ORCHESTRATION (src/)                                       │
+│  model.c, train.c, configs.c, kmamba.c                      │
+│  → API, CLI, training loop, checkpoint I/O                  │
+├─────────────────────────────────────────────────────────────┤
+│  TOPOLOGY (src/km_topology.c, src/wavefront_*.c)          │
+│  → ND indexing, wavefront scheduling, execution plans       │
+├─────────────────────────────────────────────────────────────┤
+│  KERNELS (kernels/, cuda/, cpu/)                            │
+│  → GEMM, activations, scan ND, ConvND, optimizers (AdamW)  │
+└─────────────────────────────────────────────────────────────┘
+```
 
-| Layer | Role | Location |
-|-------|------|----------|
-| **Orchestration** | Model logic, API, training loop | `src/kmamba.c`, `src/mamba_block.c` |
-| **Topology** | ND indexing, wavefront scheduling | `src/km_topology.c`, `src/wavefront_*.c` |
-| **Kernels** | Compute-intensive operations | `kernels/*.c`, `cuda/*.cu`, `cpu/*.asm` |
-| **Training** | Gradient Checkpointing, trainer logic | `libs/train_set/trainer.h` |
+### Key Modules
 
-**Design Principle**: High-level model code (5-10 lines per operation) stays in `src/`. Performance-critical loops (millions of iterations) go in `kernels/`. Gradient Checkpointing is handled by the Trainer in `libs/train_set/`.
+| Module | Files | Function |
+|--------|-------|----------|
+| **CLI** | `model.c`, `train.c`, `scripts/train.sh` | Model creation → Training |
+| **Config** | `src/configs.c`, `include/configs.h` | Unified JSON (model + optimizer + backend) |
+| **Trainer** | `libs/train_set/src/trainer.c` | Gradient Checkpointing, `trainer_run()`, progress tables |
+| **Serialization** | `libs/kser/`, `src/kmamba_ser.c` | `.ser` format (model + vocab + tensors) |
+| **Backends** | `include/kmamba_cuda_utils.h` | Auto-detect CPU/GPU |
+
+---
+
+## CLI Workflow
+
+### 1. Create the model
+
+```bash
+./model configs/cifar10.json
+```
+
+Creates the model from JSON config and saves to `checkpoint.ser`.
+
+### 2. Train the model
+
+```bash
+./train configs/cifar10.json --batch_size=16 --epochs=10 --backend=cpu
+```
+
+Options:
+- `--batch_size=N` : Batch size (default: 8)
+- `--epochs=N` : Number of epochs (default: 3)
+- `--backend=cpu|gpu` : Force backend (default: from JSON or auto)
+
+### 3. Complete pipeline script
+
+```bash
+./scripts/train.sh configs/cifar10.json --batch_size=16 --epochs=10
+```
+
+Displays a progress table during training:
+
+```
+┌───────┬─────────┬─────────┬───────────┬───────────┬───────────┐
+│ Epoch │  Loss   │ Acc (%) │ Samples/s │ Time (ms) │    LR     │
+├───────┼─────────┼─────────┼───────────┼───────────┼───────────┤
+│ 1     │  0.6931 │   50.20 │    1245.3 │    803.1  │  3.00e-04 │
+│ 2     │  0.5421 │   65.40 │    1289.2 │    775.6  │  3.00e-04 │
+└───────┴─────────┴─────────┴───────────┴───────────┴───────────┘
+```
+
+---
+
+## JSON Configuration
+
+Unified JSON format for architecture, optimizer and backend:
+
+```json
+{
+    "model_name": "k-mamba-cifar10",
+    "dim": 128,
+    "state_size": 16,
+    "n_layers": 4,
+    "seq_len": 64,
+    "spatial_ndims": 2,
+    "spatial_dims": [8, 8],
+    "use_convnd": 1,
+    "convnd_K": 3,
+    "convnd_ndims": 2,
+    "mimo_rank": 1,
+    "default_lambda": 0.5,
+    "use_a_log_clamp": 1,
+    "a_log_min": -5.0,
+    "dt_min": 0.0001,
+    "dt_max": 0.01,
+    "lr": 0.0003,
+    "mu": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-8,
+    "clip_norm": 1.0,
+    "weight_decay": 0.05,
+    "backend": 1,
+    "gpu_device": -1
+}
+```
+
+| Parameter | Description | Values |
+|-----------|-------------|--------|
+| `backend` | Computation backend | `0`=AUTO, `1`=CPU, `2`=GPU |
+| `spatial_ndims` | Spatial dimensions | `1`, `2`, `3` |
+| `use_convnd` | Enable ConvND | `0`=no, `1`=yes |
 
 ---
 
@@ -199,122 +206,51 @@ make tests
 
 ---
 
-## API
+## Programmatic API
 
-### Quick Example
+### Create from JSON
 
 ```c
-#include <kmamba.h>
+#include "configs.h"
 
-// Configuration
-KMambaConfig cfg = {
-    .vocab_size = 256,
-    .dim = 384,
-    .state_size = 1024,
-    .seq_len = 128,
-    .n_layers = 1
-};
-
-// Create model
-KMamba *model = kmamba_create(&cfg);
-
-// Forward pass
-kmamba_forward(model, tokens, logits);
-
-// Enable training
-MBOptimConfig opt = {.lr = 1e-3f, .clip_norm = 1.0f};
-kmamba_enable_training(model, &opt, 1e-3f, 1e-5f);
-
-// Training step
-float loss = kmamba_train_step(model, tokens_plus1);
-
-// Cleanup
-kmamba_free(model);
+KMambaFullConfig cfg;
+kmamba_configs_load_json(&cfg, "configs/cifar10.json");
+KMamba *m = kmamba_configs_create_model(&cfg);  // Creates + enables AdamW
+kmamba_save(m, "checkpoint.ser");  // .ser serialization
 ```
 
-### CLI Usage
-
-Create a model from JSON config and train it:
-
-```bash
-# Build CLI tools
-make model train
-
-# Create model from config
-./model configs/cifar10.json
-
-# Train the model
-./train configs/cifar10.json --batch_size=16 --epochs=10 --backend=cpu
-
-# Or use the pipeline script
-./scripts/train.sh configs/cifar10.json --batch_size=16 --epochs=10
-```
-
-### JSON Configuration
-
-```json
-{
-    "model_name": "k-mamba-cifar10",
-    "dim": 128,
-    "state_size": 16,
-    "n_layers": 4,
-    "seq_len": 64,
-    "spatial_ndims": 2,
-    "spatial_dims": [8, 8],
-    "backend": 1,
-    "lr": 0.0003,
-    "weight_decay": 0.05
-}
-```
-
-### Trainer API
+### Complete Training
 
 ```c
 #include "trainer.h"
 
-// Load config and create model
-KMambaFullConfig cfg;
-kmamba_configs_load_json(&cfg, "configs/cifar10.json");
-KMamba *m = kmamba_configs_create_model(&cfg);
+// Load model
+KMamba *m = kmamba_load("checkpoint.ser", 1, &optim_cfg, lr, wd);
 
-// Create trainer and run training
-TrainerGCConfig gc = {.policy = TRAINER_GC_NONE};
+// Configure Gradient Checkpointing
+TrainerGCConfig gc = {
+    .policy = TRAINER_GC_EVERY_N,  // NONE, EVERY_N, ALL
+    .checkpoint_every_n = 2
+};
+
+// Create trainer
 Trainer *t = trainer_create(m, &gc);
+
+// Run training with progress table
 trainer_run(t, data, labels, n_samples, L, D, num_classes,
-            batch_size, epochs, "checkpoint.ser", verbose);
+            batch_size, epochs, "checkpoint.ser", verbose=1);
+
+// Save checkpoint (model + training state)
+trainer_save_checkpoint(t, "checkpoint.ser");
 ```
 
-### ConvND API
+### Gradient Checkpointing Policies
 
-```c
-#include <convnd.h>
-
-// Dense convolution
-ConvNDParams p = {
-    .input = input,      // [spatial, D]
-    .output = output,    // [spatial, D]
-    .kernel = kernel,    // [K^ndims, D]
-    .bias = bias,        // [D] or NULL
-    .dims = dims,        // shape [ndims]
-    .ndims = 2,          // 2D, 3D, etc.
-    .D = 64,             // channels
-    .K = 3               // kernel size
-};
-convnd_forward_wavefront(&p, plan);
-
-// Separable convolution (faster on CPU)
-float *kernel_axes[2] = {kernel_x, kernel_y};
-ConvNDSeparableParams p_sep = {
-    .input = input,
-    .output = output,
-    .kernel_axes = kernel_axes,  // [ndims] 1D kernels
-    .dims = dims,
-    .ndims = 2,
-    .D = 64,
-    .K = 3
-};
-convnd_separable_forward_wavefront(&p_sep, NULL);
-```
+| Policy | Memory | Speed | Use Case |
+|--------|--------|-------|----------|
+| `TRAINER_GC_NONE` | High | Fast | GPUs with sufficient memory |
+| `TRAINER_GC_EVERY_N` | Medium | Medium | Balanced (recommended) |
+| `TRAINER_GC_ALL` | Minimal | Slow | Memory-limited GPUs |
 
 ---
 
@@ -323,12 +259,18 @@ convnd_separable_forward_wavefront(&p_sep, NULL);
 | File | Content |
 |------|---------|
 | `THEORY.md` | Mathematical foundations, wavefront topology, proofs |
-| `ARCHITECTURE.md` | Code structure, Volontés/Puissance philosophy |
+| `ARCHITECTURE.md` | Code structure, three-layer philosophy |
 | `AGENTS.md` | Project context for AI agents |
 | `README.md` | This file (French) |
 | `README_EN.md` | This file (English) |
 
 ---
+
+## Author
+
+**YEVI Mawuli Peniel Samuel** — IFRI-UAC, Bénin
+
+_*Optima, Immo Absoluta Perfectio*_
 
 ## Benchmarks
 

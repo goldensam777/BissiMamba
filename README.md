@@ -1,8 +1,8 @@
 # k-mamba
 
-**Bibliothèque C zero-dependency pour Mamba-ND natif.**
+**Framework C zero-dependency pour entraînement Mamba-ND.**
 
-ScanND + ConvND unifiés. CLI model/train. Gradient Checkpointing natif.
+CLI model/train · Gradient Checkpointing natif · Sérialisation .ser
 
 [![Build](https://img.shields.io/badge/build-makefile-blue)](Makefile)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -15,138 +15,75 @@ ScanND + ConvND unifiés. CLI model/train. Gradient Checkpointing natif.
 
 ## Table des matières
 
-- [Innovations](#innovations)
-- [Structure](#structure)
+- [Philosophie](#philosophie)
+- [Architecture](#architecture)
+- [Workflow CLI](#workflow-cli)
+- [Configuration JSON](#configuration-json)
 - [Build](#build)
-- [API](#api)
+- [API Programmatique](#api-programmatique)
 - [Documentation](#documentation)
 
 ---
 
-## Innovations
+## Philosophie
 
-### 1. Mamba-ND natif (N-dimensionnel)
+**Architecture en trois couches** avec séparation claire des responsabilités :
 
-Extension native de Mamba 1D vers N dimensions via **récurrence simultanée** :
+| Couche | Rôle | Localisation | Complexité |
+|--------|------|--------------|------------|
+| **Orchestration** | Logique modèle, API, CLI | `src/*.c`, `model.c`, `train.c` | Triviale (5-10 lignes/op) |
+| **Topologie** | Indexation ND, wavefront scheduling | `src/km_topology.c`, `src/wavefront_*.c` | Géométrie ND |
+| **Kernels** | Compute engine, math pure | `kernels/*.c`, `cuda/*.cu` | Intensive (millions d'itérations) |
 
-```math
-h(n) = Σ_{k=1}^{N} A_k · h(n − e_k) + B(n) · x(n)
-```
 
-| Opérateur | Implémentation | Wavefront | Parallélisme |
-|-----------|---------------|-----------|--------------|
-| **Scan 1D** | ASM AVX2 | N/A | Séquentiel |
-| **Scan 2D** | ASM AVX2 | Anti-diagonale | Intra-diagonale |
-| **Scan ND** | C pur | Géométrique implicite | OpenMP optionnel |
-| **ConvND Dense** | C pur | Wavefront unifié $K^N$ | OpenMP optionnel |
-| **ConvND Séparable** | C pur | Cascade 1D wavefront | OpenMP optionnel | **4–5× plus rapide** |
+### Innovations techniques
 
-### 2. Unification Wavefront
-
-**ScanND** et **ConvND** partagent le même squelette topologique :
-
-- Même générateur de wavefront (`KMWavefrontPlan`)
-- Même ordonnancement niveau par niveau
-- Même parallélisme intra-niveau (OpenMP)
-
-```c
-// ConvND Dense — noyau complet K^N
-convnd_forward_wavefront(p, plan);
-
-// ConvND Séparable — cascade de N convolutions 1D (Mamba-classic)
-convnd_separable_forward_wavefront(p, plans_per_axis);  // 4–5× plus rapide
-```
-
-**Théorème** : Pour une grille $d \times d$, l'ordonnancement par front d'onde nécessite $2d - 1$ étapes séquentielles, chacune exposant jusqu'à $d$ tâches parallèles :
-
-$$S(d) = \frac{d^2}{2d - 1} \approx \frac{d}{2} \quad (d \gg 1)$$
-
-Mesuré : **32.25×** de speedup à $d = 64$ (Table `bench_paper.c`).
-
-**Benchmark** (grille 2D 256×256, D=64, K=3) : Dense 135ms → Séparable 35ms = **3.9× speedup**. Voir [`figures/convnd_dense_vs_separable.png`](figures/convnd_dense_vs_separable.png) et section 8 de THEORY.md.
-
-### 3. MUON natif CPU
-
-Implémentation C pure de l'optimiseur MUON :
-
-- Newton-Schulz (5 itérations)
-- Momentum Nesterov + gradient clipping
-- AdamW avec weight decay
-- **Zero dependency**
-
-### 4. GPU Optimizations (CUDA)
-
-#### Parallel Scan (Blelloch)
-
-Scan SSM parallèle work-efficient utilisant l'algorithme de Blelloch sur le monoïde $(\otimes, (1,0))$ :
-
-$$h_t = A_t · h_{t-1} + B_t · x_t    →    (A_t, B_t·x_t) ⊗ (A_{t-1}, B_{t-1}·x_{t-1})$$
-
-**Complexité** : Profondeur $O(\log L)$, Travail $O(L)$ — réduction de $51×$ à $L=1024$.
-
-| Méthode | Profondeur | Parallélisme |
-|---------|-----------|--------------|
-| CPU séquentiel | $O(L)$ | $O(1)$ |
-| CUDA séquentiel | $O(L)$ | $O(D \times M)$ |
-| **Blelloch CUDA** | $O(\log L)$ | $O(L \times D \times M)$ |
-
-Accélération théorique : **790×** pour $L=1024$, $D=128$, $M=16$.
-
-#### Mixed Precision FP16/BF16
-- **FP16** : Loss scaling dynamique (65536.0f) pour éviter underflow
-- **BF16** : Range FP32 natif, pas de scaling nécessaire
-- **Tensor Cores** : GEMM accéléré via cuBLAS
-
-#### Gradient Checkpointing
-- Réduction mémoire O(L×N×D) → O(N×D)
-- Politiques : `none`, `per-layer`, `per-block`
-- Recompute forward during backward
-
-#### Multi-GPU (Optional NCCL)
-- Data parallelism : split batch
-- Pipeline parallelism : split layers
-- **Zero dependency** : NCCL optionnel
-
-### 5. Zero Dependency
-
-- **CPU** : `gcc`, `nasm`, `libc`, `libm`
-- **Build** : Makefile simple (pas CMake)
-- **Kernels** : C pur inline (pas BLAS externe)
-- **Optionnel** : OpenMP, CUDA, NCCL
+1. **Mamba-ND natif** : Extension N-dimensionnelle via récurrence simultanée
+2. **Unification Wavefront** : ScanND et ConvND partagent le même squelette topologique
+3. **Zero Dependency** : Juste `gcc`, `nasm`, `libc` — pas de BLAS, pas de CMake
 
 ---
 
-## Structure
+## Architecture
+
+### Trois couches de séparation
 
 ```
-k-mamba/
-├── include/
-│   ├── kmamba.h              # API publique
-│   ├── kmamba_kernels.h      # Kernels inline
-│   ├── km_topology.h         # Topologie ND
-│   ├── wavefront_nd.h        # Générateur wavefront
-│   ├── wavefront_plan.h      # Plans exécutables
-│   ├── scan_nd.h             # Interface scan
-│   └── convnd.h              # ConvND wavefront unifiée
-├── src/
-│   ├── kmamba.c              # Orchestration
-│   ├── mamba_block.c         # Bloc SSM
-│   ├── km_topology.c         # Topologie
-│   ├── wavefront_nd.c        # Wavefront
-│   ├── wavefront_plan.c      # Plans
-│   ├── scan_nd.c             # Scan ND
-│   └── convnd.c              # ConvND wavefront parallèle
-├── kernels/                   # Kernels inline C pur
-├── cpu/                       # ASM AVX2
-├── cuda/                      # CUDA (optionnel)
-├── libs/train_set/            # Trainer avec Gradient Checkpointing
-├── configs/                   # Configurations JSON (CIFAR-10, etc.)
-├── scripts/                   # Scripts utilitaires
-│   └── train.sh               # Pipeline model → train
-├── model.c                    # CLI création modèle
-├── train.c                    # CLI entraînement
-├── Makefile
-└── build.sh
+┌─────────────────────────────────────────────────────────────┐
+│  ORCHESTRATION (src/)                                       │
+│  model.c, train.c, configs.c, kmamba.c                      │
+│  → API, CLI, boucle d'entraînement, I/O checkpoints          │
+├─────────────────────────────────────────────────────────────┤
+│  TOPOLOGIE (src/km_topology.c, src/wavefront_*.c)          │
+│  → Indexation ND, wavefront scheduling, plans d'exécution    │
+├─────────────────────────────────────────────────────────────┤
+│  KERNELS (kernels/, cuda/, cpu/)                            │
+│  → GEMM, activations, scan ND, ConvND, optimizers (AdamW)   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Modules clés
+
+| Module | Fichiers | Fonction |
+|--------|----------|----------|
+| **CLI** | `model.c`, `train.c`, `scripts/train.sh` | Création modèle → Entraînement |
+| **Config** | `src/configs.c`, `include/configs.h` | JSON unifié (modèle + optimizer + backend) |
+| **Trainer** | `libs/train_set/src/trainer.c` | Gradient Checkpointing, `trainer_run()`, tables de progression |
+| **Sérialisation** | `libs/kser/`, `src/kmamba_ser.c` | Format `.ser` (modèle + vocab + tensors) |
+| **Backends** | `include/kmamba_cuda_utils.h` | Auto-détection CPU/GPU |
+
+### Workflow complet
+
+```
+JSON config ──→ ./model ──→ checkpoint.ser ──→ ./train ──→ modèle entraîné
+     │              │              │              │
+     │              │              │              └── trainer_run()
+     │              │              │                  ├── Gradient Checkpointing
+     │              │              │                  ├── Tables de progression
+     │              │              │                  └── Resume checkpoint
+     │              │              └── kmamba_save()
+     │              └── kmamba_configs_create_model()
+     └── kmamba_configs_load_json()
 ```
 
 ---
@@ -159,60 +96,63 @@ k-mamba/
 - `nasm >= 2.15`
 - `libc`, `libm`
 - CPU AVX2 (Intel Haswell+ / AMD Ryzen+)
+- **Optionnel** : CUDA Toolkit (pour GPU)
 
-### Compilation
-
-```bash
-cd k-mamba
-make
-```
-
-### Output
-
-```
-libkmamba.a   # Bibliothèque statique
-model         # CLI création modèle
-train         # CLI entraînement
-```
-
-### CLI - Création et Entraînement
+### Cibles Makefile
 
 ```bash
-# 1. Compiler les outils CLI
-make model train
-
-# 2. Créer un modèle depuis un fichier JSON
-./model configs/cifar10.json
-
-# 3. Lancer l'entraînement
-./train configs/cifar10.json --batch_size=16 --epochs=10
-
-# Ou utiliser le script pipeline
-./scripts/train.sh configs/cifar10.json --batch_size=16 --epochs=10
+make              # Bibliothèque libkmamba.a
+make model        # CLI création modèle
+make train        # CLI entraînement
+make model train  # Les deux CLI
+make clean        # Nettoyage
 ```
 
 ---
 
-## API
+## Workflow CLI
 
-### Création
+### 1. Créer le modèle
 
-```c
-#include <kmamba.h>
-
-KMambaConfig cfg = {
-    .vocab_size = 256,
-    .dim        = 384,
-    .state_size = 1024,
-    .seq_len    = 128,
-    .n_layers   = 1
-};
-
-KMamba *m = kmamba_create(&cfg);
-kmamba_init(m, 1234);
+```bash
+./model configs/cifar10.json
 ```
 
-### Configuration JSON
+Crée le modèle depuis la config JSON et sauvegarde dans `checkpoint.ser`.
+
+### 2. Entraîner le modèle
+
+```bash
+./train configs/cifar10.json --batch_size=16 --epochs=10 --backend=cpu
+```
+
+Options :
+- `--batch_size=N` : Taille du batch (défaut: 8)
+- `--epochs=N` : Nombre d'époques (défaut: 3)
+- `--backend=cpu|gpu` : Forcer le backend (défaut: depuis JSON ou auto)
+
+### 3. Script pipeline complet
+
+```bash
+./scripts/train.sh configs/cifar10.json --batch_size=16 --epochs=10
+```
+
+Affiche une table de progression pendant l'entraînement :
+
+```
+┌───────┬─────────┬─────────┬───────────┬───────────┬───────────┐
+│ Epoch │  Loss   │ Acc (%) │ Samples/s │ Time (ms) │    LR     │
+├───────┼─────────┼─────────┼───────────┼───────────┼───────────┤
+│ 1     │  0.6931 │   50.20 │    1245.3 │    803.1  │  3.00e-04 │
+│ 2     │  0.5421 │   65.40 │    1289.2 │    775.6  │  3.00e-04 │
+└───────┴─────────┴─────────┴───────────┴───────────┴───────────┘
+```
+
+---
+
+## Configuration JSON
+
+Le format JSON unifie architecture, optimizer et backend :
 
 ```json
 {
@@ -223,41 +163,79 @@ kmamba_init(m, 1234);
     "seq_len": 64,
     "spatial_ndims": 2,
     "spatial_dims": [8, 8],
-    "backend": 1,
+    "use_convnd": 1,
+    "convnd_K": 3,
+    "convnd_ndims": 2,
+    "mimo_rank": 1,
+    "default_lambda": 0.5,
+    "use_a_log_clamp": 1,
+    "a_log_min": -5.0,
+    "dt_min": 0.0001,
+    "dt_max": 0.01,
     "lr": 0.0003,
-    "weight_decay": 0.05
+    "mu": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-8,
+    "clip_norm": 1.0,
+    "weight_decay": 0.05,
+    "backend": 1,
+    "gpu_device": -1
 }
 ```
 
-### Entraînement Programmatique
+| Paramètre | Description | Valeurs |
+|-----------|-------------|---------|
+| `backend` | Backend computation | `0`=AUTO, `1`=CPU, `2`=GPU |
+| `spatial_ndims` | Dimensions spatiales | `1`, `2`, `3` |
+| `use_convnd` | Activer ConvND | `0`=non, `1`=oui |
+
+---
+
+## API Programmatique
+
+### Création depuis JSON
+
+```c
+#include "configs.h"
+
+KMambaFullConfig cfg;
+kmamba_configs_load_json(&cfg, "configs/cifar10.json");
+KMamba *m = kmamba_configs_create_model(&cfg);  // Crée + active AdamW
+kmamba_save(m, "checkpoint.ser");  // Sérialisation .ser
+```
+
+### Entraînement complet
 
 ```c
 #include "trainer.h"
 
-// Charger config et créer modèle
-KMambaFullConfig cfg;
-kmamba_configs_load_json(&cfg, "configs/cifar10.json");
-KMamba *m = kmamba_configs_create_model(&cfg);
+// Charger le modèle
+KMamba *m = kmamba_load("checkpoint.ser", 1, &optim_cfg, lr, wd);
 
-// Créer trainer et lancer entraînement
-TrainerGCConfig gc = {.policy = TRAINER_GC_NONE};
-Trainer *t = trainer_create(m, &gc);
-trainer_run(t, data, labels, n_samples, L, D, num_classes, 
-            batch_size, epochs, "checkpoint.ser", verbose);
-```
-
-### ConvND Wavefront
-
-```c
-#include <convnd.h>
-
-ConvNDParams p = {
-    .input = x, .kernel = k, .bias = b, .output = y,
-    .dims = dims, .ndims = 2, .D = 64, .K = 3
+// Configurer le Gradient Checkpointing
+TrainerGCConfig gc = {
+    .policy = TRAINER_GC_EVERY_N,  // NONE, EVERY_N, ALL
+    .checkpoint_every_n = 2
 };
 
-convnd(&p, CONVND_FORWARD);   // Wavefront parallèle
+// Créer le trainer
+Trainer *t = trainer_create(m, &gc);
+
+// Lancer l'entraînement avec table de progression
+trainer_run(t, data, labels, n_samples, L, D, num_classes,
+            batch_size, epochs, "checkpoint.ser", verbose=1);
+
+// Sauvegarder le checkpoint (modèle + état entraînement)
+trainer_save_checkpoint(t, "checkpoint.ser");
 ```
+
+### Gradient Checkpointing
+
+| Politique | Mémoire | Vitesse | Usage |
+|-----------|---------|---------|-------|
+| `TRAINER_GC_NONE` | Élevée | Rapide | GPUs avec mémoire suffisante |
+| `TRAINER_GC_EVERY_N` | Moyenne | Moyenne | Équilibré (recommandé) |
+| `TRAINER_GC_ALL` | Minimale | Lente | GPUs mémoire limitée |
 
 ---
 
