@@ -112,6 +112,30 @@ typedef struct {
     float accuracy;
 } TrainerMetrics;
 
+/* Prints the experiment header table (see spec) */
+void trainer_print_experiment_header(
+    const char *model_name,
+    size_t dim, size_t n_layers, size_t seq_len,
+    long spatial_ndims,
+    const char *optimizer_name,
+    float lr, float weight_decay,
+    const char *backend_str,
+    const char *gc_policy_str,
+    size_t batch_size, size_t epochs);
+
+/* Runs the training loop with pretty progress table (if verbose=1) */
+TrainerMetrics trainer_run(
+    Trainer *trainer,
+    const float *data,
+    const uint32_t *labels,
+    size_t num_samples,
+    size_t L, size_t D, int num_classes,
+    size_t batch_size,
+    size_t epochs,
+    const char *checkpoint_path,
+    int verbose
+);
+
 typedef enum {
     TRAINER_BATCH_TOKENS,     /* Language Model: uint32_t* token IDs */
     TRAINER_BATCH_VISION,     /* Vision: float* data + uint32_t* labels */

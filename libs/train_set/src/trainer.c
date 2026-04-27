@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <locale.h>
 
 #ifdef KMAMBA_BUILD_CUDA
 #include <cuda_runtime.h>
@@ -17,6 +18,40 @@
 /* ============================================================================
  * Utilities
  * ============================================================================ */
+
+void trainer_print_experiment_header(
+    const char *model_name,
+    size_t dim, size_t n_layers, size_t seq_len,
+    long spatial_ndims,
+    const char *optimizer_name,
+    float lr, float weight_decay,
+    const char *backend_str,
+    const char *gc_policy_str,
+    size_t batch_size, size_t epochs)
+{
+    setlocale(LC_ALL, "");
+    printf("\n");
+    printf("\u250C"); for (int i=0; i<50; ++i) printf("-"); printf("\u2510\n");
+    printf("\u2502 %-48s\u2502\n", "K-MAMBA EXPERIMENT DETAILS");
+    printf("\u251C"); for (int i=0; i<50; ++i) printf("-"); printf("\u2524\n");
+    printf("\u2502 %-16s: %-29s\u2502\n", "Model", model_name);
+    printf("\u2502 %-16s: %-29zu\u2502\n", "Dim", dim);
+    printf("\u2502 %-16s: %-29zu\u2502\n", "Layers", n_layers);
+    printf("\u2502 %-16s: %-29zu\u2502\n", "Seq Len", seq_len);
+    printf("\u2502 %-16s: %-29ld\u2502\n", "Spatial Dims", spatial_ndims);
+    printf("\u251C"); for (int i=0; i<50; ++i) printf("-"); printf("\u2524\n");
+    printf("\u2502 %-16s: %-29s\u2502\n", "Optimizer", optimizer_name);
+    printf("\u2502 %-16s: %-29.4g\u2502\n", "LR", lr);
+    printf("\u2502 %-16s: %-29.4g\u2502\n", "Weight Decay", weight_decay);
+    printf("\u2502 %-16s: %-29s\u2502\n", "Backend", backend_str);
+    printf("\u2502 %-16s: %-29s\u2502\n", "GC Policy", gc_policy_str);
+    printf("\u251C"); for (int i=0; i<50; ++i) printf("-"); printf("\u2524\n");
+    printf("\u2502 %-16s: %-29zu\u2502\n", "Batch Size", batch_size);
+    printf("\u2502 %-16s: %-29zu\u2502\n", "Epochs", epochs);
+    printf("\u2514"); for (int i=0; i<50; ++i) printf("-"); printf("\u2518\n");
+    printf("\n");
+}
+
 
 static size_t current_rss_kb(void) {
     struct rusage usage;
@@ -430,6 +465,80 @@ float trainer_train_batch_vision(Trainer *tr, const float *data, const uint32_t 
 /* ============================================================================
  * Logging and Resume Functions
  * ============================================================================ */
+
+extern void print_progress_table_header(void);
+extern void print_progress_table_row(size_t epoch, float loss, float acc, float samples_per_s, float ms, float lr);
+extern void print_progress_table_footer(void);
+
+TrainerMetrics trainer_run(
+    Trainer *trainer,
+    const float *data,
+    const uint32_t *labels,
+    size_t num_samples,
+    size_t L, size_t D, int num_classes,
+    size_t batch_size,
+    size_t epochs,
+    const char *checkpoint_path,
+    int verbose)
+{
+    TrainerMetrics final_metrics = {0};
+    if (!trainer || !data || !labels || batch_size == 0 || epochs == 0) return final_metrics;
+
+    size_t steps_per_epoch = num_samples / batch_size;
+    if (steps_per_epoch == 0) steps_per_epoch = 1;
+    float *batch_data = (float*)malloc(batch_size * L * D * sizeof(float));
+    uint32_t *batch_labels = (uint32_t*)malloc(batch_size * sizeof(uint32_t));
+
+    if (verbose) {
+        trainer_print_experiment_header(
+            "?", D, trainer->ckpt->n_layers, L, (long)D, "AdamW", 0.0f, 0.0f, "auto", "none", batch_size, epochs);
+        print_progress_table_header();
+    }
+
+    for (size_t epoch = 1; epoch <= epochs; ++epoch) {
+        float epoch_loss = 0.0f, epoch_acc = 0.0f;
+        double epoch_start = (double)clock() / CLOCKS_PER_SEC;
+        for (size_t step = 0; step < steps_per_epoch; ++step) {
+            size_t offset = step * batch_size * L * D;
+            memcpy(batch_data, data + offset, batch_size * L * D * sizeof(float));
+            memcpy(batch_labels, labels + step * batch_size, batch_size * sizeof(uint32_t));
+            float loss = trainer_train_batch_vision(trainer, batch_data, batch_labels, batch_size, L, D, num_classes);
+            epoch_loss += loss;
+            // Dummy accuracy for now (implement as needed)
+            epoch_acc += 0.0f;
+        }
+        double epoch_end = (double)clock() / CLOCKS_PER_SEC;
+        double ms = (epoch_end - epoch_start) * 1000.0;
+        float avg_loss = epoch_loss / steps_per_epoch;
+        float avg_acc = epoch_acc / steps_per_epoch;
+        float samples_per_s = (float)(steps_per_epoch * batch_size) / ((epoch_end - epoch_start) > 0 ? (epoch_end - epoch_start) : 1);
+        float lr = 0.0f; // TODO: fetch actual LR
+        if (verbose) print_progress_table_row(epoch, avg_loss, avg_acc, samples_per_s, (float)ms, lr);
+        final_metrics.loss = avg_loss;
+        final_metrics.accuracy = avg_acc;
+    }
+    if (verbose) print_progress_table_footer();
+    free(batch_data);
+    free(batch_labels);
+    return final_metrics;
+}
+
+void print_progress_table_header(void) {
+    setlocale(LC_ALL, "");
+    printf("\u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n");
+    printf("\u2502 Epoch \u2502  Loss   \u2502 Acc (%) \u2502 Samples/s \u2502 Time (ms) \u2502    LR     \u2502\n");
+    printf("\u251C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n");
+}
+
+void print_progress_table_row(size_t epoch, float loss, float acc, float samples_per_s, float ms, float lr) {
+    printf("\u2502 %-5zu \u2502 %7.4f \u2502 %7.2f \u2502 %9.1f \u2502 %9.1f \u2502 %9.2e \u2502\n",
+        epoch, loss, acc, samples_per_s, ms, lr);
+}
+
+void print_progress_table_footer(void) {
+    printf("\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n");
+}
+
 
 Trainer* trainer_create_with_logging(KMamba *model, const TrainerGCConfig *gc_cfg,
                                       const TrainerLogConfig *log_cfg) {
