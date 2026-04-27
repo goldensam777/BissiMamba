@@ -2,7 +2,7 @@
 
 **Zero-dependency C library for native N-dimensional Mamba.**
 
-ScanND + ConvND unified under a single parallel wavefront skeleton.
+Unified ScanND + ConvND. CLI model/train. Native Gradient Checkpointing.
 
 [![Build](https://img.shields.io/badge/build-makefile-blue)](Makefile)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
