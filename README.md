@@ -140,6 +140,11 @@ k-mamba/
 ├── cpu/                       # ASM AVX2
 ├── cuda/                      # CUDA (optionnel)
 ├── libs/train_set/            # Trainer avec Gradient Checkpointing
+├── configs/                   # Configurations JSON (CIFAR-10, etc.)
+├── scripts/                   # Scripts utilitaires
+│   └── train.sh               # Pipeline model → train
+├── model.c                    # CLI création modèle
+├── train.c                    # CLI entraînement
 ├── Makefile
 └── build.sh
 ```
@@ -166,6 +171,24 @@ make
 
 ```
 libkmamba.a   # Bibliothèque statique
+model         # CLI création modèle
+train         # CLI entraînement
+```
+
+### CLI - Création et Entraînement
+
+```bash
+# 1. Compiler les outils CLI
+make model train
+
+# 2. Créer un modèle depuis un fichier JSON
+./model configs/cifar10.json
+
+# 3. Lancer l'entraînement
+./train configs/cifar10.json --batch_size=16 --epochs=10
+
+# Ou utiliser le script pipeline
+./scripts/train.sh configs/cifar10.json --batch_size=16 --epochs=10
 ```
 
 ---
@@ -189,12 +212,38 @@ KMamba *m = kmamba_create(&cfg);
 kmamba_init(m, 1234);
 ```
 
-### Entraînement
+### Configuration JSON
+
+```json
+{
+    "model_name": "k-mamba-cifar10",
+    "dim": 128,
+    "state_size": 16,
+    "n_layers": 4,
+    "seq_len": 64,
+    "spatial_ndims": 2,
+    "spatial_dims": [8, 8],
+    "backend": 1,
+    "lr": 0.0003,
+    "weight_decay": 0.05
+}
+```
+
+### Entraînement Programmatique
 
 ```c
-MBOptimConfig opt = {.lr = 1e-3f, .clip_norm = 1.0f};
-kmamba_enable_training(m, &opt, 1e-3f, 1e-5f);
-float loss = kmamba_train_step(m, tokens_plus1);
+#include "trainer.h"
+
+// Charger config et créer modèle
+KMambaFullConfig cfg;
+kmamba_configs_load_json(&cfg, "configs/cifar10.json");
+KMamba *m = kmamba_configs_create_model(&cfg);
+
+// Créer trainer et lancer entraînement
+TrainerGCConfig gc = {.policy = TRAINER_GC_NONE};
+Trainer *t = trainer_create(m, &gc);
+trainer_run(t, data, labels, n_samples, L, D, num_classes, 
+            batch_size, epochs, "checkpoint.ser", verbose);
 ```
 
 ### ConvND Wavefront

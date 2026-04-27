@@ -190,6 +190,8 @@ make tests
 | `make cpu` | CPU-only build |
 | `make cuda` | CUDA build (fails if no CUDA) |
 | `make lib` | Library `libkmamba.a` only |
+| `make model` | Build `model` CLI (model creation) |
+| `make train` | Build `train` CLI (training) |
 | `make tests` | Run test suite |
 | `make bench-convnd-cpu` | CPU ConvND benchmark |
 | `make bench-convnd-cuda` | CUDA ConvND benchmark |
@@ -228,6 +230,58 @@ float loss = kmamba_train_step(model, tokens_plus1);
 
 // Cleanup
 kmamba_free(model);
+```
+
+### CLI Usage
+
+Create a model from JSON config and train it:
+
+```bash
+# Build CLI tools
+make model train
+
+# Create model from config
+./model configs/cifar10.json
+
+# Train the model
+./train configs/cifar10.json --batch_size=16 --epochs=10 --backend=cpu
+
+# Or use the pipeline script
+./scripts/train.sh configs/cifar10.json --batch_size=16 --epochs=10
+```
+
+### JSON Configuration
+
+```json
+{
+    "model_name": "k-mamba-cifar10",
+    "dim": 128,
+    "state_size": 16,
+    "n_layers": 4,
+    "seq_len": 64,
+    "spatial_ndims": 2,
+    "spatial_dims": [8, 8],
+    "backend": 1,
+    "lr": 0.0003,
+    "weight_decay": 0.05
+}
+```
+
+### Trainer API
+
+```c
+#include "trainer.h"
+
+// Load config and create model
+KMambaFullConfig cfg;
+kmamba_configs_load_json(&cfg, "configs/cifar10.json");
+KMamba *m = kmamba_configs_create_model(&cfg);
+
+// Create trainer and run training
+TrainerGCConfig gc = {.policy = TRAINER_GC_NONE};
+Trainer *t = trainer_create(m, &gc);
+trainer_run(t, data, labels, n_samples, L, D, num_classes,
+            batch_size, epochs, "checkpoint.ser", verbose);
 ```
 
 ### ConvND API
