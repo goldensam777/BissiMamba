@@ -17,6 +17,8 @@ typedef struct {
     MBOptimConfig optim;       /* Optimizer (lr, mu, beta2, weight_decay...) */
     int backend;              /* KMambaBackend: 0=AUTO, 1=CPU, 2=GPU */
     int gpu_device;           /* CUDA device ID (-1 = default) */
+    char data_path[256];      /* Path to dataset */
+    char checkpoint_path[256]; /* Path to checkpoint file */
 } KMambaFullConfig;
 
 /* Fill with safe defaults (calls kmamba_config_set_defaults + optim defaults) */
