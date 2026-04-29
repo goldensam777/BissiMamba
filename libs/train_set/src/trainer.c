@@ -100,8 +100,9 @@ struct KMambaCheckpointState {
 };
 
 static int should_checkpoint(int layer_idx, int n_layers, const TrainerGCConfig *cfg) {
-    if (cfg->policy == TRAINER_GC_NONE) return 1; 
-    if (cfg->policy == TRAINER_GC_ALL) return (layer_idx == 0); 
+    (void)n_layers;
+    if (cfg->policy == TRAINER_GC_NONE) return 1;
+    if (cfg->policy == TRAINER_GC_ALL) return (layer_idx == 0);
     if (cfg->policy == TRAINER_GC_EVERY_N) {
         return (layer_idx % cfg->checkpoint_every_n == 0);
     }
@@ -210,7 +211,7 @@ void trainer_backward(Trainer *tr, const float *dY, const float *input, size_t b
     size_t bytes = tr->ckpt->buffer_size * batch_size;
     
     const float *current_dy = dY;
-    float *d_input_scratch;
+    float *d_input_scratch = NULL;
     if (tr->ckpt->is_gpu) {
 #ifdef KMAMBA_BUILD_CUDA
         cudaMalloc((void**)&d_input_scratch, bytes);
@@ -236,8 +237,10 @@ void trainer_backward(Trainer *tr, const float *dY, const float *input, size_t b
             layer_in = tmp_in;
         }
         
-        mamba_backward(tr->model->layers[i], current_dy, layer_in, d_input_scratch, 0);
-        current_dy = d_input_scratch;
+        if (d_input_scratch) {
+            mamba_backward(tr->model->layers[i], current_dy, layer_in, d_input_scratch, 0);
+            current_dy = d_input_scratch;
+        }
     }
 
     if (tr->ckpt->is_gpu) {
@@ -376,10 +379,15 @@ float trainer_train_batch_vision(Trainer *tr, const float *data, const uint32_t 
     }
 
     /* Compute loss */
-    float loss = cross_entropy_loss(output_logits, labels, batch_size, num_classes, L);
+    float loss = 0.0f;
+    if (output_logits) {
+        loss = cross_entropy_loss(output_logits, labels, batch_size, num_classes, L);
+    }
 
     /* Compute output gradients */
-    cross_entropy_grad(output_logits, labels, d_output, batch_size, num_classes, L);
+    if (output_logits) {
+        cross_entropy_grad(output_logits, labels, d_output, batch_size, num_classes, L);
+    }
 
     /* Backward pass through head */
     float *d_hidden = (float*)malloc(layer_bytes);
@@ -391,7 +399,6 @@ float trainer_train_batch_vision(Trainer *tr, const float *data, const uint32_t 
             for (size_t t = 0; t < L; t++) {
                 float *d_h = d_hidden + (b * L + t) * D;
                 const float *d_logit = d_output + (b * L + t) * num_classes;
-                const float *hidden = current + (b * L + t) * D;
                 for (size_t d = 0; d < D; d++) {
                     float sum = 0.0f;
                     for (int c = 0; c < num_classes; c++) {
@@ -416,7 +423,7 @@ float trainer_train_batch_vision(Trainer *tr, const float *data, const uint32_t 
 
     /* Backward through layers */
     float *d_in = (float*)malloc(layer_bytes);
-    float *layer_in = current;
+    /* layer_in not needed, using current directly */
     float *d_out = d_hidden;
 
     for (int i = (int)n_layers - 1; i >= 0; i--) {
@@ -478,7 +485,7 @@ TrainerMetrics trainer_run(
     size_t L, size_t D, int num_classes,
     size_t batch_size,
     size_t epochs,
-    const char *checkpoint_path,
+    const char *checkpoint_path __attribute__((unused)),
     int verbose)
 {
     TrainerMetrics final_metrics = {0};
@@ -526,7 +533,7 @@ TrainerMetrics trainer_run(
 void print_progress_table_header(void) {
     setlocale(LC_ALL, "");
     printf("\u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n");
-    printf("\u2502 Epoch \u2502  Loss   \u2502 Acc (%) \u2502 Samples/s \u2502 Time (ms) \u2502    LR     \u2502\n");
+    printf("| Epoch |  Loss   | Acc (%%) | Samples/s | Time (ms) |    LR     |\n");
     printf("\u251C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n");
 }
 
@@ -616,9 +623,9 @@ static int read_resume_state(const char *path, TrainerResumeState *state) {
 static int save_layer_opt_state(FILE *fp, MambaBlock *block) {
     if (!block || !block->opt_state) return 0;
 
-    KMambaConfig *cfg = &block->config;
+    MBConfig *cfg = &block->config;
     size_t d_state = cfg->state_size;
-    size_t N = cfg->n_layers;  /* Use n_layers as N parameter */
+    size_t N = d_state;        /* N = state_size for scan dimensions */
     size_t R = 4;              /* Hardcoded R=4 based on scan_nd.h */
     size_t d_inner = cfg->dim * cfg->expand_factor;
 
@@ -763,7 +770,7 @@ Trainer* trainer_resume(KMamba *model, const TrainerGCConfig *gc_cfg,
 static int load_layer_opt_state(FILE *fp, MambaBlock *block) {
     if (!block) return 0;
 
-    KMambaConfig *cfg = &block->config;
+    MBConfig *cfg = &block->config;
     size_t d_state = cfg->state_size;
 
     /* Read dimensions */
@@ -955,7 +962,7 @@ static TrainerMetrics trainer_train_batch_vision_with_acc(Trainer *tr,
     size_t layer_bytes = L * D * batch_size * sizeof(float);
     float *current = (float*)malloc(layer_bytes);
     float *next = (float*)malloc(layer_bytes);
-    float *output_logits = (float*)malloc(batch_size * L * num_classes * sizeof(float));
+    float *output_logits = NULL;
     float *d_output = (float*)malloc(batch_size * L * num_classes * sizeof(float));
 
     if (!current || !next || !output_logits || !d_output) {
@@ -1013,12 +1020,17 @@ static TrainerMetrics trainer_train_batch_vision_with_acc(Trainer *tr,
     }
 
     /* Compute loss and accuracy (using last position for classification) */
-    float loss = cross_entropy_loss(output_logits, labels, batch_size, num_classes, L);
-    result.accuracy = compute_vision_accuracy(output_logits, labels, batch_size, num_classes);
+    float loss = 0.0f;
+    if (output_logits) {
+        loss = cross_entropy_loss(output_logits, labels, batch_size, num_classes, L);
+        result.accuracy = compute_vision_accuracy(output_logits, labels, batch_size, num_classes);
+    }
     result.loss = loss;
 
     /* Compute output gradients */
-    cross_entropy_grad(output_logits, labels, d_output, batch_size, num_classes, L);
+    if (output_logits) {
+        cross_entropy_grad(output_logits, labels, d_output, batch_size, num_classes, L);
+    }
 
     /* Backward pass through head */
     float *d_hidden = (float*)malloc(layer_bytes);
