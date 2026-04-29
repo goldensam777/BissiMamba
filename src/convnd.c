@@ -103,6 +103,7 @@ static void convnd_separable_1d_wavefront(
     KMWavefrontPlan *plan)
 {
     long spatial_total = product(dims, ndims);
+    (void)spatial_total;
     long *strides = (long *)malloc((size_t)ndims * sizeof(long));
     if (!strides) return;
     convnd_make_row_major_strides(dims, ndims, strides);
@@ -254,6 +255,7 @@ static void convnd_separable_1d_backward_wavefront(
     KMWavefrontPlan *plan)
 {
     long spatial_total = product(dims, ndims);
+    (void)spatial_total;
     long *strides = (long *)malloc((size_t)ndims * sizeof(long));
     if (!strides) return;
     convnd_make_row_major_strides(dims, ndims, strides);

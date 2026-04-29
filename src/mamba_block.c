@@ -457,7 +457,9 @@ static void _ssm_scan_forward_wavefront(MambaBlock *block,
 }
 
 void mamba_block_forward_ws(MambaBlock *block, MambaBlockWorkspace *ws, float *output, const float *input, size_t batch_size) {
-    if (!block || !ws || !output || !input) return; size_t L = block->config.seq_len, D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R;
+    if (!block || !ws || !output || !input) return;
+    size_t L = block->config.seq_len, D = block->config.dim, N = block->config.state_size;
+    size_t R = _mimo_R(&block->config), NR = N * R;
     /* Buffer size checks */
     size_t scan_B_size = L * D * N;  /* Allocated size */
     size_t scan_B_access_max = (L - 1) * NR + (NR - 1);  /* Max accessed index */
@@ -735,7 +737,8 @@ static int mamba_block_ensure_gpu(MambaBlock *block) {
 }
 
 static int _mamba_block_forward_gpu(MambaBlock *block, float *output, const float *input, size_t batch_size) {
-    if (!block || !output || !input || batch_size == 0) return -1; if (mamba_block_ensure_gpu(block) != 0) return -1;
+    if (!block || !output || !input || batch_size == 0) return -1;
+    if (mamba_block_ensure_gpu(block) != 0) return -1;
     static cublasHandle_t cublas_handle = NULL; static int cublas_init_done = 0; if (!cublas_init_done) { if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS) return -1; cublas_init_done = 1; }
     size_t L = block->config.seq_len, D = block->config.dim, R = _mimo_R(&block->config), NR = block->config.state_size * R; size_t bytes_L_D = L * D * sizeof(float);
     float *d_input, *d_output; if (cudaMalloc((void**)&d_input, bytes_L_D) != cudaSuccess) return -1; if (cudaMalloc((void**)&d_output, bytes_L_D) != cudaSuccess) { cudaFree(d_input); return -1; }
@@ -753,16 +756,21 @@ void mamba_block_forward(MambaBlock *block, float *output, const float *input, s
 }
 
 MBOptimState* mamba_local_grad_alloc(const MambaBlock *block) {
-    if (!block) return NULL; MBOptimState *s = (MBOptimState *)calloc(1, sizeof(MBOptimState)); if (!s) return NULL;
+    if (!block) return NULL;
+    MBOptimState *s = (MBOptimState *)calloc(1, sizeof(MBOptimState));
+    if (!s) return NULL;
     size_t D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R, TS = N/2 > 0 ? N/2 : 1;
     s->g_W_in = (float *)calloc(R * D, sizeof(float)); s->g_W_out = (float *)calloc(D * R, sizeof(float)); s->g_A_log = (float *)calloc(N, sizeof(float)); s->g_W_B = (float *)calloc(NR * D, sizeof(float)); s->g_W_C = (float *)calloc(NR * D, sizeof(float)); s->g_b_B = (float *)calloc(NR, sizeof(float)); s->g_b_C = (float *)calloc(NR, sizeof(float)); s->g_delta_proj = (float *)calloc(D, sizeof(float)); s->g_lambda_proj = (float *)calloc(D, sizeof(float)); s->g_theta = (float *)calloc(TS, sizeof(float));
     return s;
 }
 
 void mamba_local_grad_reduce(MambaBlock *block, const MBOptimState *local) {
-    if (!block || !block->opt_state || !local) return; MBOptimState *s = (MBOptimState *)block->opt_state;
+    if (!block || !block->opt_state || !local) return;
+    MBOptimState *s = (MBOptimState *)block->opt_state;
     size_t D = block->config.dim, N = block->config.state_size, R = _mimo_R(&block->config), NR = N * R, TS = N/2 > 0 ? N/2 : 1;
-    for (size_t i=0; i<R*D; i++) s->g_W_in[i] += local->g_W_in[i]; for (size_t i=0; i<D*R; i++) s->g_W_out[i] += local->g_W_out[i]; for (size_t i=0; i<N; i++) s->g_A_log[i] += local->g_A_log[i];
+    for (size_t i=0; i<R*D; i++) s->g_W_in[i] += local->g_W_in[i];
+    for (size_t i=0; i<D*R; i++) s->g_W_out[i] += local->g_W_out[i];
+    for (size_t i=0; i<N; i++) s->g_A_log[i] += local->g_A_log[i];
     for (size_t i=0; i<NR*D; i++) { s->g_W_B[i] += local->g_W_B[i]; s->g_W_C[i] += local->g_W_C[i]; }
     for (size_t i=0; i<NR; i++) { s->g_b_B[i] += local->g_b_B[i]; s->g_b_C[i] += local->g_b_C[i]; }
     for (size_t i=0; i<D; i++) { s->g_delta_proj[i] += local->g_delta_proj[i]; s->g_lambda_proj[i] += local->g_lambda_proj[i]; }
@@ -770,7 +778,18 @@ void mamba_local_grad_reduce(MambaBlock *block, const MBOptimState *local) {
 }
 
 void mamba_local_grad_free(MBOptimState *local) {
-    if (!local) return; free(local->g_W_in); free(local->g_W_out); free(local->g_A_log); free(local->g_W_B); free(local->g_W_C); free(local->g_b_B); free(local->g_b_C); free(local->g_delta_proj); free(local->g_lambda_proj); free(local->g_theta); free(local);
+    if (!local) return;
+    free(local->g_W_in);
+    free(local->g_W_out);
+    free(local->g_A_log);
+    free(local->g_W_B);
+    free(local->g_W_C);
+    free(local->g_b_B);
+    free(local->g_b_C);
+    free(local->g_delta_proj);
+    free(local->g_lambda_proj);
+    free(local->g_theta);
+    free(local);
 }
 
 void mamba_backward_ws_local(MambaBlock *block, MambaBlockWorkspace *ws, const float *dY, const float *input, float *d_input, size_t batch_index, MBOptimState *local_grad) {

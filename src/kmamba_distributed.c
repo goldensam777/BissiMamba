@@ -86,7 +86,9 @@ int kmamba_pipeline_send_recv(KMambaDistributedContext *ctx,
                                int dst_rank,
                                int src_rank) {
     (void)ctx;
-    
+    (void)dst_rank;
+    (void)src_rank;
+
     #ifdef KMAMBA_BUILD_CUDA
     size_t bytes = n_elements * sizeof(float);
     

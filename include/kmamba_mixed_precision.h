@@ -72,7 +72,7 @@ static inline float fp16_to_float(uint16_t h) {
     if (exp == 0) {
         /* Zero/subnormal */
         if (mant == 0) {
-            union { uint32_t u; float f; } u = { .u = sign << 31 };
+            union { uint32_t u; float f; } u = { .u = (uint32_t)sign << 31 };
             return u.f;
         }
         /* Subnormal: denormalized */
@@ -83,14 +83,14 @@ static inline float fp16_to_float(uint16_t h) {
             new_mant <<= 1;
             new_exp--;
         }
-        union { uint32_t u; float f; } u = { .u = (sign << 31) | (new_exp << 23) | (new_mant & 0x7FFFFF) };
+        union { uint32_t u; float f; } u = { .u = ((uint32_t)sign << 31) | (new_exp << 23) | (new_mant & 0x7FFFFF) };
         return u.f;
     }
     
     if (exp == 0x1F) {
         /* Inf/NaN */
         uint32_t new_mant = mant ? 0x7FFFFF : 0;
-        union { uint32_t u; float f; } u = { .u = (sign << 31) | (0xFF << 23) | new_mant };
+        union { uint32_t u; float f; } u = { .u = ((uint32_t)sign << 31) | (0xFF << 23) | new_mant };
         return u.f;
     }
     
@@ -98,7 +98,7 @@ static inline float fp16_to_float(uint16_t h) {
     uint32_t new_exp = (uint32_t)exp - 15 + 127;
     uint32_t new_mant = ((uint32_t)mant) << 13;
     
-    union { uint32_t u; float f; } u = { .u = (sign << 31) | (new_exp << 23) | new_mant };
+    union { uint32_t u; float f; } u = { .u = ((uint32_t)sign << 31) | (new_exp << 23) | new_mant };
     return u.f;
 }
 

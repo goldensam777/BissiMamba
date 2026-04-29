@@ -10,6 +10,8 @@ void kmamba_configs_default(KMambaFullConfig *cfg) {
     kmamba_optim_config_set_defaults(&cfg->optim);
     cfg->backend = KMAMBA_BACKEND_AUTO;
     cfg->gpu_device = -1;
+    strncpy(cfg->data_path, "data/input.bin", 255);
+    strncpy(cfg->checkpoint_path, "checkpoint.ser", 255);
 }
 
 /* Minimal JSON parser (no external dependencies).
@@ -31,7 +33,11 @@ int kmamba_configs_load_json(KMambaFullConfig *cfg, const char *path) {
     fseek(f, 0, SEEK_SET);
     char *buf = (char *)malloc(sz + 1);
     if (!buf) { fclose(f); return -1; }
-    fread(buf, 1, sz, f);
+    if (fread(buf, 1, sz, f) != (size_t)sz) {
+        free(buf);
+        fclose(f);
+        return -1;
+    }
     buf[sz] = '\0';
     fclose(f);
 
@@ -66,12 +72,16 @@ int kmamba_configs_load_json(KMambaFullConfig *cfg, const char *path) {
             while (*p && *p != '"' && v < 255) val[v++] = *p++;
             if (*p == '"') p++;
 
-            if (strcmp(key, "model_name") == 0)
+            if (strcmp(key, "model_name") == 0) {
                 strncpy(cfg->model.model_name, val, 63);
-            else if (strcmp(key, "data_path") == 0)
-                ; /* ignored here, belongs to trainer */
-            else if (strcmp(key, "checkpoint_path") == 0)
-                ; /* ignored here */
+                cfg->model.model_name[63] = '\0';
+            } else if (strcmp(key, "data_path") == 0) {
+                strncpy(cfg->data_path, val, 255);
+                cfg->data_path[255] = '\0';
+            } else if (strcmp(key, "checkpoint_path") == 0) {
+                strncpy(cfg->checkpoint_path, val, 255);
+                cfg->checkpoint_path[255] = '\0';
+            }
         }
         else if (*p == '[') {
             /* Array value (spatial_dims) */
@@ -114,6 +124,56 @@ int kmamba_configs_load_json(KMambaFullConfig *cfg, const char *path) {
         }
     }
     free(buf);
+    return 0;
+}
+
+int kmamba_configs_save_json(const KMambaFullConfig *cfg, const char *path) {
+    if (!cfg || !path) return -1;
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "configs: cannot write %s\n", path);
+        return -1;
+    }
+
+    int nd = (int)cfg->model.spatial_ndims;
+    if (nd < 0) nd = 0;
+    if (nd > KMAMBA_CONFIG_MAX_NDIMS) nd = KMAMBA_CONFIG_MAX_NDIMS;
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"model_name\": \"%s\",\n", cfg->model.model_name);
+    fprintf(f, "  \"dim\": %zu,\n", cfg->model.dim);
+    fprintf(f, "  \"state_size\": %zu,\n", cfg->model.state_size);
+    fprintf(f, "  \"n_layers\": %zu,\n", cfg->model.n_layers);
+    fprintf(f, "  \"seq_len\": %zu,\n", cfg->model.seq_len);
+    fprintf(f, "  \"spatial_ndims\": %ld,\n", cfg->model.spatial_ndims);
+    fprintf(f, "  \"spatial_dims\": [");
+    for (int i = 0; i < nd; i++) {
+        fprintf(f, "%s%ld", (i == 0) ? "" : ", ", cfg->model.spatial_dims[i]);
+    }
+    fprintf(f, "],\n");
+    fprintf(f, "  \"use_convnd\": %d,\n", cfg->model.use_convnd);
+    fprintf(f, "  \"convnd_K\": %ld,\n", cfg->model.convnd_K);
+    fprintf(f, "  \"convnd_ndims\": %ld,\n", cfg->model.convnd_ndims);
+    fprintf(f, "  \"mimo_rank\": %zu,\n", cfg->model.mimo_rank);
+    fprintf(f, "  \"default_lambda\": %.9g,\n", cfg->model.default_lambda);
+    fprintf(f, "  \"use_a_log_clamp\": %d,\n", cfg->model.use_a_log_clamp);
+    fprintf(f, "  \"a_log_min\": %.9g,\n", cfg->model.a_log_min);
+    fprintf(f, "  \"dt_min\": %.9g,\n", cfg->model.dt_min);
+    fprintf(f, "  \"dt_max\": %.9g,\n", cfg->model.dt_max);
+    fprintf(f, "  \"lr\": %.9g,\n", cfg->optim.lr);
+    fprintf(f, "  \"mu\": %.9g,\n", cfg->optim.mu);
+    fprintf(f, "  \"beta2\": %.9g,\n", cfg->optim.beta2);
+    fprintf(f, "  \"eps\": %.9g,\n", cfg->optim.eps);
+    fprintf(f, "  \"clip_norm\": %.9g,\n", cfg->optim.clip_norm);
+    fprintf(f, "  \"weight_decay\": %.9g,\n", cfg->optim.weight_decay);
+    fprintf(f, "  \"backend\": %d,\n", cfg->backend);
+    fprintf(f, "  \"gpu_device\": %d,\n", cfg->gpu_device);
+    fprintf(f, "  \"data_path\": \"%s\",\n", cfg->data_path);
+    fprintf(f, "  \"checkpoint_path\": \"%s\"\n", cfg->checkpoint_path);
+    fprintf(f, "}\n");
+
+    fclose(f);
     return 0;
 }
 
