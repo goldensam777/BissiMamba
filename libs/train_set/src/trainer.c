@@ -109,6 +109,51 @@ static int should_checkpoint(int layer_idx, int n_layers, const TrainerGCConfig 
     return 0;
 }
 
+/* ============================================================================
+ * Learning Rate Scheduler (Linear Warmup + Cosine Decay)
+ * ============================================================================ */
+
+void trainer_init_lr_scheduler(Trainer *tr, float initial_lr, float min_lr,
+                               int warmup_steps, int max_steps) {
+    if (!tr) return;
+    tr->lr_scheduler.initial_lr = initial_lr;
+    tr->lr_scheduler.min_lr = min_lr;
+    tr->lr_scheduler.warmup_steps = warmup_steps;
+    tr->lr_scheduler.max_steps = max_steps;
+    tr->lr_scheduler.current_lr = initial_lr;
+}
+
+void trainer_update_lr(Trainer *tr, int current_step) {
+    if (!tr) return;
+
+    LRScheduler *sched = &tr->lr_scheduler;
+    float new_lr;
+
+    if (current_step < sched->warmup_steps && sched->warmup_steps > 0) {
+        /* Linear warmup: lr goes from 0 to initial_lr */
+        new_lr = sched->initial_lr * ((float)current_step / (float)sched->warmup_steps);
+    } else if (current_step >= sched->max_steps) {
+        /* End of training: use min_lr */
+        new_lr = sched->min_lr;
+    } else {
+        /* Cosine decay: lr decays from initial_lr to min_lr */
+        int decay_steps = sched->max_steps - sched->warmup_steps;
+        int step_in_decay = current_step - sched->warmup_steps;
+        float progress = (float)step_in_decay / (float)decay_steps;
+        float cosine = 0.5f * (1.0f + cosf(3.14159265f * progress));
+        new_lr = sched->min_lr + (sched->initial_lr - sched->min_lr) * cosine;
+    }
+
+    sched->current_lr = new_lr;
+
+    /* Update model learning rates */
+    if (tr->model) {
+        tr->model->opt_blocks.lr = new_lr;
+        /* Also update embedding head LR if different */
+        tr->model->lr_embed_head = new_lr;
+    }
+}
+
 Trainer* trainer_create(KMamba *model, const TrainerGCConfig *gc_cfg) {
     if (!model) return NULL;
     
@@ -496,16 +541,30 @@ TrainerMetrics trainer_run(
     float *batch_data = (float*)malloc(batch_size * L * D * sizeof(float));
     uint32_t *batch_labels = (uint32_t*)malloc(batch_size * sizeof(uint32_t));
 
+    /* Initialize LR scheduler if not already done */
+    int total_steps = (int)(epochs * steps_per_epoch);
+    if (trainer->lr_scheduler.max_steps == 0) {
+        /* Auto-init: 10% warmup, cosine decay to 1% of initial LR */
+        int warmup_steps = total_steps / 10;
+        float initial_lr = trainer->model ? trainer->model->opt_blocks.lr : 0.001f;
+        float min_lr = initial_lr * 0.01f;
+        trainer_init_lr_scheduler(trainer, initial_lr, min_lr, warmup_steps, total_steps);
+    }
+
     if (verbose) {
         trainer_print_experiment_header(
-            "?", D, trainer->ckpt->n_layers, L, (long)D, "AdamW", 0.0f, 0.0f, "auto", "none", batch_size, epochs);
+            "?", D, trainer->ckpt->n_layers, L, (long)D, "AdamW", trainer->lr_scheduler.initial_lr, 0.0f, "auto", "none", batch_size, epochs);
         print_progress_table_header();
     }
 
+    int global_step = 0;
     for (size_t epoch = 1; epoch <= epochs; ++epoch) {
         float epoch_loss = 0.0f, epoch_acc = 0.0f;
         double epoch_start = (double)clock() / CLOCKS_PER_SEC;
         for (size_t step = 0; step < steps_per_epoch; ++step) {
+            /* Update learning rate at each step */
+            trainer_update_lr(trainer, global_step);
+
             size_t offset = step * batch_size * L * D;
             memcpy(batch_data, data + offset, batch_size * L * D * sizeof(float));
             memcpy(batch_labels, labels + step * batch_size, batch_size * sizeof(uint32_t));
@@ -513,13 +572,15 @@ TrainerMetrics trainer_run(
             epoch_loss += loss;
             // Dummy accuracy for now (implement as needed)
             epoch_acc += 0.0f;
+
+            global_step++;
         }
         double epoch_end = (double)clock() / CLOCKS_PER_SEC;
         double ms = (epoch_end - epoch_start) * 1000.0;
         float avg_loss = epoch_loss / steps_per_epoch;
         float avg_acc = epoch_acc / steps_per_epoch;
         float samples_per_s = (float)(steps_per_epoch * batch_size) / ((epoch_end - epoch_start) > 0 ? (epoch_end - epoch_start) : 1);
-        float lr = 0.0f; // TODO: fetch actual LR
+        float lr = trainer->lr_scheduler.current_lr;
         if (verbose) print_progress_table_row(epoch, avg_loss, avg_acc, samples_per_s, (float)ms, lr);
         final_metrics.loss = avg_loss;
         final_metrics.accuracy = avg_acc;

@@ -45,6 +45,17 @@ typedef struct {
     char *checkpoint_path; /* Path to save/resume from */
 } TrainerResumeState;
 
+/* ============================================================================
+ * Learning Rate Scheduler (Linear Warmup + Cosine Decay)
+ * ============================================================================ */
+typedef struct {
+    float initial_lr;        /* LR at start (after warmup) */
+    float min_lr;          /* LR minimum at end of cosine decay */
+    int warmup_steps;      /* Number of steps for linear warmup (0 = no warmup) */
+    int max_steps;         /* Total training steps for cosine decay */
+    float current_lr;      /* Current LR (computed each step) */
+} LRScheduler;
+
 /* Opaque structure for checkpoint storage */
 typedef struct KMambaCheckpointState KMambaCheckpointState;
 
@@ -54,6 +65,9 @@ typedef struct {
     TrainerGCConfig gc_config;
     TrainerLogConfig log_cfg;
     TrainerResumeState resume;
+
+    /* Learning Rate Scheduler */
+    LRScheduler lr_scheduler;
 
     /* Logging state */
     FILE *step_log;
@@ -67,6 +81,17 @@ typedef struct {
 /* ============================================================================
  * Trainer API
  * ============================================================================ */
+
+/**
+ * Initialize LR scheduler with parameters
+ */
+void trainer_init_lr_scheduler(Trainer *tr, float initial_lr, float min_lr,
+                               int warmup_steps, int max_steps);
+
+/**
+ * Update learning rate based on current step
+ */
+void trainer_update_lr(Trainer *tr, int current_step);
 
 /**
  * Create a new trainer with GC support
