@@ -4,7 +4,6 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O3 -fPIC -I./include
-LDFLAGS = -shared
 AR = ar
 ARFLAGS = rcs
 
@@ -14,26 +13,16 @@ OBJS = $(SRCS:.c=.o)
 
 # Targets
 STATIC_LIB = libkser.a
-SHARED_LIB = libkser.so
-
-# Platform detection
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-    SHARED_LIB = libkser.dylib
-    LDFLAGS = -dynamiclib
-endif
 
 .PHONY: all clean test install
 
-all: $(STATIC_LIB) $(SHARED_LIB)
+all: $(STATIC_LIB)
 
-# Static library
+# Static library (copiée dans le répertoire principal)
 $(STATIC_LIB): $(OBJS)
 	$(AR) $(ARFLAGS) $@ $^
-
-# Shared library
-$(SHARED_LIB): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^
+	@cp $@ ../../
+	@echo "✓ $(STATIC_LIB) prête (copiée dans ../../)"
 
 # Object files
 %.o: %.c
@@ -48,12 +37,11 @@ test: $(STATIC_LIB)
 install: all
 	mkdir -p /usr/local/lib /usr/local/include
 	cp $(STATIC_LIB) /usr/local/lib/
-	cp $(SHARED_LIB) /usr/local/lib/
 	cp include/kser.h /usr/local/include/
 
 # Clean
 clean:
-	rm -f $(OBJS) $(STATIC_LIB) $(SHARED_LIB)
+	rm -f $(OBJS) $(STATIC_LIB)
 	rm -f tests/test_roundtrip tests/*.ser
 
 # Debug build

@@ -4,14 +4,12 @@
 # Usage:
 #   make all              # Tout compiler (lib + modèles)
 #   make lib              # Juste la bibliothèque
-#   make cpu_lm_model     # Modèle CPU 500K
-#   make cuda_lm_model    # Modèle GPU 500M
-#   make hybrid_lm_model  # Modèle Hybrid 1.5M
+#   make k-mamba-train    # CLI d'entraînement
 #   make all_models       # Tous les modèles
 #   make tests            # Tests unitaires
 #   make clean            # Nettoyage
 
-.PHONY: all lib cpu cuda models cpu_lm_model cuda_lm_model hybrid_lm_model vision_model all_models tests test-gemm-atb-determinism test-scan-nd-regression test-gradient bench-gates clean distclean help
+.PHONY: all lib cpu cuda models all_models tests clean distclean help inference
 
 # ═══════════════════════════════════════════════════════════════
 # Compilateurs et flags
@@ -59,6 +57,13 @@ KSER_LDFLAGS = -L$(KSER_DIR) -lkser -Wl,-rpath,$(KSER_DIR)
 CFLAGS += -I$(KSER_DIR)/include
 
 # ═══════════════════════════════════════════════════════════════
+# libtrain Integration
+TRAIN_DIR = libs/train_set
+TRAIN_LIB = $(TRAIN_DIR)/libtrain.a
+TRAIN_LDFLAGS = -L$(TRAIN_DIR) -ltrain -Wl,-rpath,$(TRAIN_DIR)
+CFLAGS += -I$(TRAIN_DIR)/include
+
+# ═══════════════════════════════════════════════════════════════
 # Fichiers source
 # ═══════════════════════════════════════════════════════════════
 SRCS = src/kmamba.c \
@@ -73,7 +78,6 @@ SRCS = src/kmamba.c \
        src/convnd.c \
        src/km_memory_pool.c \
        src/kmamba_ser.c \
-       libs/train_set/src/trainer.c \
        kernels/gemm_f32.c \
        kernels/activations_f32.c \
        kernels/elementwise_f32.c \
@@ -98,6 +102,13 @@ CUDA_OBJS = $(patsubst %.cu,cuda/%.o,$(notdir $(CUDA_SRCS)))
 TARGET = libkmamba.a
 
 # k-mamba-train (CLI principal)
+K_MAMBA_TRAIN_OBJS = train.o src/configs.o
+MODEL_OBJS = model.o src/configs.o
+TRAIN_OBJS = train.o src/configs.o
+
+# Runtime bundle export
+BUNDLE_DIR ?= dist/runtime
+BUNDLE_CONFIG ?= configs/cifar10.json
 
 # ═══════════════════════════════════════════════════════════════
 # Cibles principales (cpu / cuda / all)
@@ -127,15 +138,19 @@ all: lib k-mamba-train
 	@echo "=== Compilation complète terminée ==="
 
 # Juste la bibliothèque
-lib: check_cuda check_rust $(KSER_LIB) $(RUST_LIB) $(TARGET)
+lib: check_cuda check_rust $(KSER_LIB) $(TRAIN_LIB) $(RUST_LIB) $(TARGET)
 	@echo ""
 	@echo "=== libkmamba.a prête ==="
 
-# libkser static library
+# libtrain static library (auto-copiée via son Makefile)
+$(TRAIN_LIB):
+	@echo "Building libtrain..."
+	@$(MAKE) -C $(TRAIN_DIR)
+
+# libkser static library (auto-copiée via son Makefile)
 $(KSER_LIB):
 	@echo "Building libkser..."
-	$(MAKE) -C $(KSER_DIR)
-	@echo "✓ libkser.a prête"
+	@$(MAKE) -C $(KSER_DIR)
 
 # Tous les modèles
 models: all_models
@@ -160,6 +175,7 @@ endif
 
 $(TARGET): $(OBJS) $(CUDA_OBJS)
 	ar rcs $@ $^
+	@echo "✓ $(TARGET) prête"
 
 # C files (always use gcc, not nvcc)
 %.o: %.c
@@ -184,26 +200,43 @@ endif
 # Compilation des modèles
 # ═══════════════════════════════════════════════════════════════
 
-# Crée le répertoire models (pour les .o de la CLI)
-models_dir:
-	@mkdir -p models
-
 # Lien des libs pour k-mamba-train
-K_MAMBA_TRAIN_LDFLAGS = $(TARGET) $(KSER_LIB) $(LDFLAGS)
+APP_LDFLAGS = $(TARGET) $(KSER_LIB) $(TRAIN_LIB) $(LDFLAGS)
 ifeq ($(RUST_AVAILABLE),1)
-K_MAMBA_TRAIN_LDFLAGS += $(RUST_LIB) $(RUST_LDFLAGS)
+APP_LDFLAGS += $(RUST_LIB) $(RUST_LDFLAGS)
 endif
 ifeq ($(CUDA_AVAILABLE),1)
-K_MAMBA_TRAIN_LDFLAGS += $(CUDA_LDFLAGS)
+APP_LDFLAGS += $(CUDA_LDFLAGS)
 endif
 
-ifeq ($(RUST_AVAILABLE),1)
-k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) $(RUST_LIB) | models_dir
-else
-k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) | models_dir
-endif
-	$(CC) $(CFLAGS) -o $@ $(K_MAMBA_TRAIN_OBJS) $(K_MAMBA_TRAIN_LDFLAGS)
+k-mamba-train: $(K_MAMBA_TRAIN_OBJS) $(TARGET) $(KSER_LIB) $(TRAIN_LIB) $(RUST_LIB)
+	$(CC) $(CFLAGS) -o $@ $(K_MAMBA_TRAIN_OBJS) $(APP_LDFLAGS)
 	@echo "Built: $@ (K-Mamba Training CLI)"
+
+model: $(MODEL_OBJS) $(TARGET) $(KSER_LIB) $(TRAIN_LIB) $(RUST_LIB)
+	$(CC) $(CFLAGS) -o $@ $(MODEL_OBJS) $(APP_LDFLAGS)
+	@echo "Built: $@ (Model serialization CLI)"
+
+train: $(TRAIN_OBJS) $(TARGET) $(KSER_LIB) $(TRAIN_LIB) $(RUST_LIB)
+	$(CC) $(CFLAGS) -o $@ $(TRAIN_OBJS) $(APP_LDFLAGS)
+	@echo "Built: $@ (Standalone training CLI)"
+
+# ═══════════════════════════════════════════════════════════════
+# Inference package — minimal deployment folder
+# Usage: make inference
+# Result: inference/ folder with model, train binaries and config template
+# ═══════════════════════════════════════════════════════════════
+inference: lib model train
+	@mkdir -p inference
+	@cp model train inference/
+	@if [ ! -f inference/config.json ]; then \
+		cp $(BUNDLE_CONFIG) inference/config.json; \
+		echo "✓ Created inference/config.json (template)"; \
+	fi
+	@echo "✓ Inference package ready in inference/"
+	@echo "  1. Edit inference/config.json with your model settings"
+	@echo "  2. cd inference && ./model --config config.json --serialize ser"
+	@echo "  3. cd inference && ./train --config config.json --data <dataset_dir> --epochs=10"
 
 # Note: Les modèles standalone (cpu/cuda/azure/vision) ont été supprimés.
 # Utiliser k-mamba-train avec les presets de config appropriés.
@@ -294,21 +327,23 @@ test-trainer-gc: $(TARGET) tests/unit/test_trainer_gc.c
 
 clean:
 	rm -f $(OBJS)
-	rm -f src/*.o kernels/*.o cpu/*.o models/*.o
+	rm -f src/*.o kernels/*.o cpu/*.o
 	rm -f cuda/*.o
-	rm -f model.o train.o
+	rm -f train.o model.o src/configs.o
 	rm -f test_mamba3 test_mamba3_gpu test_trainer_gc
+	rm -f model train
 	rm -f tests/unit/bench_convnd tests/unit/bench_convnd_cuda tests/unit/test_convnd_separable_cuda
+	rm -f libkser.a libtrain.a
 	$(MAKE) -C $(KSER_DIR) clean 2>/dev/null || true
+	$(MAKE) -C $(TRAIN_DIR) clean 2>/dev/null || true
 ifeq ($(RUST_AVAILABLE),1)
 	cd $(RUST_DIR) && cargo clean 2>/dev/null || true
 endif
 
 distclean: clean
 	rm -f $(TARGET) $(RUST_LIB)
-	rm -f model train k-mamba-train
+	rm -f k-mamba-train
 	rm -f checkpoint.ser checkpoint.ser.opt checkpoint.ser.state
-	rm -rf models/
 	rm -rf logs/
 
 # ═══════════════════════════════════════════════════════════════
@@ -322,6 +357,9 @@ help:
 	@echo "  make all              - Tout compiler (lib + CLI)"
 	@echo "  make lib              - Juste la bibliothèque libkmamba.a"
 	@echo "  make k-mamba-train    - CLI d'entraînement principal"
+	@echo "  make model            - CLI de sérialisation du modèle"
+	@echo "  make train            - CLI d'entraînement standalone"
+	@echo "  make export-runtime-bundle BUNDLE_DIR=dist/runtime BUNDLE_CONFIG=configs/cifar10.json"
 	@echo "  make tests            - Tests unitaires"
 	@echo "  make clean            - Nettoyage"
 	@echo "  make distclean        - Nettoyage complet"
@@ -330,25 +368,8 @@ help:
 	@echo "Variables:"
 	@echo "  CPU_ONLY=1            - Forcer compilation CPU sans CUDA"
 
-# Config library
-CONFIGS_OBJ = src/configs.o
-
-# Model executable
-MODEL_OBJ = model.o $(CONFIGS_OBJ)
-model: $(MODEL_OBJ) libkmamba.a $(KSER_LIB)
-	$(CC) $(CFLAGS) -o $@ $(MODEL_OBJ) -L. -lkmamba $(KSER_LDFLAGS) -lm $(CUDA_LDFLAGS)
+train.o: train.c include/configs.h libs/train_set/include/trainer.h
+	$(CC) $(CFLAGS) -c train.c -o train.o
 
 src/configs.o: src/configs.c include/configs.h
 	$(CC) $(CFLAGS) -c src/configs.c -o src/configs.o
-
-model.o: model.c include/configs.h
-	$(CC) $(CFLAGS) -c model.c -o model.o
-
-# Training executable
-TRAIN_OBJ = train.o $(CONFIGS_OBJ)
-train: $(TRAIN_OBJ) libkmamba.a $(KSER_LIB)
-	$(CC) $(CFLAGS) -o $@ $(TRAIN_OBJ) -L. -lkmamba $(KSER_LDFLAGS) -lm $(CUDA_LDFLAGS)
-
-train.o: train.c include/configs.h libs/train_set/include/trainer.h
-	$(CC) $(CFLAGS) -Ilibs/train_set/include -c train.c -o train.o
-
