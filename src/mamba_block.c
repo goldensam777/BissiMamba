@@ -2,6 +2,7 @@
 #include "kmamba_kernels.h"
 #include "scan_nd.h"
 #include "km_memory_pool.h"
+#include <stdint.h>
 
 #ifdef KMAMBA_BUILD_CUDA
 #include <cuda_runtime.h>
@@ -222,17 +223,45 @@ void mamba_block_free(MambaBlock *block) {
 
 void mamba_block_init(MambaBlock *block) {
     if (!block) return;
+    /*
+     * Use a per-call Xorshift64 state seeded from the block's dimensions so
+     * initialization is reproducible and thread-safe (no shared srand() state).
+     */
+    uint64_t rng;
+    {
+        uint64_t z = (uint64_t)block->config.dim
+                   ^ ((uint64_t)block->config.state_size << 16)
+                   ^ ((uint64_t)block->config.seq_len    << 32)
+                   ^ 0x9e3779b97f4a7c15ULL;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        rng = z ^ (z >> 31);
+    }
+
+    /* Inline xorshift64 step — avoids static helper visibility issues */
+#define XS64_NEXT(s) ((s) ^= (s) << 13, (s) ^= (s) >> 7, (s) ^= (s) << 17, (s))
+#define XS64_FLOAT(s) ((float)((double)(XS64_NEXT(s) >> 11) * (1.0 / (double)(1ULL << 53))))
+
     for (size_t i = 0; i < block->config.state_size; i++) block->A_log.data[i] = -1.0f;
     MBMatrix *mats[] = { &block->W_in, &block->W_out, &block->W_B, &block->W_C };
     for (int mi = 0; mi < 4; mi++) {
-        MBMatrix *M = mats[mi]; float scale = sqrtf(6.0f / (float)(M->rows + M->cols));
-        for (size_t i = 0; i < M->rows * M->cols; i++) M->data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
+        MBMatrix *M = mats[mi];
+        float scale = sqrtf(6.0f / (float)(M->rows + M->cols));
+        for (size_t i = 0; i < M->rows * M->cols; i++)
+            M->data[i] = (XS64_FLOAT(rng) * 2.0f - 1.0f) * scale;
     }
     size_t R = _mimo_R(&block->config), N = block->config.state_size;
-    memset(block->b_B, 0, N * R * sizeof(float)); memset(block->b_C, 0, N * R * sizeof(float));
-    for (size_t i = 0; i < (N/2 > 0 ? N/2 : 1); i++) block->theta[i] = ((float)rand() / RAND_MAX) * (2.0f * 3.14159f / (float)N);
-    for (size_t i = 0; i < block->delta_proj.rows * block->delta_proj.cols; i++) block->delta_proj.data[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
-    for (size_t i = 0; i < block->lambda_proj.rows * block->lambda_proj.cols; i++) block->lambda_proj.data[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+    memset(block->b_B, 0, N * R * sizeof(float));
+    memset(block->b_C, 0, N * R * sizeof(float));
+    for (size_t i = 0; i < (N/2 > 0 ? N/2 : 1); i++)
+        block->theta[i] = XS64_FLOAT(rng) * (2.0f * 3.14159f / (float)N);
+    for (size_t i = 0; i < block->delta_proj.rows * block->delta_proj.cols; i++)
+        block->delta_proj.data[i] = (XS64_FLOAT(rng) - 0.5f) * 0.02f;
+    for (size_t i = 0; i < block->lambda_proj.rows * block->lambda_proj.cols; i++)
+        block->lambda_proj.data[i] = (XS64_FLOAT(rng) - 0.5f) * 0.02f;
+
+#undef XS64_NEXT
+#undef XS64_FLOAT
 }
 
 void mamba_attach_optimizer(MambaBlock *block, OptimizerType type, const MBOptimConfig *optconf) {
@@ -273,6 +302,24 @@ void mamba_zero_grads(MambaBlock *block) {
     memset(s->g_W_C, 0, NR * D * sizeof(float)); memset(s->g_b_B, 0, NR * sizeof(float));
     memset(s->g_b_C, 0, NR * sizeof(float)); memset(s->g_delta_proj, 0, D * sizeof(float));
     memset(s->g_lambda_proj, 0, D * sizeof(float)); memset(s->g_theta, 0, (N/2>0?N/2:1) * sizeof(float));
+#ifdef KMAMBA_BUILD_CUDA
+    /* Mirror the CPU zero on the GPU gradient buffers so that the GPU
+     * backward pass starts accumulating from zero every step. */
+    if (block->gpu.gpu_ready) {
+        size_t TS = (N / 2 > 0 ? N / 2 : 1);
+        cudaMemset(block->gpu.d_g_W_in,        0, R  * D  * sizeof(float));
+        cudaMemset(block->gpu.d_g_W_out,        0, D  * R  * sizeof(float));
+        cudaMemset(block->gpu.d_g_A_log,        0, N        * sizeof(float));
+        cudaMemset(block->gpu.d_g_W_B,          0, NR * D  * sizeof(float));
+        cudaMemset(block->gpu.d_g_W_C,          0, NR * D  * sizeof(float));
+        cudaMemset(block->gpu.d_g_b_B,          0, NR       * sizeof(float));
+        cudaMemset(block->gpu.d_g_b_C,          0, NR       * sizeof(float));
+        cudaMemset(block->gpu.d_g_delta_proj,   0, D        * sizeof(float));
+        cudaMemset(block->gpu.d_g_lambda_proj,  0, D        * sizeof(float));
+        if (block->gpu.d_g_theta)
+            cudaMemset(block->gpu.d_g_theta,    0, TS       * sizeof(float));
+    }
+#endif
 }
 
 float mamba_block_grad_sqnorm(const MambaBlock *block) {

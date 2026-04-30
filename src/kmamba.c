@@ -524,6 +524,13 @@ float kmamba_train_batch(KMamba *m, const uint32_t *batch_tokens, size_t batch_s
     float total_loss = 0.0f;
     m->step_embed_head++;
 
+    /* Zero all GPU gradient buffers before accumulating gradients for this batch. */
+    cudaMemset(m->gpu.d_g_head,  0, D * V * sizeof(float));
+    cudaMemset(m->gpu.d_g_embed, 0, V * D * sizeof(float));
+    for (size_t i = 0; i < n_layers; i++) {
+        mamba_zero_grads(m->layers[i]);
+    }
+
     for (size_t b = 0; b < batch_size; b++) {
         uint32_t *d_seq = d_batch_tokens + b * Lp1;
         uint32_t *d_tok_in = d_seq;
