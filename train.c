@@ -16,7 +16,9 @@
 
 typedef enum {
     DATA_MODALITY_GENERIC,  /* Raw binary, user-preprocessed */
-    DATA_MODALITY_VISION,   /* Images: CIFAR, MNIST, etc. */
+    DATA_MODALITY_MNIST,    /* MNIST: idx3-ubyte + idx1-ubyte */
+    DATA_MODALITY_CIFAR10,  /* CIFAR-10: data_batch_*.bin */
+    DATA_MODALITY_VISION,   /* Generic images: PNG, JPG */
     DATA_MODALITY_TEXT,     /* Text: token IDs or embeddings */
     DATA_MODALITY_AUDIO,    /* Audio: spectrograms or raw waveform */
     DATA_MODALITY_TIME_SERIES, /* Any 1D/2D time series */
@@ -26,6 +28,14 @@ typedef enum {
 /* Detect modality from file extension or path */
 static DataModality detect_modality(const char *path) {
     if (!path || path[0] == '\0') return DATA_MODALITY_SYNTHETIC;
+    
+    /* Check for MNIST pattern: *-images-idx3-ubyte */
+    if (strstr(path, "-images-idx3-ubyte") || strstr(path, "-labels-idx1-ubyte"))
+        return DATA_MODALITY_MNIST;
+    
+    /* Check for CIFAR-10 pattern: data_batch_*.bin or test_batch.bin */
+    if (strstr(path, "data_batch_") || strstr(path, "test_batch.bin"))
+        return DATA_MODALITY_CIFAR10;
     
     const char *ext = strrchr(path, '.');
     if (!ext) return DATA_MODALITY_GENERIC;
@@ -40,6 +50,145 @@ static DataModality detect_modality(const char *path) {
         return DATA_MODALITY_GENERIC;
     
     return DATA_MODALITY_GENERIC; /* Default: assume preprocessed binary */
+}
+
+/* MNIST loader - native format (idx3-ubyte for images, idx1-ubyte for labels) */
+static int load_mnist(const char *path, float **data, uint32_t **labels,
+                      size_t *num_samples, size_t L, size_t D, int num_classes) {
+    /* Parse MNIST path format: /path/to/train-images-idx3-ubyte */
+    char images_path[512];
+    char labels_path[512];
+    
+    strncpy(images_path, path, sizeof(images_path) - 1);
+    images_path[sizeof(images_path) - 1] = '\0';
+    
+    /* Construct labels path: train-images-idx3-ubyte -> train-labels-idx1-ubyte */
+    char *images_name = strrchr(images_path, '/');
+    if (!images_name) images_name = images_path;
+    else images_name++; /* Skip the slash */
+    
+    char dir_buf[512] = "";
+    const char *dir = dir_buf;
+    if (images_name != images_path) {
+        size_t dir_len = images_name - images_path;
+        if (dir_len < sizeof(dir_buf)) {
+            memcpy(dir_buf, images_path, dir_len);
+            dir_buf[dir_len] = '\0';
+        }
+    }
+    
+    if (strncmp(images_name, "train-images", 12) == 0) {
+        snprintf(labels_path, sizeof(labels_path), "%s%s%s", dir, dir[0] ? "/" : "", "train-labels-idx1-ubyte");
+    } else if (strncmp(images_name, "t10k-images", 11) == 0) {
+        snprintf(labels_path, sizeof(labels_path), "%s%s%s", dir, dir[0] ? "/" : "", "t10k-labels-idx1-ubyte");
+    } else {
+        /* Fallback: try to construct labels path by replacing 'images' with 'labels' and idx3 with idx1 */
+        snprintf(labels_path, sizeof(labels_path), "%s.labels", path);
+    }
+    
+    printf("Loading MNIST from: %s\n", path);
+    printf("Expected labels: %s\n", labels_path);
+    
+    /* Read images file */
+    FILE *img_fp = fopen(path, "rb");
+    if (!img_fp) {
+        fprintf(stderr, "Error: Cannot open images file %s\n", path);
+        return -1;
+    }
+    
+    /* Read MNIST header (big-endian) */
+    uint32_t magic, num_images, rows, cols;
+    fread(&magic, 4, 1, img_fp);
+    fread(&num_images, 4, 1, img_fp);
+    fread(&rows, 4, 1, img_fp);
+    fread(&cols, 4, 1, img_fp);
+    
+    /* Convert from big-endian */
+    magic = __builtin_bswap32(magic);
+    num_images = __builtin_bswap32(num_images);
+    rows = __builtin_bswap32(rows);
+    cols = __builtin_bswap32(cols);
+    
+    if (magic != 0x00000803) { /* 2051 for images */
+        fprintf(stderr, "Error: Invalid MNIST images magic number: %u\n", magic);
+        fclose(img_fp);
+        return -1;
+    }
+    
+    printf("MNIST: %u images, %ux%u pixels\n", num_images, rows, cols);
+    
+    size_t n = num_images;
+    size_t img_size = rows * cols;
+    
+    /* Allocate and read images (normalize to [0,1]) */
+    *data = (float*)malloc(n * img_size * sizeof(float));
+    if (!*data) {
+        fprintf(stderr, "Error: Failed to allocate memory\n");
+        fclose(img_fp);
+        return -1;
+    }
+    
+    uint8_t *img_buf = (uint8_t*)malloc(img_size);
+    if (!img_buf) {
+        fclose(img_fp);
+        return -1;
+    }
+    
+    for (size_t i = 0; i < n; i++) {
+        if (fread(img_buf, 1, img_size, img_fp) != img_size) {
+            fprintf(stderr, "Warning: Could not read image %zu\n", i);
+            break;
+        }
+        for (size_t j = 0; j < img_size; j++) {
+            (*data)[i * img_size + j] = img_buf[j] / 255.0f;
+        }
+    }
+    
+    free(img_buf);
+    fclose(img_fp);
+    
+    /* Read labels file */
+    FILE *lbl_fp = fopen(labels_path, "rb");
+    if (lbl_fp) {
+        uint32_t lbl_magic, num_labels;
+        fread(&lbl_magic, 4, 1, lbl_fp);
+        fread(&num_labels, 4, 1, lbl_fp);
+        
+        lbl_magic = __builtin_bswap32(lbl_magic);
+        num_labels = __builtin_bswap32(num_labels);
+        
+        if (lbl_magic == 0x00000801 && num_labels == n) { /* 2049 for labels */
+            *labels = (uint32_t*)malloc(n * sizeof(uint32_t));
+            if (*labels) {
+                uint8_t *lbl_buf = (uint8_t*)malloc(n);
+                if (lbl_buf) {
+                    fread(lbl_buf, 1, n, lbl_fp);
+                    for (size_t i = 0; i < n; i++) {
+                        (*labels)[i] = lbl_buf[i];
+                    }
+                    free(lbl_buf);
+                    printf("Loaded %zu MNIST labels\n", n);
+                }
+            }
+        } else {
+            printf("Warning: MNIST labels file mismatch. Using dummy labels.\n");
+        }
+        fclose(lbl_fp);
+    } else {
+        printf("Warning: Could not open labels file. Using dummy labels.\n");
+        if (num_classes > 0) {
+            *labels = (uint32_t*)calloc(n, sizeof(uint32_t));
+            if (*labels) {
+                for (size_t i = 0; i < n; i++) {
+                    (*labels)[i] = (uint32_t)(i % num_classes);
+                }
+            }
+        }
+    }
+    
+    *num_samples = n;
+    printf("Loaded %zu MNIST samples successfully.\n", n);
+    return 0;
 }
 
 /* Generic binary loader - loads raw float32 files */
@@ -105,23 +254,118 @@ static int load_modality_generic(const char *path, float **data, uint32_t **labe
     
     *num_samples = n;
     
-    /* Generate dummy labels if num_classes > 0 */
-    if (num_classes > 0) {
-        *labels = (uint32_t*)calloc(n, sizeof(uint32_t));
-        if (*labels) {
-            for (size_t i = 0; i < n; i++) {
-                (*labels)[i] = (uint32_t)(i % num_classes);
+    /* Try to load labels from .labels file */
+    char labels_path[512];
+    snprintf(labels_path, sizeof(labels_path), "%s.labels", path);
+    FILE *lfp = fopen(labels_path, "rb");
+    if (lfp) {
+        fseek(lfp, 0, SEEK_END);
+        long labels_size = ftell(lfp);
+        fseek(lfp, 0, SEEK_SET);
+        size_t num_labels = labels_size / sizeof(uint32_t);
+        if (num_labels == n) {
+            *labels = (uint32_t*)malloc(n * sizeof(uint32_t));
+            if (*labels) {
+                fread(*labels, sizeof(uint32_t), n, lfp);
+                printf("Loaded %zu labels from %s.labels\n", n, path);
             }
+        } else {
+            printf("Warning: labels file has %zu entries, expected %zu. Using dummy labels.\n", 
+                   num_labels, n);
         }
+        fclose(lfp);
     } else {
-        *labels = NULL;
+        /* Generate dummy labels if num_classes > 0 */
+        if (num_classes > 0) {
+            *labels = (uint32_t*)calloc(n, sizeof(uint32_t));
+            if (*labels) {
+                for (size_t i = 0; i < n; i++) {
+                    (*labels)[i] = (uint32_t)(i % num_classes);
+                }
+            }
+            printf("Generated dummy labels (0-%d cycle)\n", num_classes - 1);
+        } else {
+            *labels = NULL;
+        }
     }
     
     printf("Loaded %zu samples successfully.\n", n);
     return 0;
 }
 
-/* Vision loader - CIFAR-10 style images */
+/* CIFAR-10 native loader - loads from data_batch_*.bin files */
+static int load_cifar10(const char *path, float **data, uint32_t **labels,
+                        size_t *num_samples, size_t L, size_t D, int num_classes) {
+    printf("Loading CIFAR-10 from: %s\n", path);
+    
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open %s\n", path);
+        return -1;
+    }
+    
+    /* CIFAR-10 format: each record is 3073 bytes (1 label + 3072 pixels)
+     * 10000 records per batch file
+     * Pixels are stored in planar format: R (1024) + G (1024) + B (1024)
+     * Each image is 32x32x3 = 3072 bytes
+     */
+    const size_t img_size = 32 * 32 * 3;  /* 3072 */
+    const size_t record_size = 1 + img_size;  /* 3073: 1 byte label + 3072 bytes image */
+    
+    /* Count records in file */
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    size_t n = file_size / record_size;
+    if (n == 0) {
+        fprintf(stderr, "Error: File too small or invalid format\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    printf("Loading %zu CIFAR-10 images (32x32x3)...\n", n);
+    
+    /* Allocate memory */
+    *data = (float*)malloc(n * img_size * sizeof(float));
+    *labels = (uint32_t*)malloc(n * sizeof(uint32_t));
+    if (!*data || !*labels) {
+        fprintf(stderr, "Error: Failed to allocate memory\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    /* Read all records */
+    uint8_t *record = (uint8_t*)malloc(record_size);
+    if (!record) {
+        fclose(fp);
+        return -1;
+    }
+    
+    for (size_t i = 0; i < n; i++) {
+        if (fread(record, 1, record_size, fp) != record_size) {
+            fprintf(stderr, "Warning: Could not read record %zu\n", i);
+            break;
+        }
+        
+        /* First byte is label */
+        (*labels)[i] = record[0];
+        
+        /* Convert pixel values to float [0,1] - CIFAR stores as uint8 */
+        for (size_t j = 0; j < img_size; j++) {
+            (*data)[i * img_size + j] = record[1 + j] / 255.0f;
+        }
+    }
+    
+    free(record);
+    fclose(fp);
+    
+    *num_samples = n;
+    printf("Loaded %zu CIFAR-10 samples successfully.\n", n);
+    return 0;
+}
+
+/* Generic vision loader stub - for PNG/JPG files */
 static int load_modality_vision(const char *path, float **data, uint32_t **labels,
                                  size_t *num_samples, size_t L, size_t D, int num_classes) {
     printf("Loading vision data from: %s\n", path);
@@ -205,6 +449,10 @@ static int load_dataset(const char *data_path, float **data, uint32_t **labels,
     DataModality mod = detect_modality(data_path);
     
     switch (mod) {
+        case DATA_MODALITY_MNIST:
+            return load_mnist(data_path, data, labels, num_samples, L, D, num_classes);
+        case DATA_MODALITY_CIFAR10:
+            return load_cifar10(data_path, data, labels, num_samples, L, D, num_classes);
         case DATA_MODALITY_VISION:
             return load_modality_vision(data_path, data, labels, num_samples, L, D, num_classes);
         case DATA_MODALITY_TEXT:

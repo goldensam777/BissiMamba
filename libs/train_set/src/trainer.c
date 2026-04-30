@@ -687,7 +687,7 @@ static int save_layer_opt_state(FILE *fp, MambaBlock *block) {
     MBConfig *cfg = &block->config;
     size_t d_state = cfg->state_size;
     size_t N = d_state;        /* N = state_size for scan dimensions */
-    size_t R = 4;              /* Hardcoded R=4 based on scan_nd.h */
+    size_t R = (cfg->mimo_rank > 1) ? cfg->mimo_rank : 1;  /* Use mimo_rank from config */
     size_t d_inner = cfg->dim * cfg->expand_factor;
 
     /* Helper to write a float array */
