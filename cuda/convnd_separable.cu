@@ -66,6 +66,25 @@ __global__ void separable_1d_kernel(
     output[linear * D + d] = sum;
 }
 
+/* ── Bias addition kernel ──────────────────────────────────── */
+/*
+ * Adds a per-channel bias vector bias[D] to an output tensor
+ * laid out as [spatial_total, D] (channels-last).
+ */
+__global__ void separable_add_bias_kernel(
+    float *output,
+    const float *bias,
+    long spatial_total,
+    long D)
+{
+    long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total_threads = spatial_total * D;
+    if (tid >= total_threads) return;
+
+    int d = (int)(tid % D);
+    output[tid] += bias[d];
+}
+
 
 /* ── API: Separable Forward ─────────────────────────────────── */
 int om_convnd_separable_forward(ConvNDSeparableParams *p) {
@@ -136,7 +155,8 @@ int om_convnd_separable_forward(ConvNDSeparableParams *p) {
                                          (size_t)p->ndims * sizeof(long),
                                          cudaMemcpyHostToDevice));
 
-        /* Process each level */
+        /* Process each level — all launches go to the default stream so they
+         * execute in order; no per-level sync is needed. */
         for (long level = 0; level <= plan->max_level; level++) {
             long level_size = km_wavefront_plan_level_size(plan, level);
             if (level_size <= 0) continue;
@@ -154,9 +174,11 @@ int om_convnd_separable_forward(ConvNDSeparableParams *p) {
             CONVND_CUDA_CHECK(cudaGetLastError());
         }
 
-        CONVND_CUDA_CHECK(cudaDeviceSynchronize());
-
-        /* Cleanup per-axis allocations */
+        /* All kernels for this axis are queued to the default stream.
+         * cudaFree is synchronous with respect to all prior work on the
+         * device, so it implicitly waits for the axis's kernels before
+         * releasing the temporary buffers — no explicit
+         * cudaDeviceSynchronize() is required here. */
         cudaFree(d_kernel_1d);
         cudaFree(d_ordered_offsets);
         cudaFree(d_dims);
@@ -182,11 +204,27 @@ int om_convnd_separable_forward(ConvNDSeparableParams *p) {
         }
     }
 
-    /* Add bias if present */
+    /* Add per-channel bias if provided.
+     * The bias kernel is launched to the same default stream so it runs
+     * after all separable-conv kernels have completed. */
     if (p->bias) {
-        /* TODO: implement bias addition kernel */
+        float *d_bias = NULL;
+        CONVND_CUDA_CHECK(cudaMalloc(&d_bias, (size_t)p->D * sizeof(float)));
+        CONVND_CUDA_CHECK(cudaMemcpy(d_bias, p->bias,
+                                     (size_t)p->D * sizeof(float),
+                                     cudaMemcpyHostToDevice));
+
+        long total_threads = spatial_total * p->D;
+        int bias_blocks = (int)((total_threads + 255) / 256);
+        separable_add_bias_kernel<<<bias_blocks, 256>>>(
+            p->output, d_bias, spatial_total, p->D);
+        CONVND_CUDA_CHECK(cudaGetLastError());
+
+        cudaFree(d_bias);
     }
 
+    /* Single synchronization point after the entire cascade + bias. */
+    CONVND_CUDA_CHECK(cudaDeviceSynchronize());
     rc = 0;
 
 cleanup:

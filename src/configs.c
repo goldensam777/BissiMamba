@@ -105,6 +105,7 @@ int kmamba_configs_load_json(KMambaFullConfig *cfg, const char *path) {
             else if (strcmp(key, "seq_len") == 0) cfg->model.seq_len = (size_t)val;
             else if (strcmp(key, "spatial_ndims") == 0) cfg->model.spatial_ndims = (long)val;
             else if (strcmp(key, "use_convnd") == 0) cfg->model.use_convnd = (int)val;
+            else if (strcmp(key, "use_convnd_bias") == 0) cfg->model.use_convnd_bias = (int)val;
             else if (strcmp(key, "convnd_K") == 0) cfg->model.convnd_K = (long)val;
             else if (strcmp(key, "convnd_ndims") == 0) cfg->model.convnd_ndims = (long)val;
             else if (strcmp(key, "mimo_rank") == 0) cfg->model.mimo_rank = (size_t)val;
@@ -153,6 +154,7 @@ int kmamba_configs_save_json(const KMambaFullConfig *cfg, const char *path) {
     }
     fprintf(f, "],\n");
     fprintf(f, "  \"use_convnd\": %d,\n", cfg->model.use_convnd);
+    fprintf(f, "  \"use_convnd_bias\": %d,\n", cfg->model.use_convnd_bias);
     fprintf(f, "  \"convnd_K\": %ld,\n", cfg->model.convnd_K);
     fprintf(f, "  \"convnd_ndims\": %ld,\n", cfg->model.convnd_ndims);
     fprintf(f, "  \"mimo_rank\": %zu,\n", cfg->model.mimo_rank);

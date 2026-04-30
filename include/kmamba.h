@@ -55,6 +55,7 @@ typedef struct {
 
     /* ConvND parameters */
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND locale */
+    int    use_convnd_bias;/* 0 = no bias in separable conv, 1 = add per-channel bias */
     long   convnd_K;       /* Conv kernel_size (K>=1), distinct du state_size */
     long   convnd_ndims;   /* 0 => dérivé de spatial_ndims ; sinon doit matcher */
     long   pad_left[KMAMBA_CONFIG_MAX_NDIMS];  /* separable conv padding left per axis */
@@ -259,6 +260,7 @@ typedef struct {
 
     /* ConvND parameters (optionnel) */
     int    use_convnd;     /* 0 = disable, 1 = enable ConvND locale */
+    int    use_convnd_bias;/* 0 = no bias in separable conv, 1 = add per-channel bias */
     long   convnd_K;       /* Conv kernel_size (K>=1), distinct du state_size */
     long   convnd_ndims;   /* 0 => dérivé de spatial_ndims ; sinon doit matcher */
     long   pad_left[KMAMBA_CONFIG_MAX_NDIMS];  /* separable conv padding left per axis */
