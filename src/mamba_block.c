@@ -169,8 +169,11 @@ MambaBlock* mamba_block_create(const MBConfig *config) {
     if (block->config.use_convnd && block->config.convnd_K > 0) {
         long kernel_size = block->config.convnd_ndims * block->config.convnd_K * (long)block->config.dim;
         block->convnd_kernel = malloc(kernel_size * sizeof(float));
-        block->convnd_bias = malloc(block->config.dim * sizeof(float));
-        if (!block->convnd_kernel || !block->convnd_bias) { mamba_block_free(block); return NULL; }
+        if (!block->convnd_kernel) { mamba_block_free(block); return NULL; }
+        if (block->config.use_convnd_bias) {
+            block->convnd_bias = malloc(block->config.dim * sizeof(float));
+            if (!block->convnd_bias) { mamba_block_free(block); return NULL; }
+        }
     }
     return block;
 }
